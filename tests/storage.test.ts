@@ -31,6 +31,42 @@ describe("durable acceptance", () => {
     expect(() => store.decodeCursor(`${cursor}x`)).toThrow("invalid cursor");
     store.close();
   });
+  test("paginates tasks by stable key when newer work arrives", async () => {
+    const store = fixture(),
+      agent = store.createAgent("paged-worker"),
+      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    const ids: string[] = [];
+    for (const messageId of ["page-1", "page-2", "page-3"]) {
+      ids.push(
+        store.accept(
+          agent.id,
+          principal.id,
+          Message.fromJSON({ messageId, role: Role.ROLE_USER, parts: [{ text: messageId }] }),
+          {},
+        ).task.id,
+      );
+      await Bun.sleep(2);
+    }
+    const first = store.listTasks(agent.id, principal.id, { limit: 2 });
+    expect(first.tasks).toHaveLength(2);
+    expect(first.nextCursor).toBeString();
+    await Bun.sleep(2);
+    const newer = store.accept(
+      agent.id,
+      principal.id,
+      Message.fromJSON({ messageId: "page-new", role: Role.ROLE_USER, parts: [{ text: "new" }] }),
+      {},
+    ).task.id;
+    const second = store.listTasks(agent.id, principal.id, {
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    expect([...first.tasks, ...second.tasks].map((task) => task.id).toSorted()).toEqual(
+      ids.toSorted(),
+    );
+    expect(second.tasks.map((task) => task.id)).not.toContain(newer);
+    store.close();
+  });
   test("commits one task and one delivery for an idempotent message", () => {
     const store = fixture(),
       agent = store.createAgent("backend"),

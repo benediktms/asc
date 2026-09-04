@@ -660,13 +660,67 @@ export class Store {
       .get(principalId, idValue, targetAgentId ?? null, targetAgentId ?? null, principalId);
     return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
   }
-  listTasks(agentId: string, principalId: string): StoredTask[] {
-    return this.db
-      .query<{ a2a_snapshot_json: string }, [string, string]>(
-        "SELECT a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? ORDER BY updated_at_ms DESC LIMIT 100",
-      )
-      .all(agentId, principalId)
-      .map((row) => JSON.parse(row.a2a_snapshot_json));
+  listTasks(
+    agentId: string,
+    principalId: string,
+    options: { contextId?: string; state?: string; cursor?: string; limit: number },
+  ) {
+    const cursor = options.cursor ? pageCursor(this.decodeCursor(options.cursor)) : undefined,
+      params: [
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        number | null,
+        number | null,
+        number | null,
+        string | null,
+        number,
+      ] = [
+        agentId,
+        principalId,
+        options.contextId ?? null,
+        options.contextId ?? null,
+        options.state ?? null,
+        options.state ?? null,
+        cursor?.sortKey ?? null,
+        cursor?.sortKey ?? null,
+        cursor?.sortKey ?? null,
+        cursor?.id ?? null,
+        options.limit + 1,
+      ],
+      rows = this.db
+        .query<{ id: string; updated_at_ms: number; a2a_snapshot_json: string }, typeof params>(
+          "SELECT id,updated_at_ms,a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? AND (? IS NULL OR context_id=?) AND (? IS NULL OR state=?) AND (? IS NULL OR updated_at_ms<? OR (updated_at_ms=? AND id<?)) ORDER BY updated_at_ms DESC,id DESC LIMIT ?",
+        )
+        .all(...params),
+      page = rows.slice(0, options.limit),
+      last = page.at(-1),
+      total = this.db
+        .query<
+          { count: number },
+          [string, string, string | null, string | null, string | null, string | null]
+        >(
+          "SELECT count(*) count FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? AND (? IS NULL OR context_id=?) AND (? IS NULL OR state=?)",
+        )
+        .get(
+          agentId,
+          principalId,
+          options.contextId ?? null,
+          options.contextId ?? null,
+          options.state ?? null,
+          options.state ?? null,
+        )!.count;
+    return {
+      tasks: page.map((row) => parseTask(row.a2a_snapshot_json)),
+      nextCursor:
+        rows.length > options.limit && last
+          ? this.encodeCursor({ sortKey: last.updated_at_ms, id: last.id })
+          : undefined,
+      total,
+    };
   }
   eventSequence(taskId: string) {
     return Number(
@@ -1232,4 +1286,14 @@ function parseTask(json: string): StoredTask {
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function pageCursor(value: unknown) {
+  if (
+    !isRecord(value) ||
+    typeof value.sortKey !== "number" ||
+    !Number.isSafeInteger(value.sortKey) ||
+    typeof value.id !== "string"
+  )
+    throw new Error("VALIDATION_FAILED: invalid cursor");
+  return { sortKey: value.sortKey, id: value.id };
 }

@@ -164,28 +164,18 @@ class Handler implements A2ARequestHandler {
     return trim(asTask(task), params.historyLength);
   }
   async listTasks(params: ListTasksRequest, context: ServerCallContext) {
-    let tasks = this.store.listTasks(this.agent.id, context.user!.userName);
-    if (params.contextId) tasks = tasks.filter((task) => task.contextId === params.contextId);
-    if (params.status !== TaskState.TASK_STATE_UNSPECIFIED)
-      tasks = tasks.filter((task) => task.status?.state === params.status);
     const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100),
-      offset = this.store.cursorOffset(params.pageToken),
-      page = tasks
-        .slice(offset, offset + pageSize)
-        .map((task) => trim(asTask(task), params.historyLength));
-    const last = page.at(-1);
+      page = this.store.listTasks(this.agent.id, context.user!.userName, {
+        contextId: params.contextId,
+        state: taskState(params.status),
+        cursor: params.pageToken,
+        limit: pageSize,
+      });
     return {
-      tasks: page,
-      nextPageToken:
-        offset + pageSize < tasks.length && last
-          ? this.store.encodeCursor({
-              offset: offset + pageSize,
-              sortKey: last.status?.timestamp ?? "",
-              id: last.id,
-            })
-          : "",
+      tasks: page.tasks.map((task) => trim(asTask(task), params.historyLength)),
+      nextPageToken: page.nextCursor ?? "",
       pageSize,
-      totalSize: tasks.length,
+      totalSize: page.total,
     };
   }
   async cancelTask(params: CancelTaskRequest, context: ServerCallContext) {
@@ -297,6 +287,32 @@ function terminal(state?: TaskState) {
       TaskState.TASK_STATE_REJECTED,
     ].includes(state)
   );
+}
+
+function taskState(state: TaskState | undefined) {
+  switch (state) {
+    case undefined:
+    case TaskState.TASK_STATE_UNSPECIFIED:
+      return undefined;
+    case TaskState.TASK_STATE_SUBMITTED:
+      return "submitted";
+    case TaskState.TASK_STATE_WORKING:
+      return "working";
+    case TaskState.TASK_STATE_INPUT_REQUIRED:
+      return "input-required";
+    case TaskState.TASK_STATE_AUTH_REQUIRED:
+      return "auth-required";
+    case TaskState.TASK_STATE_COMPLETED:
+      return "completed";
+    case TaskState.TASK_STATE_FAILED:
+      return "failed";
+    case TaskState.TASK_STATE_CANCELED:
+      return "canceled";
+    case TaskState.TASK_STATE_REJECTED:
+      return "rejected";
+    default:
+      throw new Error("VALIDATION_FAILED: invalid task status");
+  }
 }
 
 export async function handleA2A(
