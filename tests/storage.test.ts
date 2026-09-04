@@ -24,6 +24,13 @@ function fixture() {
 }
 
 describe("durable acceptance", () => {
+  test("signs opaque cursors and rejects tampering", () => {
+    const store = fixture(),
+      cursor = store.encodeCursor({ sortKey: "backend", id: "agt_1", offset: 1 });
+    expect(store.decodeCursor<{ offset: number }>(cursor).offset).toBe(1);
+    expect(() => store.decodeCursor(`${cursor}x`)).toThrow("invalid cursor");
+    store.close();
+  });
   test("commits one task and one delivery for an idempotent message", () => {
     const store = fixture(),
       agent = store.createAgent("backend"),

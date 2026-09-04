@@ -33,6 +33,7 @@ export class CodexAppServerClient {
   private connectPromise?: Promise<void>;
   readonly notifications = new EventTarget();
   onNotification?: (method: string, params: unknown) => void;
+  onClose?: () => void;
 
   constructor(
     readonly socketPath: string,
@@ -152,6 +153,7 @@ export class CodexAppServerClient {
             this.upgraded = false;
             this.connectPromise = undefined;
             this.failPending(new Error("app-server connection closed"));
+            this.onClose?.();
           },
           error: (_socket, error) => {
             reject(error);

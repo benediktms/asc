@@ -5,6 +5,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import type { JsonValue } from "../../../contracts/runtime-adapter";
+import { loadConfig } from "../../config/src/index";
 export interface StoredPart {
   content?:
     | { $case: "text"; value: string }
@@ -119,12 +120,17 @@ export interface Paths {
   secret: string;
 }
 export function paths(): Paths {
-  const base = process.env.ACS_HOME ?? `${process.env.HOME}/Library/Application Support/acs`;
+  const base = process.env.ACS_HOME ?? `${process.env.HOME}/Library/Application Support/acs`,
+    config = loadConfig();
   return {
-    data: process.env.ACS_STORAGE_PATH ?? `${base}/acs.db`,
+    data:
+      process.env.ACS_STORAGE_PATH ??
+      (process.env.ACS_HOME ? `${base}/acs.db` : config.storage.path),
     runtime:
       process.env.ACS_CONTROL_SOCKET ??
-      `${process.env.TMPDIR ?? "/tmp"}/acs-${process.getuid?.() ?? 0}/control.sock`,
+      (process.env.ACS_HOME
+        ? `${process.env.TMPDIR ?? "/tmp"}/acs-${process.getuid?.() ?? 0}/control.sock`
+        : config.daemon.controlSocket),
     token: `${base}/control.token`,
     bridgeToken: `${base}/bridge.token`,
     secret: `${base}/secret.key`,
@@ -152,11 +158,29 @@ export function initFiles(target = paths()): string {
 export class Store {
   readonly db: Database;
   readonly secret: Buffer;
-  constructor(readonly config = paths()) {
+  readonly limits: {
+    maxInlineContentBytes: number;
+    claimTtlSeconds: number;
+    defaultMode: "wake_when_idle" | "append_context";
+    busyTimeoutMs: number;
+    durability: "balanced" | "strict";
+  };
+  constructor(
+    readonly config = paths(),
+    limits: Partial<Store["limits"]> = {},
+  ) {
+    this.limits = {
+      maxInlineContentBytes: 262144,
+      claimTtlSeconds: 600,
+      defaultMode: "wake_when_idle",
+      busyTimeoutMs: 5000,
+      durability: "balanced",
+      ...limits,
+    };
     initFiles(config);
     this.db = new Database(config.data, { create: true, strict: true });
     this.db.exec(
-      "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
+      `PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=${this.limits.busyTimeoutMs}; PRAGMA synchronous=${this.limits.durability === "strict" ? "FULL" : "NORMAL"};`,
     );
     if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'").get()) {
       this.db.exec(migration);
@@ -177,6 +201,56 @@ export class Store {
   }
   payloadHash(value: unknown) {
     return createHash("sha256").update(canonical(value)).digest("hex");
+  }
+  encodeCursor(value: Record<string, unknown>) {
+    const payload = Buffer.from(JSON.stringify(value)).toString("base64url"),
+      mac = createHmac("sha256", this.secret).update(payload).digest("base64url");
+    return `${payload}.${mac}`;
+  }
+  decodeCursor<T>(cursor: string): T {
+    const [payload, signature, extra] = cursor.split("."),
+      expected = payload
+        ? createHmac("sha256", this.secret).update(payload).digest("base64url")
+        : "";
+    if (
+      !payload ||
+      !signature ||
+      extra !== undefined ||
+      signature.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+    )
+      throw new Error("VALIDATION_FAILED: invalid cursor");
+    return JSON.parse(Buffer.from(payload, "base64url").toString()) as T;
+  }
+  cursorOffset(cursor?: string) {
+    if (!cursor) return 0;
+    const value = this.decodeCursor<{ offset?: unknown }>(cursor).offset;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+      throw new Error("VALIDATION_FAILED: invalid cursor");
+    return value;
+  }
+  audit(
+    actorPrincipalId: string | null,
+    action: string,
+    resourceType: string,
+    resourceId?: string,
+    details: Record<string, unknown> = {},
+    correlationId: string = crypto.randomUUID(),
+  ) {
+    this.db
+      .query(
+        "INSERT INTO audit_events(id,actor_principal_id,action,resource_type,resource_id,correlation_id,details_json,created_at_ms) VALUES(?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        id("evt"),
+        actorPrincipalId,
+        action,
+        resourceType,
+        resourceId ?? null,
+        correlationId,
+        JSON.stringify(details),
+        Date.now(),
+      );
   }
   private bootstrap() {
     const principal = this.db
@@ -208,7 +282,7 @@ export class Store {
           bridgePrincipalId,
           "service",
           "Codex MCP bridge",
-          '["bridge:attest","bridge:token","inbox","executor"]',
+          '["agents:read","bridge:attest","bridge:token","inbox","executor"]',
           now,
         );
       this.db
@@ -220,7 +294,7 @@ export class Store {
           bridgePrincipalId,
           this.hashToken(bridgeToken),
           bridgeToken.slice(0, 6),
-          '["bridge:attest","bridge:token","inbox","executor"]',
+          '["agents:read","bridge:attest","bridge:token","inbox","executor"]',
           now,
         );
       this.db
@@ -243,17 +317,24 @@ export class Store {
   authenticate(token: string) {
     const rows = this.db
       .query(
-        "SELECT p.id,p.kind,p.agent_id,p.binding_id,t.token_hash FROM auth_tokens t JOIN principals p ON p.id=t.principal_id WHERE t.revoked_at_ms IS NULL AND p.disabled_at_ms IS NULL AND (t.expires_at_ms IS NULL OR t.expires_at_ms>?)",
+        "SELECT p.id,p.kind,p.agent_id,p.binding_id,t.id token_id,t.token_hash,t.scopes_json FROM auth_tokens t JOIN principals p ON p.id=t.principal_id WHERE t.revoked_at_ms IS NULL AND p.disabled_at_ms IS NULL AND (t.expires_at_ms IS NULL OR t.expires_at_ms>?)",
       )
       .all(Date.now()) as Array<{
       id: string;
       kind: string;
       agent_id: string | null;
       binding_id: string | null;
+      token_id: string;
       token_hash: Uint8Array;
+      scopes_json: string;
     }>;
     const hash = this.hashToken(token);
-    return rows.find((row) => timingSafeEqual(hash, Buffer.from(row.token_hash))) ?? null;
+    const row = rows.find((candidate) => timingSafeEqual(hash, Buffer.from(candidate.token_hash)));
+    if (!row) return null;
+    this.db
+      .query("UPDATE auth_tokens SET last_used_at_ms=? WHERE id=?")
+      .run(Date.now(), row.token_id);
+    return { ...row, scopes: JSON.parse(row.scopes_json) as string[] };
   }
   createToken(kind: "external-a2a-client" | "service" = "external-a2a-client") {
     const now = Date.now(),
@@ -279,6 +360,7 @@ export class Store {
           now,
         );
     })();
+    this.audit(principalId, "token.issue", "token", tokenId, { kind });
     return { token, principalId };
   }
   createAgent(slugValue: string, displayName?: string, description = "") {
@@ -415,7 +497,7 @@ export class Store {
     })();
     return this.binding(bindingId);
   }
-  createClaim(agentValue: string, principalId: string, ttlSeconds = 600) {
+  createClaim(agentValue: string, principalId: string, ttlSeconds = this.limits.claimTtlSeconds) {
     const agent = this.agent(agentValue);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
     const claimCode = randomBytes(24).toString("base64url"),
@@ -490,6 +572,7 @@ export class Store {
         now,
         now + ttlSeconds * 1000,
       );
+    this.audit(principalId, "token.issue", "token", undefined, { ttlSeconds });
     return token;
   }
   inbox(agentId: string) {
@@ -566,7 +649,7 @@ export class Store {
         throw new Error("ACS_MESSAGE_TOO_LARGE");
       bytes += Buffer.byteLength(JSON.stringify(part));
     }
-    if (bytes > 262144) throw new Error("ACS_MESSAGE_TOO_LARGE");
+    if (bytes > this.limits.maxInlineContentBytes) throw new Error("ACS_MESSAGE_TOO_LARGE");
     const scope = `${principalId}:${agentId}`,
       requestHash = this.payloadHash({ message, options });
     const existing = this.db
@@ -684,7 +767,7 @@ export class Store {
       this.db
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
-      const mode = options.mode ?? "wake_when_idle",
+      const mode = options.mode ?? this.limits.defaultMode,
         priority = { low: 0, normal: 10, high: 20 }[options.priority as string] ?? 10;
       const payload = {
         taskId,

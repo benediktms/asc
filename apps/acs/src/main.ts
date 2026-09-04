@@ -7,25 +7,41 @@ import { initFiles, paths, Store } from "../../../packages/storage-sqlite/src/in
 import { CodexRuntimeAdapter } from "../../../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../../../packages/runtime-codex/src/app-server-client";
 import { DeliveryScheduler } from "../../../packages/application/src/scheduler";
+import { loadConfig, parseListen, writeDefaultConfig } from "../../../packages/config/src/index";
 
 const args = Bun.argv.slice(2),
   config = paths(),
-  port = Number(process.env.ACS_A2A_PORT ?? 7432);
+  settings = loadConfig(),
+  listen = parseListen(settings.daemon.a2aListen),
+  port = listen.port;
 
 async function main() {
   if (!args.length || args[0] === "--help" || args[0] === "help") return usage();
   if (args[0] === "init") {
+    writeDefaultConfig();
     initFiles(config);
     const store = new Store(config);
     store.close();
     console.log(`Initialized ACS at ${config.data}`);
     return;
   }
-  if (args[0] === "daemon" && args[1] === "run") return daemon();
+  if (args[0] === "daemon" && (args[1] === "run" || args[1] === "start")) return daemon();
   if (args[0] === "mcp" && args[1] === "codex") return runMcp(port);
   if (args[0] === "codex" && args[1] === "doctor") return doctor();
   if (args[0] === "codex" && args[1] === "install-mcp") {
-    console.log(`codex mcp add acs -- ${process.execPath} mcp codex`);
+    const installed = Bun.spawnSync([
+      settings.codex.binary,
+      "mcp",
+      "add",
+      "acs",
+      "--",
+      process.execPath,
+      "mcp",
+      "codex",
+    ]);
+    if (!installed.success)
+      throw new Error(installed.stderr.toString().trim() || "Codex MCP installation failed");
+    process.stdout.write(installed.stdout);
     return;
   }
   const call = (method: string, params: unknown = {}) =>
@@ -110,13 +126,19 @@ async function main() {
 }
 
 async function daemon() {
-  const store = new Store(config),
+  const store = new Store(config, {
+      maxInlineContentBytes: settings.security.maxInlineContentBytes,
+      claimTtlSeconds: settings.security.claimTtlSeconds,
+      defaultMode: settings.delivery.defaultMode,
+      busyTimeoutMs: settings.storage.busyTimeoutMs,
+      durability: settings.storage.durability,
+    }),
     startedAt = new Date().toISOString();
   if (existsSync(config.runtime)) unlinkSync(config.runtime);
   const a2a = Bun.serve({
-    hostname: "127.0.0.1",
+    hostname: listen.hostname,
     port,
-    fetch: (request) => handleA2A(store, request, port),
+    fetch: (request) => handleA2A(store, request, port, settings.security.maxRequestBytes),
     error: sanitizedError,
   });
   let control: ReturnType<typeof Bun.serve>;
@@ -127,13 +149,21 @@ async function daemon() {
   const codexSocket =
     process.env.ACS_CODEX_SOCKET ??
     `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`;
-  const adapter = new CodexRuntimeAdapter(codexSocket);
-  const scheduler = new DeliveryScheduler(store, adapter, String(process.pid));
-  await scheduler.start();
+  const adapter = settings.codex.enabled ? new CodexRuntimeAdapter(codexSocket) : undefined;
+  const scheduler = adapter
+    ? new DeliveryScheduler(store, adapter, String(process.pid), {
+        concurrency: settings.delivery.workerConcurrency,
+        leaseMs: settings.delivery.leaseSeconds * 1000,
+        retryBaseMs: settings.delivery.retryBaseMs,
+        retryCapMs: settings.delivery.retryCapMs,
+        reconnectMs: settings.codex.statusPollIntervalMs,
+      })
+    : undefined;
+  await scheduler?.start();
   const stop = () => {
     a2a.stop(false);
     control.stop(false);
-    void scheduler.stop().then(() => {
+    void Promise.resolve(scheduler?.stop()).then(() => {
       store.close();
       if (existsSync(config.runtime)) unlinkSync(config.runtime);
       finish();
@@ -173,7 +203,7 @@ function print(value: unknown) {
   console.log(JSON.stringify(value, null, 2));
 }
 async function doctor() {
-  const codex = Bun.spawnSync([process.env.ACS_CODEX_BINARY ?? "codex", "--version"]);
+  const codex = Bun.spawnSync([settings.codex.binary, "--version"]);
   const socket =
       process.env.ACS_CODEX_SOCKET ??
       `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`,
@@ -203,7 +233,7 @@ async function doctor() {
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon run\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|update|delete <agent>\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--allow-non-atomic-wake]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --as <resolution>\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|update|delete <agent>\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--allow-non-atomic-wake]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --as <resolution>\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 

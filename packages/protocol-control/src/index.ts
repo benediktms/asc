@@ -17,6 +17,7 @@ type Params = {
   bindingId: string;
   claimCode: string;
   choices?: string[];
+  cursor?: string;
   deliveryId: string;
   description?: string;
   displayName?: string;
@@ -35,6 +36,7 @@ type Params = {
   taskId: string;
   threadId?: unknown;
   ttlSeconds?: number;
+  toBindingId?: string;
 };
 type Rpc = { jsonrpc: "2.0"; id: string | number; method: string; params?: Params };
 const ok = (id: Rpc["id"], result: unknown) => Response.json({ jsonrpc: "2.0", id, result });
@@ -80,6 +82,23 @@ export function controlHandler(
     }
     try {
       const p = rpc.params as Params;
+      authorize(principal, rpc.method);
+      const audit = (
+        action: string,
+        resourceType: string,
+        resourceId?: string,
+        details: Record<string, unknown> = {},
+      ) =>
+        store.audit(
+          principal.id,
+          action,
+          resourceType,
+          resourceId,
+          {
+            ...details,
+          },
+          String(rpc.id),
+        );
       switch (rpc.method) {
         case "system.initialize":
           if (
@@ -117,44 +136,55 @@ export function controlHandler(
           });
         case "system.shutdown":
           if (principal.kind !== "local-user") throw new Error("NOT_AUTHORIZED");
+          audit("daemon.shutdown", "system");
           queueMicrotask(shutdown);
           return ok(rpc.id, { accepted: true });
         case "agents.create":
           admin(principal.kind);
-          return ok(rpc.id, {
-            agent: agentDto(store, store.createAgent(p.slug, p.displayName, p.description)),
-          });
+          const createdAgent = store.createAgent(p.slug, p.displayName, p.description);
+          audit("agent.create", "agent", createdAgent.id);
+          return ok(rpc.id, { agent: agentDto(store, createdAgent) });
         case "agents.update":
           admin(principal.kind);
-          return ok(rpc.id, {
-            agent: agentDto(
-              store,
-              store.updateAgent(p.agent, {
-                displayName: p.displayName,
-                description: p.description,
-                enabled: p.enabled,
-              }),
-            ),
+          const updatedAgent = store.updateAgent(p.agent, {
+            displayName: p.displayName,
+            description: p.description,
+            enabled: p.enabled,
           });
+          audit("agent.update", "agent", updatedAgent.id);
+          return ok(rpc.id, { agent: agentDto(store, updatedAgent) });
         case "agents.delete":
           admin(principal.kind);
+          const deletedAgent = store.agent(p.agent);
+          if (!deletedAgent) throw new Error("AGENT_NOT_FOUND");
           store.deleteAgent(p.agent);
+          audit("agent.delete", "agent", deletedAgent.id);
           return ok(rpc.id, { deleted: true });
         case "agents.createClaim":
           admin(principal.kind);
-          return ok(rpc.id, store.createClaim(p.agent, principal.id, p.ttlSeconds));
+          const claim = store.createClaim(p.agent, principal.id, p.ttlSeconds);
+          audit("binding.claim.create", "claim", claim.claimId);
+          return ok(rpc.id, claim);
         case "agents.get": {
           const agent = store.agent(p.agent);
           if (!agent) throw new Error("AGENT_NOT_FOUND");
           return ok(rpc.id, { agent: agentDto(store, agent) });
         }
         case "agents.list":
+          const agentOffset = store.cursorOffset(p?.cursor);
+          const agentLimit = Math.min(p?.limit ?? 50, 100),
+            agents = store.agents().slice(agentOffset, agentOffset + agentLimit),
+            lastAgent = agents.at(-1);
           return ok(rpc.id, {
-            items: store
-              .agents()
-              .slice(0, Math.min(p?.limit ?? 50, 100))
-              .map((agent) => agentDto(store, agent)),
-            nextCursor: undefined,
+            items: agents.map((agent) => agentDto(store, agent)),
+            nextCursor:
+              agents.length === agentLimit && lastAgent
+                ? store.encodeCursor({
+                    offset: agentOffset + agentLimit,
+                    sortKey: lastAgent.slug,
+                    id: lastAgent.id,
+                  })
+                : undefined,
           });
         case "bindings.bind":
           admin(principal.kind);
@@ -172,12 +202,9 @@ export function controlHandler(
             ).availability === "offline"
           )
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
-          return ok(rpc.id, {
-            binding: bindingDto(
-              store.bind(p.agent, sessionId, Boolean(p.allowNonAtomicWake)),
-              store,
-            ),
-          });
+          const createdBinding = store.bind(p.agent, sessionId, Boolean(p.allowNonAtomicWake));
+          audit("binding.bind", "binding", createdBinding.id);
+          return ok(rpc.id, { binding: bindingDto(createdBinding, store) });
         case "bindings.claim": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const threadId = p.evidence?.metadata?.threadId;
@@ -195,6 +222,7 @@ export function controlHandler(
           )
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
           const binding = store.claim(p.claimCode, threadId);
+          audit("binding.claim", "binding", binding.id);
           const agent = store.agent(binding.agentId);
           return ok(rpc.id, {
             binding: bindingDto(binding, store),
@@ -217,14 +245,14 @@ export function controlHandler(
           });
         case "bindings.revoke":
           admin(principal.kind);
-          return ok(rpc.id, {
-            binding: bindingDto(store.revokeBinding(p.bindingId, p.reason)!, store),
-          });
+          const revoked = store.revokeBinding(p.bindingId, p.reason)!;
+          audit("binding.revoke", "binding", revoked.id, { reason: p.reason ?? "revoked" });
+          return ok(rpc.id, { binding: bindingDto(revoked, store) });
         case "bindings.retargetPending": {
           admin(principal.kind);
           const agent = store.agent(p.agent);
           if (!agent) throw new Error("AGENT_NOT_FOUND");
-          const target = store.binding(p.bindingId);
+          const target = store.binding(p.toBindingId ?? p.bindingId);
           if (!target || target.agent_id !== agent.id || target.status !== "active")
             throw new Error("BINDING_NOT_FOUND");
           const changed = store.db
@@ -232,6 +260,7 @@ export function controlHandler(
               "UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=?,updated_at_ms=? WHERE target_agent_id=? AND state IN ('pending','deferred')",
             )
             .run(target.id, target.epoch, Date.now(), agent.id).changes;
+          audit("binding.retarget-pending", "binding", target.id, { retargeted: changed });
           return ok(rpc.id, { retargeted: changed });
         }
         case "runtimes.list":
@@ -366,13 +395,19 @@ export function controlHandler(
         }
         case "deliveries.retry":
           admin(principal.kind);
-          return ok(rpc.id, { delivery: store.retryDelivery(p.deliveryId) });
+          const retried = store.retryDelivery(p.deliveryId);
+          audit("delivery.retry", "delivery", p.deliveryId);
+          return ok(rpc.id, { delivery: retried });
         case "deliveries.cancel":
           admin(principal.kind);
-          return ok(rpc.id, { delivery: store.cancelDelivery(p.deliveryId, p.reason) });
+          const canceled = store.cancelDelivery(p.deliveryId, p.reason);
+          audit("delivery.cancel", "delivery", p.deliveryId);
+          return ok(rpc.id, { delivery: canceled });
         case "deliveries.resolveUnknown":
           admin(principal.kind);
-          return ok(rpc.id, { delivery: store.resolveUnknown(p.deliveryId, p.resolution) });
+          const resolved = store.resolveUnknown(p.deliveryId, p.resolution);
+          audit("delivery.resolve-unknown", "delivery", p.deliveryId, { resolution: p.resolution });
+          return ok(rpc.id, { delivery: resolved });
         default:
           throw new Error("METHOD_NOT_FOUND");
       }
@@ -439,6 +474,24 @@ export async function controlCall<T = unknown>(
 
 function admin(kind: string) {
   if (kind !== "local-user") throw new Error("NOT_AUTHORIZED");
+}
+function authorize(principal: { kind: string; scopes: string[] }, method: string) {
+  if (principal.scopes.includes("*")) return;
+  const scope = method.startsWith("bridge.issueA2AToken")
+    ? "bridge:token"
+    : method.startsWith("bridge.") || method === "bindings.claim"
+      ? "bridge:attest"
+      : method.startsWith("executor.")
+        ? "executor"
+        : method.startsWith("inbox.")
+          ? "inbox"
+          : method === "agents.get" || method === "agents.list"
+            ? "agents:read"
+            : method.startsWith("system.")
+              ? undefined
+              : null;
+  if (scope === null || (scope && !principal.scopes.includes(scope)))
+    throw new Error("NOT_AUTHORIZED");
 }
 function agentDto(store: Store, agent: AgentRow) {
   const binding = store.db

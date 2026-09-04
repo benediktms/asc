@@ -79,6 +79,30 @@ describe("A2A JSON-RPC", () => {
         }
       ).n,
     ).toBe(1);
+    const limited = store.createToken();
+    store.db
+      .query("UPDATE auth_tokens SET scopes_json='[\"a2a:read\"]' WHERE principal_id=?")
+      .run(limited.principalId);
+    const forbidden = await handleA2A(
+      store,
+      new Request("http://localhost/agents/backend/a2a", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${limited.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "forbidden",
+          method: "SendMessage",
+          params: {
+            message: { messageId: "a2a-forbidden", role: "ROLE_USER", parts: [{ text: "work" }] },
+          },
+        }),
+      }),
+      7432,
+    );
+    expect(forbidden.status).toBe(403);
     expect(store.agent(agent.id)?.slug).toBe("backend");
     store.close();
   });

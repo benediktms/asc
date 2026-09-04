@@ -32,20 +32,32 @@ type ExecutionRow = { id: string; task_id: string; binding_id: string };
 
 export class DeliveryScheduler {
   private timer?: Timer;
-  private busy = false;
+  private scheduling = false;
   private abort = new AbortController();
   private observeTask?: Promise<void>;
+  private lanes = new Set<string>();
+  private inFlight = new Set<Promise<void>>();
+  private context?: RuntimeAdapterContext;
+  private connected = false;
+  private nextConnectAt = 0;
   constructor(
     private store: Store,
     private adapter: RuntimeAdapter,
     private instanceId: string,
+    private options = {
+      concurrency: 16,
+      leaseMs: 30_000,
+      retryBaseMs: 250,
+      retryCapMs: 30_000,
+      reconnectMs: 2000,
+    },
   ) {}
 
   async start() {
     const installation = this.store.db
       .query("SELECT id FROM runtime_installations WHERE adapter_id='codex.app-server' LIMIT 1")
       .get() as { id: string };
-    const context: RuntimeAdapterContext = {
+    this.context = {
       installationId: installation.id as RuntimeInstallationId,
       instanceId: this.instanceId,
       clock: { now: () => new Date().toISOString() },
@@ -60,25 +72,60 @@ export class DeliveryScheduler {
       },
     };
     this.recoverExpiredLeases();
-    await this.adapter.start(context);
-    this.observeTask = this.observe();
+    await this.connect();
     this.timer = setInterval(() => void this.tick(), 250);
   }
   async stop() {
     if (this.timer) clearInterval(this.timer);
     this.abort.abort();
-    await this.adapter.stop({ reason: "shutdown" });
+    await Promise.allSettled(this.inFlight);
+    if (this.connected) await this.adapter.stop({ reason: "shutdown" });
     await this.observeTask;
   }
   private async tick() {
-    if (this.busy) return;
-    this.busy = true;
+    if (this.scheduling) return;
+    this.scheduling = true;
     try {
+      if (!this.connected) {
+        if (Date.now() >= this.nextConnectAt) await this.connect();
+        return;
+      }
       if (await this.cancelOne()) return;
-      const intent = this.lease();
-      if (intent) await this.deliver(intent);
+      while (this.inFlight.size < this.options.concurrency) {
+        const intent = this.lease();
+        if (!intent) break;
+        this.lanes.add(intent.target_agent_id);
+        const work = this.deliver(intent)
+          .catch((error: unknown) => {
+            this.defer(
+              intent.id,
+              error instanceof Error ? error.message.split(":")[0]! : "delivery-error",
+              retryDelay(
+                intent.attempt_count + 1,
+                Math.random,
+                this.options.retryBaseMs,
+                this.options.retryCapMs,
+              ),
+            );
+          })
+          .finally(() => {
+            this.lanes.delete(intent.target_agent_id);
+            this.inFlight.delete(work);
+          });
+        this.inFlight.add(work);
+        void work;
+      }
     } finally {
-      this.busy = false;
+      this.scheduling = false;
+    }
+  }
+  private async connect() {
+    try {
+      await this.adapter.start(this.context!);
+      this.connected = true;
+      this.observeTask = this.observe();
+    } catch {
+      this.nextConnectAt = Date.now() + this.options.reconnectMs;
     }
   }
   private async cancelOne() {
@@ -137,17 +184,18 @@ export class DeliveryScheduler {
   private lease() {
     return this.store.db.transaction(() => {
       const now = Date.now(),
-        row = this.store.db
+        rows = this.store.db
           .query(
-            "SELECT * FROM delivery_intents WHERE state IN ('pending','deferred') AND not_before_ms<=? AND (deadline_ms IS NULL OR deadline_ms>?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY priority DESC,not_before_ms,created_at_ms LIMIT 1",
+            "SELECT * FROM delivery_intents WHERE state IN ('pending','deferred') AND not_before_ms<=? AND (deadline_ms IS NULL OR deadline_ms>?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY priority DESC,not_before_ms,created_at_ms LIMIT 100",
           )
-          .get(now, now, now) as DeliveryIntentRow | null;
+          .all(now, now, now) as DeliveryIntentRow[],
+        row = rows.find((item) => !this.lanes.has(item.target_agent_id));
       if (!row) return null;
       this.store.db
         .query(
           "UPDATE delivery_intents SET state='leased',lease_owner=?,lease_generation=lease_generation+1,lease_expires_at_ms=?,updated_at_ms=? WHERE id=?",
         )
-        .run(this.instanceId, now + 30_000, now, row.id);
+        .run(this.instanceId, now + this.options.leaseMs, now, row.id);
       return row;
     })();
   }
@@ -286,7 +334,12 @@ export class DeliveryScheduler {
       }
     } else if (result.outcome === "deferred") {
       this.finishAttempt(attempt, "deferred", result.reason);
-      this.defer(intent.id, result.reason, result.retryAfterMs ?? retryDelay(number));
+      this.defer(
+        intent.id,
+        result.reason,
+        result.retryAfterMs ??
+          retryDelay(number, Math.random, this.options.retryBaseMs, this.options.retryCapMs),
+      );
     } else if (result.outcome === "acceptance-unknown") {
       this.finishAttempt(
         attempt,
@@ -344,7 +397,14 @@ export class DeliveryScheduler {
       .run(Date.now(), outcome, error, token ?? null, attempt);
   }
   private async observe() {
-    for await (const event of this.adapter.observe(this.abort.signal)) this.project(event);
+    for await (const event of this.adapter.observe(this.abort.signal)) {
+      if (event.type === "adapter.connection" && event.state === "offline") {
+        this.connected = false;
+        this.nextConnectAt = Date.now() + this.options.reconnectMs;
+        return;
+      }
+      this.project(event);
+    }
   }
   private project(event: RuntimeEvent) {
     if (event.type !== "execution.completed") return;
@@ -392,8 +452,8 @@ export class DeliveryScheduler {
   }
 }
 
-export function retryDelay(attempt: number, random = Math.random) {
-  return Math.floor(random() * Math.min(30_000, 250 * 2 ** Math.min(attempt, 16)));
+export function retryDelay(attempt: number, random = Math.random, base = 250, cap = 30_000) {
+  return Math.floor(random() * Math.min(cap, base * 2 ** Math.min(attempt, 16)));
 }
 
 function toNeutral(part: StoredPart): NeutralPart {

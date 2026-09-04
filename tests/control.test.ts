@@ -38,12 +38,12 @@ describe("control protocol", () => {
     } as unknown as RuntimeAdapter;
     const handler = controlHandler(store, new Date().toISOString(), () => {}, adapter),
       token = readFileSync(paths.token, "utf8");
-    const call = async (method: string, params: unknown, version = "1") =>
+    const call = async (method: string, params: unknown, version = "1", bearer = token) =>
       handler(
         new Request("http://localhost", {
           method: "POST",
           headers: {
-            authorization: `Bearer ${token}`,
+            authorization: `Bearer ${bearer}`,
             "ACS-Control-Version": version,
             "content-type": "application/json",
           },
@@ -56,6 +56,18 @@ describe("control protocol", () => {
     );
     expect(inspected).toEqual(["thread-1"]);
     expect((await call("agents.list", {}, "2")).status).toBe(426);
+    expect(
+      (
+        store.db
+          .query(
+            "SELECT count(*) n FROM audit_events WHERE action IN ('agent.create','binding.bind')",
+          )
+          .get() as { n: number }
+      ).n,
+    ).toBe(2);
+    const bridgeToken = readFileSync(paths.bridgeToken, "utf8"),
+      denied = (await call("agents.create", { slug: "forbidden" }, "1", bridgeToken)).json();
+    expect(await denied).toMatchObject({ error: { message: "NOT_AUTHORIZED" } });
     store.close();
   });
 });

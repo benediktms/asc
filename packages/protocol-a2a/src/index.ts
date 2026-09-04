@@ -169,13 +169,21 @@ class Handler implements A2ARequestHandler {
     if (params.status !== TaskState.TASK_STATE_UNSPECIFIED)
       tasks = tasks.filter((task) => task.status?.state === params.status);
     const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100),
-      offset = Number(params.pageToken || 0),
+      offset = this.store.cursorOffset(params.pageToken),
       page = tasks
         .slice(offset, offset + pageSize)
         .map((task) => trim(asTask(task), params.historyLength));
+    const last = page.at(-1);
     return {
       tasks: page,
-      nextPageToken: offset + pageSize < tasks.length ? String(offset + pageSize) : "",
+      nextPageToken:
+        offset + pageSize < tasks.length && last
+          ? this.store.encodeCursor({
+              offset: offset + pageSize,
+              sortKey: last.status?.timestamp ?? "",
+              id: last.id,
+            })
+          : "",
       pageSize,
       totalSize: tasks.length,
     };
@@ -291,25 +299,49 @@ function terminal(state?: TaskState) {
   );
 }
 
-export async function handleA2A(store: Store, request: Request, port: number): Promise<Response> {
+export async function handleA2A(
+  store: Store,
+  request: Request,
+  port: number,
+  maxRequestBytes = 524288,
+): Promise<Response> {
   const url = new URL(request.url),
     match = url.pathname.match(/^\/agents\/([^/]+)\/(?:\.well-known\/agent-card\.json|a2a)$/);
   if (!match) return new Response("Not found", { status: 404 });
   const agent = store.agent(match[1]!);
   if (!agent || !agent.enabled) return new Response("Not found", { status: 404 });
   if (request.method === "GET" && url.pathname.endsWith("agent-card.json"))
-    return Response.json(AgentCard.toJSON(card(agent, port)));
+    return Response.json({
+      ...(AgentCard.toJSON(card(agent, port)) as Record<string, unknown>),
+      description: agent.description,
+      skills: JSON.parse(agent.skills_json),
+    });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.startsWith("application/json"))
     return new Response("Unsupported media type", { status: 415 });
   const length = Number(request.headers.get("content-length") ?? 0);
-  if (length > 524288) return new Response("Request too large", { status: 413 });
+  if (length > maxRequestBytes) return new Response("Request too large", { status: 413 });
   const token = request.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1],
     principal = token ? store.authenticate(token) : null;
   if (!principal) return new Response("Unauthorized", { status: 401 });
   const body = await request.text();
-  if (Buffer.byteLength(body) > 524288) return new Response("Request too large", { status: 413 });
+  if (Buffer.byteLength(body) > maxRequestBytes)
+    return new Response("Request too large", { status: 413 });
+  let method: unknown;
+  try {
+    method = (JSON.parse(body) as { method?: unknown }).method;
+  } catch {
+    method = undefined;
+  }
+  const requiredScope =
+    method === "SendMessage" || method === "SendStreamingMessage"
+      ? "a2a:send"
+      : method === "CancelTask"
+        ? "a2a:cancel"
+        : "a2a:read";
+  if (!principal.scopes.includes("*") && !principal.scopes.includes(requiredScope))
+    return new Response("Forbidden", { status: 403 });
   const context = new ServerCallContext({
     user: new PrincipalUser(principal.id),
     requestedVersion: request.headers.get("A2A-Version") ?? "1.0",

@@ -8,7 +8,7 @@ bun run check
 bun run format
 bun run build
 ./dist/acs init
-./dist/acs daemon run
+./dist/acs daemon start
 ```
 
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,

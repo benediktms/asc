@@ -71,9 +71,21 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (this.client) return;
     this.context = context;
     this.stopped = false;
-    this.client = new CodexAppServerClient(this.socketPath);
-    this.client.onNotification = (method, params) => this.handleNotification(method, params);
-    await this.client.start();
+    const client = new CodexAppServerClient(this.socketPath);
+    this.client = client;
+    client.onNotification = (method, params) => this.handleNotification(method, params);
+    client.onClose = () => {
+      if (this.client !== client) return;
+      this.client = undefined;
+      if (!this.stopped) this.emit({ type: "adapter.connection", state: "offline" });
+    };
+    try {
+      await client.start();
+    } catch (error) {
+      client.close();
+      if (this.client === client) this.client = undefined;
+      throw error;
+    }
     this.emit({ type: "adapter.connection", state: "online" });
   }
   async stop(_context: RuntimeAdapterStopContext) {

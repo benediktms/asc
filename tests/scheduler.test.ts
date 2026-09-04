@@ -29,6 +29,35 @@ describe("delivery scheduler", () => {
     expect(retryDelay(1, () => 0.5)).toBe(250);
     expect(retryDelay(99, () => 0.999)).toBeLessThan(30_000);
   });
+  test("starts degraded and reconnects when the runtime appears", async () => {
+    const store = fixture();
+    let starts = 0;
+    const adapter = {
+      descriptor: { adapterApiVersion: 1 },
+      async start() {
+        if (++starts === 1) throw new Error("offline");
+      },
+      async stop() {},
+      async *observe(signal: AbortSignal) {
+        yield { type: "adapter.connection", state: "online" };
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      },
+    } as unknown as RuntimeAdapter;
+    const scheduler = new DeliveryScheduler(store, adapter, "reconnect", {
+      concurrency: 1,
+      leaseMs: 1000,
+      retryBaseMs: 10,
+      retryCapMs: 100,
+      reconnectMs: 10,
+    });
+    await scheduler.start();
+    await Bun.sleep(300);
+    expect(starts).toBe(2);
+    await scheduler.stop();
+    store.close();
+  });
   test("leases and accepts context delivery through the runtime port", async () => {
     const store = fixture(),
       agent = store.createAgent("backend"),
