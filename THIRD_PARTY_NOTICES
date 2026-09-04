@@ -1,0 +1,27 @@
+Agent Communications Service third-party notices
+
+The JavaScript bundle contains these direct or transitively bundled packages:
+
+@a2a-js/sdk 1.1.0                 Apache-2.0
+@modelcontextprotocol/sdk 1.30.0 MIT
+ajv 8.20.0                       MIT
+ajv-formats 3.0.1               MIT
+fast-deep-equal 3.1.3            MIT
+fast-uri 3.1.7                   BSD-3-Clause
+json-schema-traverse 1.0.0       MIT
+zod 4.1.5                        MIT
+zod-to-json-schema 3.25.2        ISC
+
+Their license texts and source metadata are distributed in their respective
+packages. Source repositories are linked from each package's package.json.
+
+The standalone executable embeds Bun 1.3.14. Bun itself is MIT licensed and
+statically links additional software, including JavaScriptCore/WebKit under
+LGPL-2.0 and other libraries under their respective licenses. Bun's official
+license inventory, corresponding sources, and relinking instructions are at:
+
+https://github.com/oven-sh/bun/blob/bun-v1.3.14/LICENSE.md
+https://github.com/oven-sh/bun/blob/bun-v1.3.14/docs/project/license.mdx
+https://github.com/oven-sh/webkit
+
+The Bun source revision used for these binaries is 0d9b296af.

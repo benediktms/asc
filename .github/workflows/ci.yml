@@ -56,6 +56,9 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
-      - run: mkdir -p "dist/${{ matrix.target }}"
-      - run: bun build apps/acs/src/main.ts --compile --target="${{ matrix.target }}" --outfile="dist/${{ matrix.target }}/acs"
-      - run: test -s "dist/${{ matrix.target }}/acs"
+      - run: bun run release -- --target "${{ matrix.target }}"
+      - run: test -s "dist/release/${{ matrix.target }}/acs"
+      - run: test -s "dist/release/${{ matrix.target }}/LICENSE"
+      - run: test -s "dist/release/${{ matrix.target }}/THIRD_PARTY_NOTICES"
+      - run: shasum -a 256 -c SHA256SUMS
+        working-directory: dist/release/${{ matrix.target }}

@@ -2,6 +2,7 @@
   "name": "agent-communications-service",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",
@@ -13,6 +14,7 @@
     "format:check": "oxfmt --check . '!packages/codex-protocol-generated/**'",
     "generate:codex": "bun scripts/generate-codex-protocol.ts",
     "lint": "oxlint -D correctness -D suspicious -D perf -D typescript/no-explicit-any -D typescript/prefer-enum-initializers -A no-await-in-loop -A no-underscore-dangle --import-plugin --deny-warnings --ignore-pattern packages/codex-protocol-generated/** .",
+    "release": "bun scripts/build-release.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:a2a-tck": "bun scripts/run-a2a-tck.ts",
