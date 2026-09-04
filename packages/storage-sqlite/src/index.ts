@@ -210,6 +210,7 @@ export class Store {
     maxInlineContentBytes: number;
     claimTtlSeconds: number;
     defaultMode: "wake_when_idle" | "append_context";
+    maxQueuedDeliveryIntents: number;
     busyTimeoutMs: number;
     durability: "balanced" | "strict";
   };
@@ -221,6 +222,7 @@ export class Store {
       maxInlineContentBytes: 262144,
       claimTtlSeconds: 600,
       defaultMode: "wake_when_idle",
+      maxQueuedDeliveryIntents: 1000,
       busyTimeoutMs: 5000,
       durability: "balanced",
       ...limits,
@@ -809,6 +811,12 @@ export class Store {
       return { ...JSON.parse(existing.response_json), duplicate: true };
     }
     const result = this.db.transaction(() => {
+      const queued = this.db
+        .query<{ count: number }, [string]>(
+          "SELECT count(*) count FROM delivery_intents WHERE target_agent_id=? AND state IN ('pending','leased','attempting','deferred','acceptance-unknown')",
+        )
+        .get(agentId)!.count;
+      if (queued >= this.limits.maxQueuedDeliveryIntents) throw new Error("ACS_OVERLOADED");
       const now = Date.now(),
         contextId = message.contextId || id("ctx"),
         taskId = message.taskId || id("tsk"),

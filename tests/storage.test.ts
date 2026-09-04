@@ -10,7 +10,7 @@ const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true });
 });
-function fixture() {
+function fixture(limits: Partial<Store["limits"]> = {}) {
   const root = mkdtempSync(join(tmpdir(), "acs-"));
   roots.push(root);
   const p: Paths = {
@@ -20,7 +20,11 @@ function fixture() {
     bridgeToken: join(root, "bridge.token"),
     secret: join(root, "secret.key"),
   };
-  return new Store(p);
+  return new Store(p, limits);
+}
+
+function requestMessage(messageId: string) {
+  return Message.fromJSON({ messageId, role: Role.ROLE_USER, parts: [{ text: "work" }] });
 }
 
 describe("durable acceptance", () => {
@@ -81,6 +85,20 @@ describe("durable acceptance", () => {
     expect(first.duplicate).toBe(false);
     expect(second.duplicate).toBe(true);
     expect(store.db.query("SELECT count(*) n FROM delivery_intents").get()).toEqual({ n: 1 });
+    store.close();
+  });
+  test("rejects target overload without partial acceptance", () => {
+    const store = fixture({ maxQueuedDeliveryIntents: 1 }),
+      agent = store.createAgent("overloaded-worker"),
+      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    store.accept(agent.id, principal.id, requestMessage("overload-1"), {});
+    expect(() => store.accept(agent.id, principal.id, requestMessage("overload-2"), {})).toThrow(
+      "ACS_OVERLOADED",
+    );
+    expect(store.db.query("SELECT count(*) count FROM a2a_tasks").get()).toEqual({ count: 1 });
+    expect(store.db.query("SELECT count(*) count FROM delivery_intents").get()).toEqual({
+      count: 1,
+    });
     store.close();
   });
   test("rolls back when any acceptance write fails", () => {
