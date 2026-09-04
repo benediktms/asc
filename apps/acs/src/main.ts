@@ -139,7 +139,7 @@ async function daemon() {
     hostname: listen.hostname,
     port,
     fetch: (request) => handleA2A(store, request, port, settings.security.maxRequestBytes),
-    error: sanitizedError,
+    error: (error) => sanitizedError(error, String(process.pid)),
   });
   let control: ReturnType<typeof Bun.serve>;
   let finish!: () => void;
@@ -172,24 +172,36 @@ async function daemon() {
   control = Bun.serve({
     unix: config.runtime,
     fetch: controlHandler(store, startedAt, stop, adapter),
-    error: sanitizedError,
+    error: (error) => sanitizedError(error, String(process.pid)),
   });
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
-  console.error(
-    JSON.stringify({
-      level: "info",
-      event: "daemon.started",
-      a2a: a2a.url.toString(),
-      control: config.runtime,
-    }),
-  );
+  log("info", "daemon.started", String(process.pid), {
+    a2a: a2a.url.origin,
+    control: "ready",
+  });
   await stopped;
 }
 
-function sanitizedError(error: Error) {
-  console.error(JSON.stringify({ level: "error", code: error.message.split(":")[0] }));
+function sanitizedError(error: Error, instanceId: string) {
+  log("error", "daemon.error", instanceId, { code: error.message.split(":")[0] });
   return Response.json({ error: "internal" }, { status: 500 });
+}
+function log(
+  severity: "info" | "error",
+  event: string,
+  daemonInstanceId: string,
+  attributes: Record<string, unknown>,
+) {
+  console.error(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      severity,
+      daemonInstanceId,
+      event,
+      ...attributes,
+    }),
+  );
 }
 function option(name: string) {
   const i = args.indexOf(name);

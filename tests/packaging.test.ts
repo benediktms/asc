@@ -48,6 +48,11 @@ test("compiled binary runs the clean-machine service workflow", async () => {
     stderr: "pipe",
   });
   processes.push(daemon);
+  const startedLog = record(JSON.parse((await readUntil(daemon.stderr, "\n")).trim()));
+  expect(startedLog.severity).toBe("info");
+  expect(startedLog.event).toBe("daemon.started");
+  expect(string(startedLog.timestamp)).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  expect(JSON.stringify(startedLog)).not.toContain(root);
   const socket = join(root, "control.sock");
   await waitFor(() => existsSync(socket));
 
