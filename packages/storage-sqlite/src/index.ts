@@ -831,6 +831,16 @@ export class Store {
     message: StoredMessage,
     options: DeliveryOptions,
   ): { task: StoredTask; deliveryId: string; duplicate: boolean } {
+    return telemetry.traceSync("task.accept", () =>
+      this.acceptTask(agentId, principalId, message, options),
+    );
+  }
+  private acceptTask(
+    agentId: string,
+    principalId: string,
+    message: StoredMessage,
+    options: DeliveryOptions,
+  ): { task: StoredTask; deliveryId: string; duplicate: boolean } {
     if (!message.messageId || !message.parts.length)
       throw new Error("VALIDATION_FAILED: messageId and parts are required");
     if (message.parts.length > 32) throw new Error("ACS_MESSAGE_TOO_LARGE");
@@ -1041,6 +1051,17 @@ export class Store {
     summary = "",
     details: Record<string, unknown> = {},
   ): StoredTask {
+    return telemetry.traceSync("task.transition", () =>
+      this.transitionTask(taskId, principalId, next, summary, details),
+    );
+  }
+  private transitionTask(
+    taskId: string,
+    principalId: string,
+    next: TaskState,
+    summary: string,
+    details: Record<string, unknown>,
+  ): StoredTask {
     return this.write(() => {
       const row = this.db
         .query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?")
@@ -1127,36 +1148,38 @@ export class Store {
           [string]
         >("SELECT * FROM task_subscriptions WHERE task_id=? AND status='active'")
         .all(taskId);
-      for (const subscription of subscriptions) {
-        const filters = stringArray(subscription.event_filter_json),
-          isTerminal = ["completed", "failed", "canceled", "rejected"].includes(state);
-        if (!filters.includes(state) && !(isTerminal && filters.includes("terminal"))) continue;
-        const payload = {
-            taskId,
-            contextId: row.context_id,
-            state,
-            sequence: row.next_event_sequence,
-            summary,
-          },
-          deliveryId = id("int");
-        this.db
-          .query(
-            "INSERT INTO delivery_intents(id,kind,task_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,'append_context',10,'pending',?,?,?,?,?)",
-          )
-          .run(
-            deliveryId,
-            "task-event-notification",
-            taskId,
-            subscription.subscriber_agent_id,
-            subscription.origin_binding_id,
-            subscription.origin_binding_epoch,
-            now,
-            JSON.stringify(payload),
-            this.payloadHash(payload),
-            now,
-            now,
-          );
-      }
+      telemetry.traceSync("task.notify", () => {
+        for (const subscription of subscriptions) {
+          const filters = stringArray(subscription.event_filter_json),
+            isTerminal = ["completed", "failed", "canceled", "rejected"].includes(state);
+          if (!filters.includes(state) && !(isTerminal && filters.includes("terminal"))) continue;
+          const payload = {
+              taskId,
+              contextId: row.context_id,
+              state,
+              sequence: row.next_event_sequence,
+              summary,
+            },
+            deliveryId = id("int");
+          this.db
+            .query(
+              "INSERT INTO delivery_intents(id,kind,task_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,'append_context',10,'pending',?,?,?,?,?)",
+            )
+            .run(
+              deliveryId,
+              "task-event-notification",
+              taskId,
+              subscription.subscriber_agent_id,
+              subscription.origin_binding_id,
+              subscription.origin_binding_epoch,
+              now,
+              JSON.stringify(payload),
+              this.payloadHash(payload),
+              now,
+              now,
+            );
+        }
+      });
       if (state === TaskState.Canceled)
         this.db
           .query(

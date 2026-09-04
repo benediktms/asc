@@ -158,21 +158,27 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return { sessions, nextCursor: page.nextCursor ?? undefined };
   }
   async inspectSession(session: RuntimeSessionRef): Promise<RuntimeSessionSnapshot> {
-    try {
-      return this.snapshot(
-        (await this.requireClient().readThread({ threadId: session.opaqueId, includeTurns: false }))
-          .thread,
-      );
-    } catch (error: unknown) {
-      if (/not found|invalid thread/i.test(errorMessage(error)))
-        return {
-          session,
-          availability: "offline",
-          observedAt: new Date().toISOString(),
-          attributes: {},
-        };
-      throw error;
-    }
+    return telemetry.trace("runtime.inspect", async () => {
+      try {
+        return this.snapshot(
+          (
+            await this.requireClient().readThread({
+              threadId: session.opaqueId,
+              includeTurns: false,
+            })
+          ).thread,
+        );
+      } catch (error: unknown) {
+        if (/not found|invalid thread/i.test(errorMessage(error)))
+          return {
+            session,
+            availability: "offline",
+            observedAt: new Date().toISOString(),
+            attributes: {},
+          };
+        throw error;
+      }
+    });
   }
   async *observe(signal: AbortSignal): AsyncIterable<RuntimeEvent> {
     while (!this.stopped && !signal.aborted) {

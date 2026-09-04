@@ -161,6 +161,7 @@ export function controlHandler(
             adapters: [{ adapterId: "codex.app-server", status: probe?.state ?? "unavailable" }],
             startedAt,
             metrics: store.metrics(),
+            traces: telemetry.traceSnapshot(),
           });
         }
         case "system.capabilities":

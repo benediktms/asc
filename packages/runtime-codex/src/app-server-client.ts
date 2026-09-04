@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { telemetry } from "../../observability/src/index";
 import type { ThreadInjectItemsParams } from "../../codex-protocol-generated/src/v2/ThreadInjectItemsParams";
 import type { ThreadListParams } from "../../codex-protocol-generated/src/v2/ThreadListParams";
 import type { ThreadReadParams } from "../../codex-protocol-generated/src/v2/ThreadReadParams";
@@ -109,7 +110,7 @@ export class CodexAppServerClient {
       this.pending.set(id, { resolve, reject, timer });
     });
     this.sendFrame(0x1, Buffer.from(JSON.stringify({ id, method, params })));
-    return promise;
+    return telemetry.trace("codex.rpc", () => promise);
   }
 
   notify(method: string, params: unknown) {

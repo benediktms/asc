@@ -9,6 +9,15 @@ export type MetricName =
   | "acs_runtime_sessions_by_state"
   | "acs_sqlite_busy_total"
   | "acs_control_requests_total";
+export type SpanName =
+  | "a2a.receive"
+  | "task.accept"
+  | "delivery.lease"
+  | "runtime.inspect"
+  | "runtime.deliver"
+  | "codex.rpc"
+  | "task.transition"
+  | "task.notify";
 
 type Labels = Record<string, string>;
 type Point = { name: MetricName; labels: Labels; value: number; count?: number };
@@ -29,6 +38,12 @@ export class Telemetry {
   private counters = new Map<string, Point>();
   private gauges = new Map<string, Point>();
   private histograms = new Map<string, Point>();
+  private spans: Array<{
+    name: SpanName;
+    startedAt: string;
+    durationMs: number;
+    status: "ok" | "error";
+  }> = [];
 
   increment(name: MetricName, labels: Labels = {}, amount = 1) {
     const key = metricKey(name, labels),
@@ -69,10 +84,56 @@ export class Telemetry {
       );
   }
 
+  traceSync<T>(name: SpanName, operation: () => T): T {
+    const startedAt = new Date().toISOString(),
+      started = performance.now();
+    try {
+      const result = operation();
+      this.recordSpan(name, startedAt, performance.now() - started, "ok");
+      return result;
+    } catch (error) {
+      this.recordSpan(name, startedAt, performance.now() - started, "error");
+      throw error;
+    }
+  }
+
+  async trace<T>(name: SpanName, operation: () => Promise<T>): Promise<T> {
+    const startedAt = new Date().toISOString(),
+      started = performance.now();
+    try {
+      const result = await operation();
+      this.recordSpan(name, startedAt, performance.now() - started, "ok");
+      return result;
+    } catch (error) {
+      this.recordSpan(name, startedAt, performance.now() - started, "error");
+      throw error;
+    }
+  }
+
+  traceSnapshot() {
+    return this.spans.map((span) => ({
+      name: span.name,
+      startedAt: span.startedAt,
+      durationMs: span.durationMs,
+      status: span.status,
+    }));
+  }
+
   reset() {
     this.counters.clear();
     this.gauges.clear();
     this.histograms.clear();
+    this.spans.length = 0;
+  }
+
+  private recordSpan(
+    name: SpanName,
+    startedAt: string,
+    durationMs: number,
+    status: "ok" | "error",
+  ) {
+    this.spans.push({ name, startedAt, durationMs, status });
+    if (this.spans.length > 256) this.spans.shift();
   }
 }
 

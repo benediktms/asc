@@ -268,22 +268,24 @@ export class DeliveryScheduler {
     return true;
   }
   private lease() {
-    return this.store.write(() => {
-      const now = Date.now(),
-        rows = this.store.db
-          .query<DeliveryIntentRow, [number, number, number]>(
-            "SELECT * FROM delivery_intents WHERE state IN ('pending','deferred') AND not_before_ms<=? AND (deadline_ms IS NULL OR deadline_ms>?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY priority DESC,not_before_ms,created_at_ms LIMIT 100",
+    return telemetry.traceSync("delivery.lease", () =>
+      this.store.write(() => {
+        const now = Date.now(),
+          rows = this.store.db
+            .query<DeliveryIntentRow, [number, number, number]>(
+              "SELECT * FROM delivery_intents WHERE state IN ('pending','deferred') AND not_before_ms<=? AND (deadline_ms IS NULL OR deadline_ms>?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY priority DESC,not_before_ms,created_at_ms LIMIT 100",
+            )
+            .all(now, now, now),
+          row = rows.find((item) => !this.lanes.has(item.target_agent_id));
+        if (!row) return null;
+        this.store.db
+          .query(
+            "UPDATE delivery_intents SET state='leased',lease_owner=?,lease_generation=lease_generation+1,lease_expires_at_ms=?,updated_at_ms=? WHERE id=?",
           )
-          .all(now, now, now),
-        row = rows.find((item) => !this.lanes.has(item.target_agent_id));
-      if (!row) return null;
-      this.store.db
-        .query(
-          "UPDATE delivery_intents SET state='leased',lease_owner=?,lease_generation=lease_generation+1,lease_expires_at_ms=?,updated_at_ms=? WHERE id=?",
-        )
-        .run(this.instanceId, now + this.options.leaseMs, now, row.id);
-      return row;
-    });
+          .run(this.instanceId, now + this.options.leaseMs, now, row.id);
+        return row;
+      }),
+    );
   }
   private async deliver(intent: DeliveryIntentRow) {
     const now = Date.now(),
@@ -477,7 +479,7 @@ export class DeliveryScheduler {
       adapter: this.adapter.descriptor.adapterId,
     });
     try {
-      return await this.adapter.deliver(request);
+      return await telemetry.trace("runtime.deliver", () => this.adapter.deliver(request));
     } finally {
       telemetry.observe("acs_delivery_latency_ms", performance.now() - started, {
         adapter: this.adapter.descriptor.adapterId,

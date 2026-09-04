@@ -330,7 +330,9 @@ export async function handleA2A(
   const started = performance.now();
   telemetry.increment("acs_a2a_requests_total");
   try {
-    return await handleA2ARoute(store, request, port, maxRequestBytes);
+    return await telemetry.trace("a2a.receive", () =>
+      handleA2ARoute(store, request, port, maxRequestBytes),
+    );
   } finally {
     telemetry.observe("acs_a2a_request_duration_ms", performance.now() - started);
   }

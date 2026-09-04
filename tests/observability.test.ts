@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { Telemetry } from "../packages/observability/src/index";
 
-test("records counters, gauges, histograms, and zero-valued required metrics", () => {
+test("records metrics and bounded trace spans", async () => {
   const telemetry = new Telemetry();
   telemetry.increment("acs_a2a_requests_total", { method: "SendMessage" });
   telemetry.gauge("acs_tasks_by_state", 2, { state: "working" });
@@ -18,4 +18,10 @@ test("records counters, gauges, histograms, and zero-valued required metrics", (
   expect(names).toContain("acs_delivery_attempts_total");
   expect(names).toContain("acs_runtime_sessions_by_state");
   expect(names).toContain("acs_sqlite_busy_total");
+  telemetry.traceSync("task.accept", () => undefined);
+  await telemetry.trace("a2a.receive", async () => undefined);
+  expect(telemetry.traceSnapshot().map((span) => span.name)).toEqual([
+    "task.accept",
+    "a2a.receive",
+  ]);
 });

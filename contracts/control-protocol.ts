@@ -197,6 +197,12 @@ export interface ControlMethodMap {
         readonly value: number;
         readonly count?: number;
       }[];
+      readonly traces: readonly {
+        readonly name: string;
+        readonly startedAt: string;
+        readonly durationMs: number;
+        readonly status: "ok" | "error";
+      }[];
     };
   };
 
