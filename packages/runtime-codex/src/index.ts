@@ -386,8 +386,6 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private responseItem(envelope: RuntimeDeliveryEnvelopeV1): ResponseItem {
     return {
       type: "function_call_output",
-      id: envelope.deliveryId,
-      call_id: envelope.deliveryId,
       name: "receive_agent_message",
       namespace: "acs",
       output: JSON.stringify(envelope),
