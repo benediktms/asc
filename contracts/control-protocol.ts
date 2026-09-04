@@ -228,6 +228,7 @@ export interface ControlMethodMap {
     readonly params: {
       readonly enabled?: boolean;
       readonly availability?: readonly RuntimeAvailability[];
+      readonly skill?: string;
       readonly text?: string;
       readonly limit?: number;
       readonly cursor?: string;

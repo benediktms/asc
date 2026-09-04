@@ -144,25 +144,20 @@ export async function runMcp(port = 7432) {
       execute(async () => {
         const page = await typedCall(
           "agents.list",
-          { limit: args.limit, cursor: args.cursor },
+          {
+            availability:
+              args.status === "available"
+                ? ["idle"]
+                : args.status === "unavailable"
+                  ? ["unknown", "offline", "dormant", "busy", "awaiting-local-input", "degraded"]
+                  : undefined,
+            skill: args.skill,
+            limit: args.limit,
+            cursor: args.cursor,
+          },
           agentPageSchema,
         );
-        const items = page.items.filter(
-          (agent) =>
-            (args.status === "available"
-              ? agent.availability === "idle"
-              : args.status === "unavailable"
-                ? agent.availability !== "idle"
-                : true) &&
-            (!args.skill ||
-              agent.skills.some(
-                (skill) =>
-                  skill.id === args.skill ||
-                  skill.name === args.skill ||
-                  skill.tags?.includes(args.skill!),
-              )),
-        );
-        return { agents: items, nextCursor: page.nextCursor };
+        return { agents: page.items, nextCursor: page.nextCursor };
       }),
   );
   server.registerTool(

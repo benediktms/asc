@@ -62,6 +62,7 @@ const partSchema = z.discriminatedUnion("kind", [
     retryable: z.boolean().optional(),
     blocking: z.boolean().optional(),
     session: z.union([z.string(), z.object({ opaqueId: z.string() })]).optional(),
+    skill: z.string().optional(),
     slug: z.string().optional(),
     summary: z.string().optional(),
     targetAgent: z.string().optional(),
@@ -219,6 +220,7 @@ export function controlHandler(
                 ({ agent, dto }) =>
                   (p.enabled === undefined || Boolean(agent.enabled) === p.enabled) &&
                   (!p.availability?.length || p.availability.includes(dto.availability)) &&
+                  (!p.skill || agentHasSkill(agent.skills_json, p.skill)) &&
                   (!text ||
                     [agent.slug, agent.display_name, agent.description].some((value) =>
                       value.toLowerCase().includes(text),
@@ -766,6 +768,15 @@ function jsonArray(json: string) {
   const value: unknown = JSON.parse(json);
   if (!Array.isArray(value)) throw new Error("STORAGE_CORRUPT: expected array");
   return value;
+}
+function agentHasSkill(json: string, skill: string) {
+  return jsonArray(json).some(
+    (item) =>
+      isRecord(item) &&
+      (item.id === skill ||
+        item.name === skill ||
+        (Array.isArray(item.tags) && item.tags.includes(skill))),
+  );
 }
 function jsonRecord(json: string) {
   const value: unknown = JSON.parse(json);

@@ -109,6 +109,10 @@ describe("control protocol", () => {
     expect(slugs(firstAgents.items)).toEqual(["beta"]);
     expect(slugs(secondAgents.items)).toEqual(["delta"]);
     expect(slugs((await call("agents.list", { text: "ELT" })).items)).toEqual(["delta"]);
+    store.updateAgent("delta", {
+      skills: [{ id: "reports", name: "Reporting", description: "Build reports", tags: ["data"] }],
+    });
+    expect(slugs((await call("agents.list", { skill: "data" })).items)).toEqual(["delta"]);
 
     store.bind(beta.id, "beta-old");
     const betaBinding = store.bind(beta.id, "beta-current"),
