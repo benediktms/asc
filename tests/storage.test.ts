@@ -83,6 +83,100 @@ describe("durable acceptance", () => {
     expect(store.db.query("SELECT count(*) n FROM delivery_intents").get()).toEqual({ n: 1 });
     store.close();
   });
+  test("rolls back every acceptance write when delivery persistence fails", () => {
+    const store = fixture(),
+      agent = store.createAgent("rollback-worker"),
+      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    store.db.exec(
+      "CREATE TEMP TRIGGER fail_delivery BEFORE INSERT ON delivery_intents BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+    );
+    expect(() =>
+      store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "rollback",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        {},
+      ),
+    ).toThrow("injected failure");
+    for (const table of [
+      "conversation_contexts",
+      "a2a_tasks",
+      "a2a_messages",
+      "task_events",
+      "delivery_intents",
+      "idempotency_records",
+    ])
+      expect(store.db.query(`SELECT count(*) count FROM ${table}`).get()).toEqual({ count: 0 });
+    store.close();
+  });
+  test("recovers committed work after a WAL restart", () => {
+    const store = fixture(),
+      config = store.config,
+      agent = store.createAgent("restart-worker"),
+      principal = store.authenticate(readFileSync(config.token, "utf8"))!,
+      accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({ messageId: "restart", role: Role.ROLE_USER, parts: [{ text: "work" }] }),
+        {},
+      );
+    store.close();
+    const reopened = new Store(config);
+    expect(reopened.db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+    expect(reopened.task(accepted.task.id, principal.id)?.id).toBe(accepted.task.id);
+    expect(
+      reopened.db.query("SELECT state FROM delivery_intents WHERE id=?").get(accepted.deliveryId),
+    ).toEqual({ state: "pending" });
+    reopened.close();
+  });
+  test("detects and repairs task projection drift from the event log", () => {
+    const store = fixture(),
+      target = store.createAgent("projection-worker"),
+      binding = store.bind(target.id, "projection-thread"),
+      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!,
+      accepted = store.accept(
+        target.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "projection",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        {},
+      );
+    store.publishMessage(accepted.task.id, binding.principalId, [
+      { content: { $case: "text", value: "result" }, filename: "", mediaType: "text/plain" },
+    ]);
+    store.publishArtifacts(accepted.task.id, binding.principalId, [
+      {
+        artifactId: "artifact-1",
+        name: "result",
+        description: "",
+        parts: [
+          { content: { $case: "text", value: "artifact" }, filename: "", mediaType: "text/plain" },
+        ],
+        extensions: [],
+      },
+    ]);
+    store.setTaskState(accepted.task.id, binding.principalId, TaskState.Completed, "done");
+    store.db
+      .query("UPDATE a2a_tasks SET state='submitted',a2a_snapshot_json=? WHERE id=?")
+      .run(JSON.stringify(accepted.task), accepted.task.id);
+    expect(store.verifyTaskProjections()).toEqual({
+      checked: 1,
+      mismatched: [accepted.task.id],
+      missing: [],
+      repaired: 0,
+    });
+    expect(store.verifyTaskProjections(true).repaired).toBe(1);
+    expect(store.verifyTaskProjections().mismatched).toEqual([]);
+    expect(store.task(accepted.task.id, requester.id)?.status?.state).toBe(3);
+    store.close();
+  });
   test("uses delivery defaults and queues subscribed terminal notifications", () => {
     const store = fixture(),
       sender = store.createAgent("sender"),

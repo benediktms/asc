@@ -79,6 +79,43 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("recovers an expired delivery lease after restart", async () => {
+    const store = fixture(),
+      agent = store.createAgent("expired-lease-worker"),
+      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    store.bind(agent.id, "expired-lease-thread");
+    const accepted = store.accept(
+      agent.id,
+      principal.id,
+      Message.fromJSON({
+        messageId: "expired-lease",
+        role: "ROLE_USER",
+        parts: [{ text: "work" }],
+      }),
+      { mode: "append_context" },
+    );
+    store.db
+      .query(
+        "UPDATE delivery_intents SET state='leased',lease_owner='dead-process',lease_expires_at_ms=? WHERE id=?",
+      )
+      .run(Date.now() - 1, accepted.deliveryId);
+    const adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => ({
+      outcome: "accepted",
+      acceptedAt: new Date().toISOString(),
+      evidence: { scheme: "fake", value: "recovered" },
+    });
+    const scheduler = new DeliveryScheduler(store, adapter, "replacement");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(
+      store.db
+        .query("SELECT state,lease_owner,lease_expires_at_ms FROM delivery_intents WHERE id=?")
+        .get(accepted.deliveryId),
+    ).toEqual({ state: "accepted", lease_owner: null, lease_expires_at_ms: null });
+    await scheduler.stop();
+    store.close();
+  });
   test("interrupts only the correlated ACS execution on cancellation", async () => {
     const store = fixture(),
       agent = store.createAgent("cancel-target"),

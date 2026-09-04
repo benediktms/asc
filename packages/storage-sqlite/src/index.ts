@@ -738,6 +738,48 @@ export class Store {
       )
       .all(taskId, sequence);
   }
+  verifyTaskProjections(repair = false) {
+    const rows = this.db
+        .query<
+          {
+            id: string;
+            state: TaskState;
+            a2a_snapshot_json: string;
+            event_payload_json: string | null;
+          },
+          []
+        >(
+          "SELECT t.id,t.state,t.a2a_snapshot_json,(SELECT e.payload_json FROM task_events e WHERE e.task_id=t.id AND json_type(e.payload_json,'$.snapshot')='object' ORDER BY e.sequence DESC LIMIT 1) event_payload_json FROM a2a_tasks t ORDER BY t.id",
+        )
+        .all(),
+      mismatched: string[] = [],
+      missing: string[] = [],
+      repairs: { id: string; state: TaskState; snapshot: StoredTask }[] = [];
+    for (const row of rows) {
+      const payload: unknown = row.event_payload_json ? JSON.parse(row.event_payload_json) : null,
+        rebuilt = isRecord(payload) ? storedTaskSchema.safeParse(payload.snapshot) : undefined;
+      if (!rebuilt?.success) {
+        missing.push(row.id);
+        continue;
+      }
+      const state = taskState(rebuilt.data);
+      if (
+        canonical(rebuilt.data) === canonical(parseTask(row.a2a_snapshot_json)) &&
+        state === row.state
+      )
+        continue;
+      mismatched.push(row.id);
+      repairs.push({ id: row.id, state, snapshot: rebuilt.data });
+    }
+    if (repair && repairs.length)
+      this.db.transaction(() => {
+        for (const item of repairs)
+          this.db
+            .query("UPDATE a2a_tasks SET state=?,a2a_snapshot_json=? WHERE id=?")
+            .run(item.state, JSON.stringify(item.snapshot), item.id);
+      })();
+    return { checked: rows.length, mismatched, missing, repaired: repair ? repairs.length : 0 };
+  }
   accept(
     agentId: string,
     principalId: string,
@@ -868,7 +910,7 @@ export class Store {
           sequence,
           continuation ? "message-received" : "task-created",
           principalId,
-          JSON.stringify({ messageId: message.messageId }),
+          JSON.stringify({ messageId: message.messageId, snapshot: task }),
           now,
         );
       this.db
@@ -1012,7 +1054,7 @@ export class Store {
           row.next_event_sequence,
           eventType[state],
           principalId,
-          JSON.stringify({ summary, ...details }),
+          JSON.stringify({ summary, ...details, snapshot: task }),
           now,
         );
       this.db
@@ -1109,7 +1151,7 @@ export class Store {
           row.next_event_sequence,
           "cancellation-requested",
           principalId,
-          JSON.stringify({ reason }),
+          JSON.stringify({ reason, snapshot: task }),
           now,
         );
       this.db
@@ -1169,7 +1211,7 @@ export class Store {
           row.next_event_sequence,
           "message-published",
           principalId,
-          JSON.stringify({ messageId: message.messageId }),
+          JSON.stringify({ messageId: message.messageId, snapshot: task }),
           now,
         );
       this.db
@@ -1199,7 +1241,10 @@ export class Store {
           row.next_event_sequence,
           "artifact-published",
           principalId,
-          JSON.stringify({ artifactIds: artifacts.map((artifact) => artifact.artifactId) }),
+          JSON.stringify({
+            artifactIds: artifacts.map((artifact) => artifact.artifactId),
+            snapshot: task,
+          }),
           now,
         );
       this.db
@@ -1283,6 +1328,28 @@ function parseTask(json: string): StoredTask {
   const result = storedTaskSchema.safeParse(JSON.parse(json));
   if (!result.success) throw new Error("STORAGE_CORRUPT: invalid task snapshot");
   return result.data;
+}
+function taskState(task: StoredTask): TaskState {
+  switch (task.status?.state) {
+    case 1:
+      return TaskState.Submitted;
+    case 2:
+      return TaskState.Working;
+    case 3:
+      return TaskState.Completed;
+    case 4:
+      return TaskState.Failed;
+    case 5:
+      return TaskState.Canceled;
+    case 6:
+      return TaskState.InputRequired;
+    case 7:
+      return TaskState.Rejected;
+    case 8:
+      return TaskState.AuthRequired;
+    default:
+      throw new Error("STORAGE_CORRUPT: invalid task state");
+  }
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
