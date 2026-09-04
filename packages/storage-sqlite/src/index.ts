@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import migration from "../../../storage/001_initial.sql" with { type: "text" };
 import { agentSlug, canonical, id, TaskState, transition } from "../../domain/src/index";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
   BindingId,
@@ -49,6 +49,19 @@ export interface StoredArtifact {
   metadata?: Record<string, unknown>;
   extensions: string[];
 }
+
+type StoredAttestation =
+  | { readonly kind: "unattested"; readonly reason: "missing-session-id" | "unbound-session" }
+  | {
+      readonly kind: "attested";
+      readonly scheme: "codex-mcp-thread-meta-v1";
+      readonly bindingId: BindingId;
+      readonly bindingEpoch: number;
+      readonly agentId: `agt_${string}`;
+      readonly principalId: `prn_${string}`;
+      readonly slug: string;
+      readonly displayName: string;
+    };
 
 const storedPartSchema = z.object({
     content: z
@@ -190,18 +203,16 @@ export function paths(): Paths {
 export function initFiles(target = paths()): string {
   mkdirSync(dirname(target.data), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(target.runtime), { recursive: true, mode: 0o700 });
-  if (!Bun.file(target.secret).size) {
-    writeFileSync(target.secret, randomBytes(32));
-    chmodSync(target.secret, 0o600);
-  }
-  if (!Bun.file(target.token).size) {
+  if ((statSync(dirname(target.runtime)).mode & 0o777) !== 0o700)
+    throw new Error("VALIDATION_FAILED: runtime directory must have mode 0700");
+  if (!Bun.file(target.secret).size) writeFileSync(target.secret, randomBytes(32));
+  chmodSync(target.secret, 0o600);
+  if (!Bun.file(target.token).size)
     writeFileSync(target.token, randomBytes(32).toString("base64url"));
-    chmodSync(target.token, 0o600);
-  }
-  if (!Bun.file(target.bridgeToken).size) {
+  chmodSync(target.token, 0o600);
+  if (!Bun.file(target.bridgeToken).size)
     writeFileSync(target.bridgeToken, randomBytes(32).toString("base64url"));
-    chmodSync(target.bridgeToken, 0o600);
-  }
+  chmodSync(target.bridgeToken, 0o600);
   return readFileSync(target.token, "utf8");
 }
 
@@ -592,7 +603,7 @@ export class Store {
   createClaim(agentValue: string, principalId: string, ttlSeconds = this.limits.claimTtlSeconds) {
     const agent = this.agent(agentValue);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
-    const claimCode = randomBytes(24).toString("base64url"),
+    const claimCode = bindingClaimCode(),
       claimId = id("clm"),
       now = Date.now(),
       expires = now + Math.min(Math.max(ttlSeconds, 1), 3600) * 1000;
@@ -604,25 +615,33 @@ export class Store {
     return { claimId, claimCode, expiresAt: new Date(expires).toISOString() };
   }
   claim(code: string, sessionId: string) {
-    const row = this.db
-      .query<{ id: `clm_${string}`; agent_id: `agt_${string}` }, [Buffer, number]>(
-        "SELECT * FROM binding_claims WHERE code_hash=? AND consumed_at_ms IS NULL AND expires_at_ms>?",
-      )
-      .get(this.hashToken(code), Date.now());
-    if (!row) throw new Error("VALIDATION_FAILED: invalid or expired claim");
     return this.write(() => {
-      const binding = this.bind(row.agent_id, sessionId);
-      this.db
-        .query(
-          "UPDATE binding_claims SET consumed_at_ms=?,consumed_by_binding_id=? WHERE id=? AND consumed_at_ms IS NULL",
-        )
-        .run(Date.now(), binding.id, row.id);
+      const candidates = this.db
+          .query<
+            { id: `clm_${string}`; agent_id: `agt_${string}`; code_hash: Uint8Array },
+            [number]
+          >(
+            "SELECT id,agent_id,code_hash FROM binding_claims WHERE consumed_at_ms IS NULL AND expires_at_ms>?",
+          )
+          .all(Date.now()),
+        verifier = this.hashToken(code);
+      let row: (typeof candidates)[number] | undefined;
+      for (const candidate of candidates)
+        if (timingSafeEqual(verifier, Buffer.from(candidate.code_hash))) row = candidate;
+      if (!row) throw new Error("VALIDATION_FAILED: invalid or expired claim");
+      const binding = this.bind(row.agent_id, sessionId),
+        consumed = this.db
+          .query(
+            "UPDATE binding_claims SET consumed_at_ms=?,consumed_by_binding_id=? WHERE id=? AND consumed_at_ms IS NULL",
+          )
+          .run(Date.now(), binding.id, row.id);
+      if (consumed.changes !== 1) throw new Error("VALIDATION_FAILED: invalid or expired claim");
       return binding;
     });
   }
-  attest(threadId: unknown) {
+  attest(threadId: unknown): StoredAttestation {
     if (typeof threadId !== "string" || !threadId || threadId.length > 512)
-      return { kind: "unattested", reason: "missing-session-id" } as const;
+      return { kind: "unattested", reason: "missing-session-id" };
     const row = this.db
       .query<
         {
@@ -639,7 +658,7 @@ export class Store {
       )
       .get(threadId);
     return row
-      ? ({
+      ? {
           kind: "attested",
           scheme: "codex-mcp-thread-meta-v1",
           bindingId: row.binding_id,
@@ -648,8 +667,8 @@ export class Store {
           principalId: row.principal_id,
           slug: row.slug,
           displayName: row.display_name,
-        } as const)
-      : ({ kind: "unattested", reason: "unbound-session" } as const);
+        }
+      : { kind: "unattested", reason: "unbound-session" };
   }
   issueToken(principalId: string, ttlSeconds = 300) {
     const token = randomBytes(32).toString("base64url"),
@@ -1405,6 +1424,17 @@ function stringArray(json: string) {
 function must<T>(value: T | null | undefined, message: string): T {
   if (value === undefined || value === null) throw new Error(message);
   return value;
+}
+
+function bindingClaimCode() {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let value = BigInt(`0x${randomBytes(16).toString("hex")}`),
+    result = "";
+  for (let index = 0; index < 26; index++) {
+    result = must(alphabet.at(Number(value & 31n)), "claim alphabet") + result;
+    value >>= 5n;
+  }
+  return result;
 }
 
 function parseTask(json: string): StoredTask {

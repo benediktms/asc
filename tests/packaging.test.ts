@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -55,6 +55,9 @@ test("compiled binary runs the clean-machine service workflow", async () => {
   expect(JSON.stringify(startedLog)).not.toContain(root);
   const socket = join(root, "control.sock");
   await waitFor(() => existsSync(socket));
+  expect(statSync(socket).mode & 0o777).toBe(0o600);
+  for (const file of ["control.token", "bridge.token", "secret.key"])
+    expect(statSync(join(root, file)).mode & 0o777).toBe(0o600);
 
   const created = Bun.spawnSync([binary, "agents", "create", "smoke-agent"], { env });
   expect(created.exitCode).toBe(0);

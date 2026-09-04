@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { handleA2A } from "../../../packages/protocol-a2a/src/index";
 import { controlCall, controlHandler } from "../../../packages/protocol-control/src/index";
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
@@ -146,7 +146,7 @@ async function daemon() {
     error: (error) => sanitizedError(error, String(process.pid)),
   });
   let control: ReturnType<typeof Bun.serve>;
-  let finish!: () => void;
+  let finish: (() => void) | undefined;
   const stopped = new Promise<void>((resolve) => {
     finish = resolve;
   });
@@ -170,7 +170,7 @@ async function daemon() {
     void Promise.resolve(scheduler?.stop()).then(() => {
       store.close();
       if (existsSync(config.runtime)) unlinkSync(config.runtime);
-      finish();
+      finish?.();
     });
   };
   control = Bun.serve({
@@ -178,6 +178,7 @@ async function daemon() {
     fetch: controlHandler(store, startedAt, stop, adapter),
     error: (error) => sanitizedError(error, String(process.pid)),
   });
+  chmodSync(config.runtime, 0o600);
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   log("info", "daemon.started", String(process.pid), {

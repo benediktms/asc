@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Message, Role } from "@a2a-js/sdk";
-import { Store, type Paths } from "../packages/storage-sqlite/src/index";
+import { Store, type Paths, type StoredPart } from "../packages/storage-sqlite/src/index";
 import { TaskState } from "../packages/domain/src/index";
 
 const roots: string[] = [];
@@ -33,6 +33,41 @@ function authenticated(store: Store) {
 }
 
 describe("durable acceptance", () => {
+  test("repairs permissions on existing runtime credentials", () => {
+    const root = mkdtempSync(join(tmpdir(), "acs-permissions-"));
+    roots.push(root);
+    const paths: Paths = {
+      data: join(root, "acs.db"),
+      runtime: join(root, "control.sock"),
+      token: join(root, "control.token"),
+      bridgeToken: join(root, "bridge.token"),
+      secret: join(root, "secret.key"),
+    };
+    writeFileSync(paths.secret, Buffer.alloc(32, 1));
+    writeFileSync(paths.token, "existing-control-token");
+    writeFileSync(paths.bridgeToken, "existing-bridge-token");
+    for (const file of [paths.secret, paths.token, paths.bridgeToken]) chmodSync(file, 0o666);
+    const store = new Store(paths);
+    expect(statSync(root).mode & 0o777).toBe(0o700);
+    for (const file of [paths.secret, paths.token, paths.bridgeToken])
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+    store.close();
+  });
+  test("rejects a permissive runtime directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "acs-unsafe-runtime-"));
+    roots.push(root);
+    chmodSync(root, 0o777);
+    expect(
+      () =>
+        new Store({
+          data: join(root, "acs.db"),
+          runtime: join(root, "control.sock"),
+          token: join(root, "control.token"),
+          bridgeToken: join(root, "bridge.token"),
+          secret: join(root, "secret.key"),
+        }),
+    ).toThrow("runtime directory must have mode 0700");
+  });
   test("signs opaque cursors and rejects tampering", () => {
     const store = fixture(),
       cursor = store.encodeCursor({ sortKey: "backend", id: "agt_1", offset: 1 });
@@ -236,6 +271,20 @@ describe("durable acceptance", () => {
     ).toThrow("UNIQUE constraint failed");
     store.close();
   });
+  test("creates a Crockford claim and consumes it once", () => {
+    const store = fixture(),
+      agent = store.createAgent("claimed-agent"),
+      requester = authenticated(store),
+      claim = store.createClaim(agent.id, requester.id),
+      binding = store.claim(claim.claimCode, "claimed-thread");
+    expect(claim.claimCode).toMatch(/^[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{26}$/);
+    expect(binding.agentId).toBe(agent.id);
+    expect(() => store.claim(claim.claimCode, "replayed-thread")).toThrow(
+      "invalid or expired claim",
+    );
+    expect(store.binding(binding.id)?.session_opaque_id).toBe("claimed-thread");
+    store.close();
+  });
   test("uses delivery defaults and queues subscribed terminal notifications", () => {
     const store = fixture(),
       sender = store.createAgent("sender"),
@@ -290,8 +339,8 @@ describe("durable acceptance", () => {
       Message.fromJSON({ messageId: "request-3", role: Role.ROLE_USER, parts: [{ text: "work" }] }),
       {},
     );
-    const output = [
-      { content: { $case: "text" as const, value: "done" }, filename: "", mediaType: "text/plain" },
+    const output: StoredPart[] = [
+      { content: { $case: "text", value: "done" }, filename: "", mediaType: "text/plain" },
     ];
     expect(() =>
       store.publishMessage(accepted.task.id, strangerBinding.principalId, output),
