@@ -104,7 +104,7 @@ test.skipIf(process.env.ACS_REAL_CODEX_MODEL !== "1")(
       const started = record(
           await client.startThread({
             cwd: root,
-            ephemeral: true,
+            ephemeral: false,
             approvalPolicy: "never",
             sandbox: "read-only",
           }),
@@ -159,38 +159,42 @@ test.skipIf(process.env.ACS_REAL_CODEX_MODEL !== "1")(
           payloadHash: "shared-codex-probe",
         }),
       ).toMatchObject({ outcome: "accepted" });
-
-      let final = "";
-      let complete: (() => void) | undefined;
-      const completed = new Promise<void>((resolve, reject) => {
-        complete = resolve;
-        setTimeout(() => reject(new Error("shared Codex model turn timed out")), 120_000);
-      });
-      client.onNotification = (method, params) => {
-        if (!isRecord(params) || params.threadId !== threadId) return;
-        if (
-          method === "item/completed" &&
-          isRecord(params.item) &&
-          params.item.type === "agentMessage" &&
-          typeof params.item.text === "string"
-        )
-          final = params.item.text;
-        if (method === "turn/completed") complete?.();
-      };
-      await client.startTurn({
-        threadId,
-        input: [
-          {
-            type: "text",
-            text: "Inspect the previously injected agent context and reply only with the uppercase token beginning ACS_CONTEXT_.",
-            text_elements: [],
+      const abort = new AbortController(),
+        completion = waitForCompletion(adapter, abort.signal),
+        wake = await adapter.deliver({
+          deliveryId: "int_shared_codex_wake",
+          target: {
+            session: { installationId: "ins_shared_codex", opaqueId: threadId },
+            bindingId: "bnd_shared_codex",
+            bindingEpoch: 1,
           },
-        ],
-        approvalPolicy: "never",
-        sandboxPolicy: { type: "readOnly", networkAccess: false },
+          mode: "wake_when_idle",
+          envelope: {
+            schema: "urn:agent-communications:runtime-envelope:v1",
+            deliveryId: "int_shared_codex_wake",
+            kind: "a2a-message",
+            from: { agentId: "agt_sender", name: "sender" },
+            to: { agentId: "agt_recipient", name: "recipient" },
+            message: {
+              id: "msg_shared_codex_wake",
+              parts: [{ kind: "text", text: "Reply only with the token from prior context." }],
+            },
+            provenance: { authority: "peer-agent", trustedForPermissions: false },
+          },
+          payloadHash: "shared-codex-wake-probe",
+        });
+      expect(wake).toMatchObject({ outcome: "accepted", execution: { alreadyRunning: false } });
+      const completed = await Promise.race([
+        completion,
+        Bun.sleep(120_000).then(() => {
+          throw new Error("real Codex model turn timed out");
+        }),
+      ]);
+      abort.abort();
+      expect(completed).toMatchObject({
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "ACS_CONTEXT_VISIBLE_OK" }],
       });
-      await completed;
-      expect(final.trim()).toBe("ACS_CONTEXT_VISIBLE_OK");
       await adapter.stop({ reason: "shutdown" });
     } finally {
       if (threadId) await client.deleteThread(threadId).catch(() => {});
@@ -215,4 +219,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function string(value: unknown): string {
   if (typeof value !== "string") throw new Error("expected string");
   return value;
+}
+
+async function waitForCompletion(adapter: CodexRuntimeAdapter, signal: AbortSignal) {
+  for await (const event of adapter.observe(signal))
+    if (event.type === "execution.completed") return event;
+  throw new Error("Codex observation stopped before completion");
 }

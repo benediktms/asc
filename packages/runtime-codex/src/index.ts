@@ -297,6 +297,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           evidence: { scheme: "codex.thread-inject-items.v1", value: request.deliveryId },
         };
       }
+      await this.requireClient().resumeThread(request.target.session.opaqueId);
       const response = await this.requireClient().startTurn({
         threadId: request.target.session.opaqueId,
         input: [],

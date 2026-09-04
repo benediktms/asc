@@ -85,6 +85,9 @@ export class CodexAppServerClient {
   async startThread(params: ThreadStartParams) {
     return record(await this.request("thread/start", params));
   }
+  async resumeThread(threadId: string): Promise<void> {
+    await this.request("thread/resume", { threadId, excludeTurns: true });
+  }
   async deleteThread(threadId: string): Promise<void> {
     await this.request("thread/delete", { threadId });
   }
