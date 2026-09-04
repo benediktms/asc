@@ -2,6 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AgentCard, Message, Role } from "@a2a-js/sdk";
+import { ClientFactory, JsonRpcTransportFactory } from "@a2a-js/sdk/client";
+import { TaskState } from "../packages/domain/src/index";
 import { handleA2A } from "../packages/protocol-a2a/src/index";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
 
@@ -10,18 +13,22 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true });
 });
 
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "acs-a2a-"));
+  roots.push(root);
+  const paths: Paths = {
+    data: join(root, "acs.db"),
+    runtime: join(root, "control.sock"),
+    token: join(root, "control.token"),
+    bridgeToken: join(root, "bridge.token"),
+    secret: join(root, "secret.key"),
+  };
+  return new Store(paths);
+}
+
 describe("A2A JSON-RPC", () => {
   test("discovers an agent and sends, reads, then cancels a durable task", async () => {
-    const root = mkdtempSync(join(tmpdir(), "acs-a2a-"));
-    roots.push(root);
-    const paths: Paths = {
-        data: join(root, "acs.db"),
-        runtime: join(root, "control.sock"),
-        token: join(root, "control.token"),
-        bridgeToken: join(root, "bridge.token"),
-        secret: join(root, "secret.key"),
-      },
-      store = new Store(paths),
+    const store = fixture(),
       agent = store.createAgent("backend"),
       { token } = store.createToken();
     const card = await handleA2A(
@@ -131,6 +138,104 @@ describe("A2A JSON-RPC", () => {
     );
     expect(record(await unsupportedVersion.json()).error).toMatchObject({ code: -32009 });
     expect(store.agent(agent.id)?.slug).toBe("backend");
+    store.close();
+  });
+
+  test("interoperates with the pinned SDK JSON-RPC client", async () => {
+    const store = fixture(),
+      agent = store.createAgent("sdk-client"),
+      { token } = store.createToken(),
+      fetchImpl = Object.assign(
+        async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+          handleA2A(store, new Request(input, init), 7432),
+        { preconnect: fetch.preconnect },
+      ),
+      cardResponse = await fetchImpl(
+        "http://localhost/agents/sdk-client/.well-known/agent-card.json",
+      ),
+      card = AgentCard.fromJSON(await cardResponse.json()),
+      client = await new ClientFactory({
+        transports: [new JsonRpcTransportFactory({ fetchImpl })],
+        clientConfig: { polling: true },
+      }).createFromAgentCard(card),
+      options = { serviceParameters: { Authorization: `Bearer ${token}` } },
+      sent = await client.sendMessage(
+        {
+          tenant: "",
+          message: Message.fromJSON({
+            messageId: "sdk-client-message",
+            role: Role.ROLE_USER,
+            parts: [{ text: "work" }],
+          }),
+          configuration: undefined,
+          metadata: undefined,
+        },
+        options,
+      );
+    if (!("id" in sent)) throw new Error("SDK client did not return a task");
+    expect(sent.id).toStartWith("tsk_");
+    expect((await client.getTask({ tenant: "", id: sent.id }, options)).id).toBe(sent.id);
+    expect(
+      (await client.cancelTask({ tenant: "", id: sent.id, metadata: undefined }, options)).status
+        ?.state,
+    ).toBe(5);
+
+    const streamedResponse = client.sendMessageStream(
+        {
+          tenant: "",
+          message: Message.fromJSON({
+            messageId: "sdk-client-stream",
+            role: Role.ROLE_USER,
+            parts: [{ text: "stream work" }],
+          }),
+          configuration: undefined,
+          metadata: undefined,
+        },
+        options,
+      ),
+      streamed = streamedResponse[Symbol.asyncIterator](),
+      initial = await streamed.next();
+    if (initial.done || initial.value.payload?.$case !== "task")
+      throw new Error("SDK stream did not return an initial task");
+    const streamedTaskId = initial.value.payload.value.id;
+    await client.cancelTask({ tenant: "", id: streamedTaskId, metadata: undefined }, options);
+    const terminal = await streamed.next();
+    expect(terminal.value?.payload).toMatchObject({
+      $case: "statusUpdate",
+      value: { taskId: streamedTaskId, status: { state: 5 } },
+    });
+    expect((await streamed.next()).done).toBe(true);
+
+    const resumable = await client.sendMessage(
+      {
+        tenant: "",
+        message: Message.fromJSON({
+          messageId: "sdk-client-resubscribe",
+          role: Role.ROLE_USER,
+          parts: [{ text: "resume work" }],
+        }),
+        configuration: undefined,
+        metadata: undefined,
+      },
+      options,
+    );
+    if (!("id" in resumable)) throw new Error("SDK client did not return a resumable task");
+    const binding = store.bind(agent.id, "sdk-client-thread");
+    store.setTaskState(resumable.id, binding.principalId, TaskState.Working);
+    const subscriptionResponse = client.resubscribeTask({ tenant: "", id: resumable.id }, options),
+      subscription = subscriptionResponse[Symbol.asyncIterator](),
+      current = await subscription.next();
+    expect(current.value?.payload).toMatchObject({
+      $case: "task",
+      value: { id: resumable.id, status: { state: 2 } },
+    });
+    store.setTaskState(resumable.id, binding.principalId, TaskState.Completed);
+    expect((await subscription.next()).value?.payload).toMatchObject({
+      $case: "statusUpdate",
+      value: { taskId: resumable.id, status: { state: 3 } },
+    });
+    expect((await subscription.next()).done).toBe(true);
+    expect(store.agent(agent.id)?.slug).toBe("sdk-client");
     store.close();
   });
 });
