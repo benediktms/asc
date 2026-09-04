@@ -83,35 +83,38 @@ describe("durable acceptance", () => {
     expect(store.db.query("SELECT count(*) n FROM delivery_intents").get()).toEqual({ n: 1 });
     store.close();
   });
-  test("rolls back every acceptance write when delivery persistence fails", () => {
-    const store = fixture(),
-      agent = store.createAgent("rollback-worker"),
-      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
-    store.db.exec(
-      "CREATE TEMP TRIGGER fail_delivery BEFORE INSERT ON delivery_intents BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
-    );
-    expect(() =>
-      store.accept(
-        agent.id,
-        principal.id,
-        Message.fromJSON({
-          messageId: "rollback",
-          role: Role.ROLE_USER,
-          parts: [{ text: "work" }],
-        }),
-        {},
-      ),
-    ).toThrow("injected failure");
-    for (const table of [
+  test("rolls back when any acceptance write fails", () => {
+    const tables = [
       "conversation_contexts",
       "a2a_tasks",
       "a2a_messages",
       "task_events",
       "delivery_intents",
       "idempotency_records",
-    ])
-      expect(store.db.query(`SELECT count(*) count FROM ${table}`).get()).toEqual({ count: 0 });
-    store.close();
+    ];
+    for (const failureTable of tables) {
+      const store = fixture(),
+        agent = store.createAgent(`rollback-${failureTable.replaceAll("_", "-")}`),
+        principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      store.db.exec(
+        `CREATE TEMP TRIGGER fail_acceptance BEFORE INSERT ON ${failureTable} BEGIN SELECT RAISE(ABORT, 'injected failure'); END`,
+      );
+      expect(() =>
+        store.accept(
+          agent.id,
+          principal.id,
+          Message.fromJSON({
+            messageId: `rollback-${failureTable}`,
+            role: Role.ROLE_USER,
+            parts: [{ text: "work" }],
+          }),
+          {},
+        ),
+      ).toThrow("injected failure");
+      for (const table of tables)
+        expect(store.db.query(`SELECT count(*) count FROM ${table}`).get()).toEqual({ count: 0 });
+      store.close();
+    }
   });
   test("recovers committed work after a WAL restart", () => {
     const store = fixture(),
@@ -163,6 +166,9 @@ describe("durable acceptance", () => {
       },
     ]);
     store.setTaskState(accepted.task.id, binding.principalId, TaskState.Completed, "done");
+    expect(store.eventsAfter(accepted.task.id, 0).map((event) => event.sequence)).toEqual([
+      1, 2, 3, 4, 5,
+    ]);
     store.db
       .query("UPDATE a2a_tasks SET state='submitted',a2a_snapshot_json=? WHERE id=?")
       .run(JSON.stringify(accepted.task), accepted.task.id);
@@ -175,6 +181,27 @@ describe("durable acceptance", () => {
     expect(store.verifyTaskProjections(true).repaired).toBe(1);
     expect(store.verifyTaskProjections().mismatched).toEqual([]);
     expect(store.task(accepted.task.id, requester.id)?.status?.state).toBe(3);
+    store.close();
+  });
+  test("enforces one active binding per agent and runtime session", () => {
+    const store = fixture(),
+      firstAgent = store.createAgent("first-bound-agent"),
+      secondAgent = store.createAgent("second-bound-agent"),
+      binding = store.bind(firstAgent.id, "shared-runtime-session");
+    expect(() =>
+      store.db
+        .query(
+          "INSERT INTO runtime_bindings(id,agent_id,installation_id,session_opaque_id,epoch,status,continuity_policy,delivery_policy_json,created_at_ms) SELECT 'bnd_duplicate_agent',agent_id,installation_id,'other-session',epoch+1,'active',continuity_policy,delivery_policy_json,created_at_ms FROM runtime_bindings WHERE id=?",
+        )
+        .run(binding.id),
+    ).toThrow("UNIQUE constraint failed");
+    expect(() =>
+      store.db
+        .query(
+          "INSERT INTO runtime_bindings(id,agent_id,installation_id,session_opaque_id,epoch,status,continuity_policy,delivery_policy_json,created_at_ms) SELECT 'bnd_duplicate_session',?,installation_id,session_opaque_id,1,'active',continuity_policy,delivery_policy_json,created_at_ms FROM runtime_bindings WHERE id=?",
+        )
+        .run(secondAgent.id, binding.id),
+    ).toThrow("UNIQUE constraint failed");
     store.close();
   });
   test("uses delivery defaults and queues subscribed terminal notifications", () => {
