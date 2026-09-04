@@ -6,7 +6,7 @@ import { CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../packages/runtime-codex/src/app-server-client";
 
 test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
-  "discovers two loaded threads from an isolated real Codex app-server",
+  "discovers loaded threads and injects context through an isolated real Codex app-server",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "acs-real-codex-")),
       socket = join(root, "app.sock"),
@@ -36,6 +36,32 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
       const page = await adapter.listSessions({ limit: 10 });
       expect(page.sessions).toHaveLength(2);
       expect(page.sessions.every((session) => session.availability === "idle")).toBe(true);
+      const target = page.sessions.at(0);
+      if (!target) throw new Error("missing discovered Codex thread");
+      expect(
+        await adapter.deliver({
+          deliveryId: "int_real_codex",
+          target: {
+            session: target.session,
+            bindingId: "bnd_real_codex",
+            bindingEpoch: 1,
+          },
+          mode: "append_context",
+          envelope: {
+            schema: "urn:agent-communications:runtime-envelope:v1",
+            deliveryId: "int_real_codex",
+            kind: "a2a-message",
+            from: { agentId: "agt_sender", name: "sender" },
+            to: { agentId: "agt_recipient", name: "recipient" },
+            message: { id: "msg_real_codex", parts: [{ kind: "text", text: "probe" }] },
+            provenance: { authority: "peer-agent", trustedForPermissions: false },
+          },
+          payloadHash: "real-codex-probe",
+        }),
+      ).toMatchObject({
+        outcome: "accepted",
+        evidence: { scheme: "codex.thread-inject-items.v1", value: "int_real_codex" },
+      });
       await adapter.stop({ reason: "shutdown" });
       setup.close();
     } finally {
