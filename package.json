@@ -6,7 +6,8 @@
   "scripts": {
     "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",
     "boundaries": "bun scripts/check-imports.ts",
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun test",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun run codex:check && bun test",
+    "codex:check": "bun scripts/generate-codex-protocol.ts --check",
     "enums:check": "bun scripts/check-enums.ts",
     "format": "oxfmt . '!packages/codex-protocol-generated/**'",
     "format:check": "oxfmt --check . '!packages/codex-protocol-generated/**'",
@@ -22,6 +23,7 @@
     "zod": "4.1.5"
   },
   "devDependencies": {
+    "@openai/codex": "0.153.2",
     "@types/bun": "1.2.21",
     "oxfmt": "0.66.0",
     "oxlint": "1.81.0",

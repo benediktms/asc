@@ -10,9 +10,10 @@
         "zod": "4.1.5",
       },
       "devDependencies": {
+        "@openai/codex": "0.153.2",
         "@types/bun": "1.2.21",
-        "oxfmt": "^0.66.0",
-        "oxlint": "^1.81.0",
+        "oxfmt": "0.66.0",
+        "oxlint": "1.81.0",
         "typescript": "5.9.2",
       },
     },
@@ -23,6 +24,20 @@
     "@hono/node-server": ["@hono/node-server@2.1.1", "https://ffw.external-infrastructure.fresha.io/npm/@hono/node-server/-/node-server-2.1.1.tgz", { "peerDependencies": { "hono": "^4" } }, "sha512-ELuehkj5VCBdgEw9zs+ivkKwyzzUCSQuE96YmiPvn1ECBoZCczbFXJLeEGMTYjphP6gydh4pHMqEYPVMYUVgQg=="],
 
     "@modelcontextprotocol/sdk": ["@modelcontextprotocol/sdk@1.30.0", "https://ffw.external-infrastructure.fresha.io/npm/@modelcontextprotocol/sdk/-/sdk-1.30.0.tgz", { "dependencies": { "@hono/node-server": "^1.19.9 || ^2.0.5", "ajv": "^8.17.1", "ajv-formats": "^3.0.1", "content-type": "^1.0.5", "cors": "^2.8.5", "cross-spawn": "^7.0.5", "eventsource": "^3.0.2", "eventsource-parser": "^3.0.0", "express": "^5.2.1", "express-rate-limit": "^8.2.1", "hono": "^4.11.4", "jose": "^6.1.3", "json-schema-typed": "^8.0.2", "pkce-challenge": "^5.0.0", "raw-body": "^3.0.0", "zod": "^3.25 || ^4.0", "zod-to-json-schema": "^3.25.1" }, "peerDependencies": { "@cfworker/json-schema": "^4.1.1" }, "optionalPeers": ["@cfworker/json-schema"] }, "sha512-xKd8OIzlqNzcqcNumGAa6g+PW2kjD5vrpcKOnfldAUPP3j7lnqMPwlTXQm8gF+UwH72z0lqaRbjr9hqGz0eITA=="],
+
+    "@openai/codex": ["@openai/codex@0.153.2", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2.tgz", { "optionalDependencies": { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.153.2-darwin-arm64", "@openai/codex-darwin-x64": "npm:@openai/codex@0.153.2-darwin-x64", "@openai/codex-linux-arm64": "npm:@openai/codex@0.153.2-linux-arm64", "@openai/codex-linux-x64": "npm:@openai/codex@0.153.2-linux-x64", "@openai/codex-win32-arm64": "npm:@openai/codex@0.153.2-win32-arm64", "@openai/codex-win32-x64": "npm:@openai/codex@0.153.2-win32-x64" }, "bin": { "codex": "bin/codex.js" } }, "sha512-IRocJlE+jCZGYHwIJWBja2nDswTSZY4sNddQgU5xiR/mVWxo5WcO8pqcajXJea1XDoNK9CaVzizVhUxDhFkU6g=="],
+
+    "@openai/codex-darwin-arm64": ["@openai/codex@0.153.2-darwin-arm64", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2-darwin-arm64.tgz", { "os": "darwin", "cpu": "arm64" }, "sha512-8cEJWOIW5WnSn2+W1RUjc1sm2sN1H6NP+cCrOe73ImamUy2yOk3QKjZM2SfkA9jf3fqgwlBNUslhGMen2omc5g=="],
+
+    "@openai/codex-darwin-x64": ["@openai/codex@0.153.2-darwin-x64", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2-darwin-x64.tgz", { "os": "darwin", "cpu": "x64" }, "sha512-hY68UBhIUE3xIn40SdoujokNiCBeHn9Jp9bEtcIrYeYd2IUtu1oCFwxFnkGhw6+UjHn7piiMxohAomddRA4MCg=="],
+
+    "@openai/codex-linux-arm64": ["@openai/codex@0.153.2-linux-arm64", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2-linux-arm64.tgz", { "os": "linux", "cpu": "arm64" }, "sha512-QDkOdJzIdMGaOCViY2dqGqr8WhQv81WfmJkAghC3doFedsOfHt87RuAO4yFN7m0FSR3y5UsScSDUT4zOCcmEVA=="],
+
+    "@openai/codex-linux-x64": ["@openai/codex@0.153.2-linux-x64", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2-linux-x64.tgz", { "os": "linux", "cpu": "x64" }, "sha512-CPUPhFmykKRdIcgwiOfKvFKHBP62dPfaiP+pzQ2bVNAfLTW+i0Kasd7hQryoxZUmTPvw0h9HyM2NgsnQ9AJlTw=="],
+
+    "@openai/codex-win32-arm64": ["@openai/codex@0.153.2-win32-arm64", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2-win32-arm64.tgz", { "os": "win32", "cpu": "arm64" }, "sha512-+49dim0F4FoxKLBDBLzMQL4C1m9FG2kx6twg98jo2USesKfmj8XG3HSCe2tW2zOfRArSgHCDyNDHFdts3AfaBg=="],
+
+    "@openai/codex-win32-x64": ["@openai/codex@0.153.2-win32-x64", "https://ffw.external-infrastructure.fresha.io/npm/@openai/codex/-/codex-0.153.2-win32-x64.tgz", { "os": "win32", "cpu": "x64" }, "sha512-x1PnFo9Uy81NEIlPx3qxkP3PQgkfmJOY/2LqKCKlvxArWIL+PrEV9xKcmKeo9Yw23PPU2TDH3AyqcdeblqtNNg=="],
 
     "@oxfmt/binding-android-arm-eabi": ["@oxfmt/binding-android-arm-eabi@0.66.0", "https://ffw.external-infrastructure.fresha.io/npm/@oxfmt/binding-android-arm-eabi/-/binding-android-arm-eabi-0.66.0.tgz", { "os": "android", "cpu": "arm" }, "sha512-2Me9eoptv6ERdEuI2P8AOlYdHHraXebJaM6SC0kc2Dfb+mLrep2db+fedBPKaYn673h/vBgvP4tkOdAbaudX6w=="],
 

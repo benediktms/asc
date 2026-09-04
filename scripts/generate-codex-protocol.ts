@@ -3,8 +3,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, ".."),
-  output = join(root, "packages/codex-protocol-generated"),
-  temporary = mkdtempSync(join(tmpdir(), "acs-codex-protocol-"));
+  committedOutput = join(root, "packages/codex-protocol-generated"),
+  temporary = mkdtempSync(join(tmpdir(), "acs-codex-protocol-")),
+  check = process.argv.includes("--check"),
+  output = check ? join(temporary, "output") : committedOutput;
 const source = join(temporary, "src"),
   schema = join(temporary, "schema");
 const command = process.env.ACS_CODEX_BINARY ?? "codex";
@@ -94,6 +96,15 @@ try {
   console.log(
     `Vendored ${copied.size} generated TypeScript files for ${readFileSync(join(output, "CODEX_VERSION"), "utf8").trim()}`,
   );
+  if (check) {
+    const difference = Bun.spawnSync(["diff", "-ru", committedOutput, output]);
+    if (!difference.success)
+      throw new Error(
+        difference.stdout.toString() ||
+          difference.stderr.toString() ||
+          "generated Codex protocol differs from committed output",
+      );
+  }
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }
