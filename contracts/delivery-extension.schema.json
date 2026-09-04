@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-communications:delivery:v1",
+  "title": "ACS A2A Delivery Extension v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "enum": ["wake_when_idle", "append_context"],
+      "default": "wake_when_idle"
+    },
+    "priority": {
+      "enum": ["low", "normal", "high"],
+      "default": "normal"
+    },
+    "notifyOn": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "working",
+          "input-required",
+          "completed",
+          "failed",
+          "canceled",
+          "rejected",
+          "terminal"
+        ]
+      },
+      "default": ["input-required", "terminal"]
+    },
+    "replyExpected": {
+      "type": "boolean",
+      "default": true
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

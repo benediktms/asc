@@ -1,0 +1,27 @@
+{
+  "name": "agent-communications-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun test",
+    "format": "oxfmt . '!packages/codex-protocol-generated/**'",
+    "format:check": "oxfmt --check . '!packages/codex-protocol-generated/**'",
+    "generate:codex": "bun scripts/generate-codex-protocol.ts",
+    "lint": "oxlint -D correctness -D suspicious -D perf -D typescript/no-explicit-any -A no-await-in-loop -A no-underscore-dangle --import-plugin --deny-warnings --ignore-pattern packages/codex-protocol-generated/** .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "1.1.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.1.5"
+  },
+  "devDependencies": {
+    "@types/bun": "1.2.21",
+    "oxfmt": "^0.66.0",
+    "oxlint": "^1.81.0",
+    "typescript": "5.9.2"
+  }
+}
