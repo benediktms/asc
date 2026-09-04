@@ -1,15 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { InitializeResponse } from "../../codex-protocol-generated/src/InitializeResponse";
 import type { ThreadInjectItemsParams } from "../../codex-protocol-generated/src/v2/ThreadInjectItemsParams";
 import type { ThreadListParams } from "../../codex-protocol-generated/src/v2/ThreadListParams";
-import type { ThreadListResponse } from "../../codex-protocol-generated/src/v2/ThreadListResponse";
-import type { ThreadLoadedListResponse } from "../../codex-protocol-generated/src/v2/ThreadLoadedListResponse";
 import type { ThreadReadParams } from "../../codex-protocol-generated/src/v2/ThreadReadParams";
-import type { ThreadReadResponse } from "../../codex-protocol-generated/src/v2/ThreadReadResponse";
 import type { ThreadStartParams } from "../../codex-protocol-generated/src/v2/ThreadStartParams";
-import type { ThreadStartResponse } from "../../codex-protocol-generated/src/v2/ThreadStartResponse";
 import type { TurnStartParams } from "../../codex-protocol-generated/src/v2/TurnStartParams";
-import type { TurnStartResponse } from "../../codex-protocol-generated/src/v2/TurnStartResponse";
+
+export type CodexThread = {
+  id: string;
+  preview: string;
+  name: string | null;
+  updatedAt: number;
+  cwd: string;
+  cliVersion: string;
+  source: unknown;
+  status: { type: string };
+};
 
 type RpcId = number;
 type RpcMessage = {
@@ -40,9 +45,9 @@ export class CodexAppServerClient {
     readonly timeoutMs = 10_000,
   ) {}
 
-  async start(): Promise<InitializeResponse> {
+  async start() {
     await this.connect();
-    const initialized = decodeResponse<InitializeResponse>(
+    const initialized = record(
       await this.request("initialize", {
         clientInfo: {
           name: "agent_communications_service",
@@ -53,22 +58,30 @@ export class CodexAppServerClient {
       }),
     );
     this.notify("initialized", {});
-    return initialized;
+    return { userAgent: stringField(initialized, "userAgent") };
   }
 
-  async loadedThreads(cursor: string | null = null): Promise<ThreadLoadedListResponse> {
-    return decodeResponse<ThreadLoadedListResponse>(
-      await this.request("thread/loaded/list", { cursor, limit: 100 }),
-    );
+  async loadedThreads(cursor: string | null = null) {
+    const response = record(await this.request("thread/loaded/list", { cursor, limit: 100 }));
+    return {
+      data: stringArray(response.data),
+      nextCursor: nullableString(response.nextCursor),
+    };
   }
-  async listThreads(params: ThreadListParams = {}): Promise<ThreadListResponse> {
-    return decodeResponse<ThreadListResponse>(await this.request("thread/list", params));
+  async listThreads(params: ThreadListParams = {}) {
+    const response = record(await this.request("thread/list", params));
+    if (!Array.isArray(response.data)) throw new Error("invalid app-server thread list");
+    return {
+      data: response.data.map(decodeThread),
+      nextCursor: nullableString(response.nextCursor),
+    };
   }
-  async readThread(params: ThreadReadParams): Promise<ThreadReadResponse> {
-    return decodeResponse<ThreadReadResponse>(await this.request("thread/read", params));
+  async readThread(params: ThreadReadParams) {
+    const response = record(await this.request("thread/read", params));
+    return { thread: decodeThread(response.thread) };
   }
-  async startThread(params: ThreadStartParams): Promise<ThreadStartResponse> {
-    return decodeResponse<ThreadStartResponse>(await this.request("thread/start", params));
+  async startThread(params: ThreadStartParams) {
+    return record(await this.request("thread/start", params));
   }
   async deleteThread(threadId: string): Promise<void> {
     await this.request("thread/delete", { threadId });
@@ -76,8 +89,10 @@ export class CodexAppServerClient {
   async injectItems(params: ThreadInjectItemsParams): Promise<void> {
     await this.request("thread/inject_items", params);
   }
-  async startTurn(params: TurnStartParams): Promise<TurnStartResponse> {
-    return decodeResponse<TurnStartResponse>(await this.request("turn/start", params));
+  async startTurn(params: TurnStartParams) {
+    const response = record(await this.request("turn/start", params)),
+      turn = record(response.turn);
+    return { turn: { id: stringField(turn, "id") } };
   }
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     await this.request("turn/interrupt", { threadId, turnId });
@@ -263,8 +278,43 @@ export class CodexAppServerClient {
   }
 }
 
-function decodeResponse<T>(value: unknown): T {
-  if (typeof value !== "object" || value === null || Array.isArray(value))
-    throw new Error("invalid app-server response");
-  return value as T;
+function record(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error("invalid app-server response");
+  return value;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function stringField(value: Record<string, unknown>, key: string) {
+  const field = value[key];
+  if (typeof field !== "string") throw new Error(`invalid app-server ${key}`);
+  return field;
+}
+function nullableString(value: unknown) {
+  if (value !== null && value !== undefined && typeof value !== "string")
+    throw new Error("invalid app-server cursor");
+  return value ?? null;
+}
+function stringArray(value: unknown) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string"))
+    throw new Error("invalid app-server string list");
+  return value;
+}
+function decodeThread(value: unknown): CodexThread {
+  const thread = record(value),
+    name = thread.name,
+    updatedAt = thread.updatedAt,
+    status = record(thread.status);
+  if (name !== null && typeof name !== "string") throw new Error("invalid app-server thread name");
+  if (typeof updatedAt !== "number") throw new Error("invalid app-server thread timestamp");
+  return {
+    id: stringField(thread, "id"),
+    preview: stringField(thread, "preview"),
+    name,
+    updatedAt,
+    cwd: stringField(thread, "cwd"),
+    cliVersion: stringField(thread, "cliVersion"),
+    source: thread.source,
+    status: { type: stringField(status, "type") },
+  };
 }

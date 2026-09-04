@@ -1,6 +1,4 @@
-import type { Thread } from "../../codex-protocol-generated/src/v2/Thread";
 import type { ResponseItem } from "../../codex-protocol-generated/src/ResponseItem";
-import type { ThreadStatus } from "../../codex-protocol-generated/src/v2/ThreadStatus";
 import type { JsonValue } from "../../codex-protocol-generated/src/serde_json/JsonValue";
 import type {
   RuntimeAdapter,
@@ -23,7 +21,7 @@ import type {
   RuntimeSessionRef,
   RuntimeSessionSnapshot,
 } from "../../../contracts/runtime-adapter";
-import { CodexAppServerClient } from "./app-server-client";
+import { CodexAppServerClient, type CodexThread } from "./app-server-client";
 
 const capabilities = {
   listSessions: true,
@@ -286,7 +284,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         : { outcome: "unknown", reason: message };
     }
   }
-  private snapshot(thread: Thread): RuntimeSessionSnapshot {
+  private snapshot(thread: CodexThread): RuntimeSessionSnapshot {
     return {
       session: { installationId: this.context!.installationId, opaqueId: thread.id },
       availability: status(thread),
@@ -437,7 +435,7 @@ function errorCode(error: unknown) {
 }
 function isThreadStatusChanged(
   value: unknown,
-): value is { threadId: string; status: ThreadStatus } {
+): value is { threadId: string; status: { type: string } } {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -450,10 +448,10 @@ function isThreadStatusChanged(
   );
 }
 
-function status(thread: Thread): RuntimeAvailability {
+function status(thread: CodexThread): RuntimeAvailability {
   return statusType(thread.status);
 }
-function statusType(value: ThreadStatus): RuntimeAvailability {
+function statusType(value: { type: string }): RuntimeAvailability {
   switch (value.type) {
     case "idle":
       return "idle";
