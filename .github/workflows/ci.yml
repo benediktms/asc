@@ -39,3 +39,23 @@ jobs:
       - run: python3 -m pip install uv
       - run: python3 -m uv sync --directory "$A2A_TCK_DIR"
       - run: bun run test:a2a-tck
+
+  release-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - bun-darwin-arm64
+          - bun-darwin-x64
+          - bun-linux-arm64
+          - bun-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: mkdir -p "dist/${{ matrix.target }}"
+      - run: bun build apps/acs/src/main.ts --compile --target="${{ matrix.target }}" --outfile="dist/${{ matrix.target }}/acs"
+      - run: test -s "dist/${{ matrix.target }}/acs"
