@@ -7,8 +7,9 @@ import type {
   RuntimeAdapter,
   RuntimeAdapterContext,
   RuntimeDeliveryRequest,
+  RuntimeReconcileRequest,
 } from "../contracts/runtime-adapter";
-import { CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
+import { CodexRuntimeAdapter, TESTED_CODEX_VERSION } from "../packages/runtime-codex/src/index";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -19,6 +20,9 @@ type Fixture = {
   adapter: RuntimeAdapter;
   context: RuntimeAdapterContext;
   methods: string[];
+  failNext(method: string, failure: "overload" | "disconnect"): void;
+  disconnect(): void;
+  request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
   setStatus(status: string): void;
   notify(method: string, params: unknown): void;
@@ -77,12 +81,12 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       ).toMatchObject({ outcome: "rejected", reason: "not-owned" });
       expect(mutations(methods)).toEqual(["thread/inject_items"]);
 
-      const reconciliation = {
+      const reconciliation: RuntimeReconcileRequest = {
         deliveryId: "int_conformance",
         target: delivery().target,
         payloadHash: "payload-hash",
         reconciliationToken: "token",
-      } as const;
+      };
       expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
       expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
       expect(mutations(methods)).toEqual(["thread/inject_items"]);
@@ -91,6 +95,27 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
         outcome: "accepted",
         execution: { opaqueId: "turn-1" },
+      });
+      const localInput = iterator.next();
+      fixture.request("item/tool/requestUserInput", {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-1",
+        isBlocking: true,
+        questions: [],
+      });
+      expect((await localInput).value).toEqual({
+        type: "execution.awaiting-local-input",
+        execution: {
+          opaqueId: "turn-1",
+          session: { installationId: "ins_conformance", opaqueId: "thread-1" },
+        },
+        request: {
+          opaqueId: "server-request-1",
+          kind: "question",
+          blocking: true,
+          summary: "Local runtime input required",
+        },
       });
       const completion = iterator.next();
       fixture.notify("turn/completed", {
@@ -105,29 +130,90 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         execution: { opaqueId: "turn-1" },
       });
 
+      fixture.failNext("thread/inject_items", "overload");
+      expect(await adapter.deliver(delivery())).toMatchObject({
+        outcome: "deferred",
+        reason: "backpressure",
+      });
+
+      fixture.failNext("thread/inject_items", "disconnect");
+      expect(await adapter.deliver(delivery())).toMatchObject({
+        outcome: "acceptance-unknown",
+        ambiguity: "connection-reset",
+      });
+      expect((await iterator.next()).value).toEqual({
+        type: "adapter.connection",
+        state: "offline",
+      });
+
       await adapter.stop({ reason: "shutdown" });
       expect((await iterator.next()).done).toBe(true);
       fixture.close();
     }, 30_000);
+
+    test("maps a disconnect before delivery to offline without mutation", async () => {
+      const fixture = await create(),
+        { adapter, context, methods } = fixture;
+      await adapter.start(context);
+      const iterator = adapter.observe(new AbortController().signal)[Symbol.asyncIterator]();
+      expect((await iterator.next()).value).toMatchObject({ state: "online" });
+      fixture.disconnect();
+      expect((await iterator.next()).value).toMatchObject({ state: "offline" });
+      expect(await adapter.deliver(delivery())).toMatchObject({
+        outcome: "deferred",
+        reason: "offline",
+      });
+      expect(mutations(methods)).toEqual([]);
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
   });
 }
 
-runtimeAdapterConformance("Codex", async () => {
+runtimeAdapterConformance("Codex", () => codexFixture());
+
+test("Codex runtime adapter disables mutations for an untested runtime", async () => {
+  const fixture = await codexFixture("codex-cli 99.0.0"),
+    { adapter, context, methods } = fixture;
+  await adapter.start(context);
+  expect(await adapter.probe()).toMatchObject({
+    state: "incompatible",
+    runtimeVersion: "99.0.0",
+    capabilities: { appendContext: false, wakeWhenIdle: false, cancelOwnedExecution: false },
+  });
+  expect(await adapter.deliver(delivery())).toMatchObject({
+    outcome: "rejected",
+    reason: "runtime-protocol-error",
+  });
+  expect(mutations(methods)).toEqual([]);
+  await adapter.stop({ reason: "shutdown" });
+  fixture.close();
+});
+
+async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Promise<Fixture> {
   const root = mkdtempSync(join(tmpdir(), "acs-adapter-"));
   roots.push(root);
   const path = join(root, "codex.sock"),
     methods: string[] = [],
-    buffers = new WeakMap<object, Buffer>();
+    buffers = new WeakMap<object, Buffer>(),
+    failures = new Map<string, "overload" | "disconnect">();
   let fence = true,
     status = "idle";
-  let sendNotification: ((method: string, params: unknown) => void) | undefined;
+  let sendNotification: ((method: string, params: unknown) => void) | undefined,
+    sendRequest: ((method: string, params: unknown) => void) | undefined,
+    disconnect: (() => void) | undefined;
   const server = Bun.listen({
     unix: path,
     socket: {
       open() {},
       data(socket, data) {
+        disconnect = () => socket.end();
         sendNotification = (method, params) =>
           void socket.write(serverFrame(JSON.stringify({ method, params })));
+        sendRequest = (method, params) =>
+          void socket.write(
+            serverFrame(JSON.stringify({ id: "server-request-1", method, params })),
+          );
         const bytes = Buffer.from(data),
           text = bytes.toString();
         if (text.startsWith("GET ")) {
@@ -149,9 +235,26 @@ runtimeAdapterConformance("Codex", async () => {
           const request = record(JSON.parse(decoded.text)),
             method = string(request.method);
           methods.push(method);
-          if (typeof request.id === "number")
+          const failure = failures.get(method);
+          failures.delete(method);
+          if (failure === "disconnect") {
+            socket.end();
+            return;
+          }
+          if (typeof request.id === "number" && failure === "overload")
             socket.write(
-              serverFrame(JSON.stringify({ id: request.id, result: response(method, status) })),
+              serverFrame(
+                JSON.stringify({
+                  id: request.id,
+                  error: { code: -32000, message: "ingress overloaded" },
+                }),
+              ),
+            );
+          else if (typeof request.id === "number")
+            socket.write(
+              serverFrame(
+                JSON.stringify({ id: request.id, result: response(method, status, userAgent) }),
+              ),
             );
         }
         buffers.set(socket, pending);
@@ -170,6 +273,17 @@ runtimeAdapterConformance("Codex", async () => {
       assertBindingFence: async () => (fence ? { valid: true } : { valid: false, reason: "stale" }),
     },
     methods,
+    failNext(method, failure) {
+      failures.set(method, failure);
+    },
+    disconnect() {
+      if (!disconnect) throw new Error("emulator is not connected");
+      disconnect();
+    },
+    request(method, params) {
+      if (!sendRequest) throw new Error("emulator is not connected");
+      sendRequest(method, params);
+    },
     setFence(value) {
       fence = value;
     },
@@ -184,7 +298,7 @@ runtimeAdapterConformance("Codex", async () => {
       server.stop();
     },
   };
-});
+}
 
 function delivery(mode: RuntimeDeliveryRequest["mode"] = "append_context"): RuntimeDeliveryRequest {
   return {
@@ -208,8 +322,9 @@ function delivery(mode: RuntimeDeliveryRequest["mode"] = "append_context"): Runt
   };
 }
 
-function response(method: string, status: string) {
-  if (method === "initialize") return { userAgent: "codex-test" };
+function response(method: string, status: string, userAgent: string) {
+  if (method === "initialize") return { userAgent };
+  if (method === "thread/list") return { data: [], nextCursor: null };
   if (method === "thread/read")
     return {
       thread: {

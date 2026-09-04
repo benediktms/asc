@@ -519,6 +519,14 @@ export class DeliveryScheduler {
     }
   }
   private project(event: RuntimeEvent) {
+    if (event.type === "execution.awaiting-local-input") {
+      this.store.db
+        .query(
+          "UPDATE runtime_executions SET state='awaiting-local-input',updated_at_ms=? WHERE runtime_execution_opaque_id=? AND state IN ('accepted','started')",
+        )
+        .run(Date.now(), event.execution.opaqueId);
+      return;
+    }
     if (event.type !== "execution.completed") return;
     const execution = this.store.db
       .query<ExecutionRow, [string]>(

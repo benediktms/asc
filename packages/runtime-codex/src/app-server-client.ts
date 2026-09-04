@@ -17,7 +17,7 @@ export type CodexThread = {
   status: { type: string };
 };
 
-type RpcId = number;
+type RpcId = number | string;
 type RpcMessage = {
   id?: RpcId;
   method?: string;
@@ -39,6 +39,7 @@ export class CodexAppServerClient {
   private connectPromise?: Promise<void>;
   readonly notifications = new EventTarget();
   onNotification?: (method: string, params: unknown) => void;
+  onRequest?: (id: RpcId, method: string, params: unknown) => void;
   onClose?: () => void;
 
   constructor(
@@ -251,6 +252,10 @@ export class CodexAppServerClient {
   }
 
   private receive(message: RpcMessage) {
+    if (message.id !== undefined && message.method) {
+      this.onRequest?.(message.id, message.method, message.params);
+      return;
+    }
     if (message.id !== undefined) {
       const pending = this.pending.get(message.id);
       if (!pending) return;

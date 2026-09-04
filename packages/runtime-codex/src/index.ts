@@ -3,8 +3,10 @@ import type { JsonValue } from "../../codex-protocol-generated/src/serde_json/Js
 import type {
   RuntimeAdapter,
   RuntimeAdapterContext,
+  RuntimeAdapterDescriptor,
   RuntimeAdapterStopContext,
   RuntimeAvailability,
+  RuntimeCapabilities,
   RuntimeCancelRequest,
   RuntimeCancelResult,
   RuntimeDeliveryEnvelopeV1,
@@ -23,8 +25,15 @@ import type {
 } from "../../../contracts/runtime-adapter";
 import { CodexAppServerClient, type CodexThread } from "./app-server-client";
 import { telemetry } from "../../observability/src/index";
+import testedVersion from "../../codex-protocol-generated/CODEX_VERSION" with { type: "text" };
 
-const capabilities = {
+export const TESTED_CODEX_VERSION = testedVersion.trim();
+
+export function codexVersion(value: string): string | undefined {
+  return value.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.at(0);
+}
+
+const capabilities: RuntimeCapabilities = {
   listSessions: true,
   observeSessionState: true,
   observeExecutions: true,
@@ -35,8 +44,14 @@ const capabilities = {
   cancelOwnedExecution: true,
   reconcileDelivery: false,
   callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
-  supportedPartKinds: ["text", "uri", "data"] as const,
+  supportedPartKinds: ["text", "uri", "data"],
 };
+const disabledCapabilities = (): RuntimeCapabilities => ({
+  ...capabilities,
+  appendContext: false,
+  wakeWhenIdle: false,
+  cancelOwnedExecution: false,
+});
 const availabilityStates: RuntimeAvailability[] = [
   "unknown",
   "offline",
@@ -48,8 +63,8 @@ const availabilityStates: RuntimeAvailability[] = [
 ];
 
 export class CodexRuntimeAdapter implements RuntimeAdapter {
-  readonly descriptor = {
-    adapterApiVersion: 1 as const,
+  readonly descriptor: RuntimeAdapterDescriptor = {
+    adapterApiVersion: 1,
     adapterId: "codex.app-server",
     harnessId: "codex",
     implementationVersion: "0.1.0",
@@ -58,6 +73,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private client?: CodexAppServerClient;
   private context?: RuntimeAdapterContext;
   private stopped = false;
+  private runtimeVersion?: string;
   private events: RuntimeEvent[] = [];
   private waiters: Array<() => void> = [];
   private executions = new Map<
@@ -79,13 +95,17 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const client = new CodexAppServerClient(this.socketPath);
     this.client = client;
     client.onNotification = (method, params) => this.handleNotification(method, params);
+    client.onRequest = (requestId, method, params) =>
+      this.handleRequest(String(requestId), method, params);
     client.onClose = () => {
       if (this.client !== client) return;
       this.client = undefined;
+      this.runtimeVersion = undefined;
       if (!this.stopped) this.emit({ type: "adapter.connection", state: "offline" });
     };
     try {
-      await client.start();
+      const initialized = await client.start();
+      this.runtimeVersion = codexVersion(initialized.userAgent);
     } catch (error) {
       client.close();
       if (this.client === client) this.client = undefined;
@@ -97,16 +117,31 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.stopped = true;
     this.client?.close();
     this.client = undefined;
+    this.runtimeVersion = undefined;
     this.wake();
   }
   async probe(): Promise<RuntimeProbeResult> {
     try {
       if (!this.client) throw new Error("adapter not started");
-      const page = await this.client.listThreads({ limit: 1, useStateDbOnly: true });
+      await this.client.listThreads({ limit: 1, useStateDbOnly: true });
+      if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+        return {
+          state: "incompatible",
+          observedAt: new Date().toISOString(),
+          runtimeVersion: this.runtimeVersion,
+          capabilities: disabledCapabilities(),
+          diagnostics: [
+            {
+              severity: "error",
+              code: "CODEX_VERSION_UNTESTED",
+              message: `Expected Codex ${TESTED_CODEX_VERSION}, received ${this.runtimeVersion ?? "unknown"}`,
+            },
+          ],
+        };
       return {
         state: "ready",
         observedAt: new Date().toISOString(),
-        runtimeVersion: page.data[0]?.cliVersion,
+        runtimeVersion: this.runtimeVersion,
         capabilities,
         diagnostics: [
           {
@@ -121,12 +156,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return {
         state: "unavailable",
         observedAt: new Date().toISOString(),
-        capabilities: {
-          ...capabilities,
-          appendContext: false,
-          wakeWhenIdle: false,
-          cancelOwnedExecution: false,
-        },
+        capabilities: disabledCapabilities(),
         diagnostics: [
           {
             severity: "error",
@@ -169,7 +199,11 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           ).thread,
         );
       } catch (error: unknown) {
-        if (/not found|invalid thread/i.test(errorMessage(error)))
+        if (
+          /not found|invalid thread|adapter not started|not connected|connection (?:closed|reset)|socket unavailable/i.test(
+            errorMessage(error),
+          )
+        )
           return {
             session,
             availability: "offline",
@@ -211,6 +245,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
     const snapshot = await this.inspectSession(request.target.session);
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
+    if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+      return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (snapshot.availability === "dormant" && request.mode === "wake_when_idle")
       return { outcome: "deferred", reason: "dormant" };
     if (snapshot.availability !== "idle" && request.mode === "wake_when_idle")
@@ -288,6 +324,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     };
   }
   async cancel(request: RuntimeCancelRequest): Promise<RuntimeCancelResult> {
+    if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+      return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (!this.executions.has(request.execution.opaqueId))
       return { outcome: "rejected", reason: "not-owned", retryable: false };
     const fence = await this.requireContext().assertBindingFence(
@@ -408,6 +446,26 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       }
     }
   }
+  private handleRequest(requestId: string, method: string, params: unknown) {
+    if (!isRuntimeInputRequest(params)) return;
+    const execution = this.executions.get(params.turnId);
+    if (!execution) return;
+    this.emit({
+      type: "execution.awaiting-local-input",
+      execution: { opaqueId: params.turnId, session: execution.session },
+      request: {
+        opaqueId: requestId,
+        kind:
+          method === "item/tool/requestUserInput"
+            ? "question"
+            : method.endsWith("/requestApproval")
+              ? "approval"
+              : "unknown",
+        blocking: params.isBlocking !== false,
+        summary: "Local runtime input required",
+      },
+    });
+  }
 }
 
 function jsonValue(json: string): JsonValue {
@@ -453,6 +511,16 @@ function isTurnCompleted(
     typeof value.turn.id === "string" &&
     "status" in value.turn &&
     typeof value.turn.status === "string"
+  );
+}
+
+function isRuntimeInputRequest(value: unknown): value is { turnId: string; isBlocking?: boolean } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "turnId" in value &&
+    typeof value.turnId === "string" &&
+    (!("isBlocking" in value) || typeof value.isBlocking === "boolean")
   );
 }
 

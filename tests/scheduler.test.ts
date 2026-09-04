@@ -153,6 +153,68 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("records local runtime input without changing the A2A task state", async () => {
+    const store = fixture(),
+      agent = store.createAgent("local-input-target"),
+      requester = authenticated(store);
+    store.bind(agent.id, "thread-local-input");
+    const accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "local-input-one",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    let deliveryAccepted: (() => void) | undefined;
+    const acceptedByRuntime = new Promise<void>((resolve) => {
+      deliveryAccepted = resolve;
+    });
+    adapter.deliver = async () => {
+      deliveryAccepted?.();
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "local-input-turn", alreadyRunning: false },
+        evidence: { scheme: "fake", value: "local-input-turn" },
+      };
+    };
+    adapter.observe = async function* (signal) {
+      yield { type: "adapter.connection", state: "online" };
+      await acceptedByRuntime;
+      await Bun.sleep(50);
+      yield {
+        type: "execution.awaiting-local-input",
+        execution: {
+          opaqueId: "local-input-turn",
+          session: { installationId: "ins_codex_local", opaqueId: "thread-local-input" },
+        },
+        request: {
+          opaqueId: "request-local-input",
+          kind: "question",
+          blocking: true,
+        },
+      };
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "test-local-input");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(
+      store.db
+        .query<{ execution_state: string; task_state: string }, [string]>(
+          "SELECT e.state execution_state,t.state task_state FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id WHERE i.id=?",
+        )
+        .get(accepted.deliveryId),
+    ).toEqual({ execution_state: "awaiting-local-input", task_state: "working" });
+    await scheduler.stop();
+    store.close();
+  });
   test("reconciles an ambiguous runtime write without redelivery", async () => {
     const store = fixture(),
       agent = store.createAgent("ambiguous-target"),
