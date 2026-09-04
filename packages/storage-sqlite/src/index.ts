@@ -246,6 +246,9 @@ export class Store {
   close() {
     this.db.close();
   }
+  write<T>(operation: () => T): T {
+    return this.db.transaction(operation).immediate();
+  }
   hashToken(token: string) {
     return createHmac("sha256", this.secret).update(token).digest();
   }
@@ -315,7 +318,7 @@ export class Store {
       tokenId = id("tok"),
       token = readFileSync(this.config.token, "utf8"),
       bridgePrincipalId = id("prn");
-    this.db.transaction(() => {
+    this.write(() => {
       this.db
         .query(
           "INSERT INTO principals(id,kind,display_name,scopes_json,created_at_ms) VALUES(?,?,?,?,?)",
@@ -365,7 +368,7 @@ export class Store {
           now,
           now,
         );
-    })();
+    });
   }
   authenticate(token: string) {
     const rows = this.db
@@ -397,7 +400,7 @@ export class Store {
       principalId = id("prn"),
       tokenId = id("tok"),
       token = randomBytes(32).toString("base64url");
-    this.db.transaction(() => {
+    this.write(() => {
       this.db
         .query(
           "INSERT INTO principals(id,kind,display_name,scopes_json,created_at_ms) VALUES(?,?,?,?,?)",
@@ -415,7 +418,7 @@ export class Store {
           '["a2a:send","a2a:read","a2a:cancel"]',
           now,
         );
-    })();
+    });
     this.audit(principalId, "token.issue", "token", tokenId, { kind });
     return { token, principalId };
   }
@@ -454,7 +457,7 @@ export class Store {
     const agent = this.agent(value);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
     const now = Date.now();
-    this.db.transaction(() => {
+    this.write(() => {
       this.db
         .query("UPDATE agents SET enabled=0,deleted_at_ms=?,updated_at_ms=? WHERE id=?")
         .run(now, now, agent.id);
@@ -463,7 +466,7 @@ export class Store {
           "UPDATE runtime_bindings SET status='revoked',revoked_at_ms=?,revocation_reason='agent-deleted' WHERE agent_id=? AND status='active'",
         )
         .run(now, agent.id);
-    })();
+    });
   }
   agent(value: string) {
     return this.db
@@ -493,7 +496,7 @@ export class Store {
             "SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?",
           )
           .get(agent.id)!.value ?? 0) + 1;
-    return this.db.transaction(() => {
+    return this.write(() => {
       this.db
         .query(
           "UPDATE runtime_bindings SET status='revoked',revoked_at_ms=?,revocation_reason='rebound' WHERE agent_id=? AND status='active'",
@@ -532,7 +535,7 @@ export class Store {
           now,
         );
       return { id: bindingId, agentId: agent.id, sessionId, epoch, principalId };
-    })();
+    });
   }
   binding(bindingId: string) {
     return this.db
@@ -543,7 +546,7 @@ export class Store {
     const binding = this.binding(bindingId);
     if (!binding) throw new Error("BINDING_NOT_FOUND");
     const now = Date.now();
-    this.db.transaction(() => {
+    this.write(() => {
       this.db
         .query(
           "UPDATE runtime_bindings SET status='revoked',revoked_at_ms=?,revocation_reason=? WHERE id=?",
@@ -554,7 +557,7 @@ export class Store {
           "UPDATE principals SET disabled_at_ms=? WHERE binding_id=? AND disabled_at_ms IS NULL",
         )
         .run(now, bindingId);
-    })();
+    });
     return this.binding(bindingId);
   }
   createClaim(agentValue: string, principalId: string, ttlSeconds = this.limits.claimTtlSeconds) {
@@ -578,7 +581,7 @@ export class Store {
       )
       .get(this.hashToken(code), Date.now());
     if (!row) throw new Error("VALIDATION_FAILED: invalid or expired claim");
-    return this.db.transaction(() => {
+    return this.write(() => {
       const binding = this.bind(row.agent_id, sessionId);
       this.db
         .query(
@@ -586,7 +589,7 @@ export class Store {
         )
         .run(Date.now(), binding.id, row.id);
       return binding;
-    })();
+    });
   }
   attest(threadId: unknown) {
     if (typeof threadId !== "string" || !threadId || threadId.length > 512)
@@ -774,12 +777,12 @@ export class Store {
       repairs.push({ id: row.id, state, snapshot: rebuilt.data });
     }
     if (repair && repairs.length)
-      this.db.transaction(() => {
+      this.write(() => {
         for (const item of repairs)
           this.db
             .query("UPDATE a2a_tasks SET state=?,a2a_snapshot_json=? WHERE id=?")
             .run(item.state, JSON.stringify(item.snapshot), item.id);
-      })();
+      });
     return { checked: rows.length, mismatched, missing, repaired: repair ? repairs.length : 0 };
   }
   accept(
@@ -810,7 +813,7 @@ export class Store {
       if (existing.request_hash !== requestHash) throw new Error("ACS_IDEMPOTENCY_CONFLICT");
       return { ...JSON.parse(existing.response_json), duplicate: true };
     }
-    const result = this.db.transaction(() => {
+    return this.write(() => {
       const queued = this.db
         .query<{ count: number }, [string]>(
           "SELECT count(*) count FROM delivery_intents WHERE target_agent_id=? AND state IN ('pending','leased','attempting','deferred','acceptance-unknown')",
@@ -984,7 +987,6 @@ export class Store {
         );
       return { ...response, duplicate: false };
     });
-    return result();
   }
   setTaskState(
     taskId: string,
@@ -993,7 +995,7 @@ export class Store {
     summary = "",
     details: Record<string, unknown> = {},
   ): StoredTask {
-    return this.db.transaction(() => {
+    return this.write(() => {
       const row = this.db
         .query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?")
         .get(taskId);
@@ -1116,10 +1118,10 @@ export class Store {
           )
           .run(now, taskId);
       return task;
-    })();
+    });
   }
   requestCancellation(taskId: string, principalId: string, reason = "") {
-    return this.db.transaction(() => {
+    return this.write(() => {
       const row = this.db
         .query<TaskRow, [string, string]>(
           "SELECT * FROM a2a_tasks WHERE id=? AND requester_principal_id=?",
@@ -1166,11 +1168,11 @@ export class Store {
         .query("UPDATE a2a_tasks SET next_event_sequence=next_event_sequence+1 WHERE id=?")
         .run(taskId);
       return task;
-    })();
+    });
   }
   publishMessage(taskId: string, principalId: string, parts: StoredPart[], summary = "") {
     if (!parts.length) throw new Error("VALIDATION_FAILED: message parts required");
-    return this.db.transaction(() => {
+    return this.write(() => {
       let row = this.assignedTask(taskId, principalId);
       if (row.state === TaskState.Submitted) {
         this.setTaskState(taskId, principalId, TaskState.Working);
@@ -1228,11 +1230,11 @@ export class Store {
         )
         .run(JSON.stringify(task), now, taskId);
       return { task, eventSequence: row.next_event_sequence };
-    })();
+    });
   }
   publishArtifacts(taskId: string, principalId: string, artifacts: StoredArtifact[]) {
     if (!artifacts.length) throw new Error("VALIDATION_FAILED: artifacts required");
-    return this.db.transaction(() => {
+    return this.write(() => {
       const row = this.assignedTask(taskId, principalId);
       if (["completed", "failed", "canceled", "rejected"].includes(row.state))
         throw new Error("TASK_STATE_CONFLICT");
@@ -1261,7 +1263,7 @@ export class Store {
         )
         .run(JSON.stringify(task), now, taskId);
       return { task, eventSequence: row.next_event_sequence };
-    })();
+    });
   }
   retryDelivery(deliveryId: string) {
     const delivery = this.db

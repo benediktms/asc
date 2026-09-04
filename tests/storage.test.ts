@@ -154,6 +154,15 @@ describe("durable acceptance", () => {
     ).toEqual({ state: "pending" });
     reopened.close();
   });
+  test("acquires the SQLite write lock before transaction work", () => {
+    const first = fixture(),
+      second = new Store(first.config, { busyTimeoutMs: 1 });
+    first.write(() => {
+      expect(() => second.db.exec("BEGIN IMMEDIATE")).toThrow("database is locked");
+    });
+    second.close();
+    first.close();
+  });
   test("detects and repairs task projection drift from the event log", () => {
     const store = fixture(),
       target = store.createAgent("projection-worker"),

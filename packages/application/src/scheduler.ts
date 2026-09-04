@@ -157,7 +157,7 @@ export class DeliveryScheduler {
       reconciliationToken: row.reconciliation_token,
     });
     if (result.outcome === "accepted") {
-      this.store.db.transaction(() => {
+      this.store.write(() => {
         this.store.db
           .query(
             "UPDATE delivery_intents SET state='accepted',state_reason=NULL,runtime_execution_id=?,updated_at_ms=? WHERE id=? AND state='acceptance-unknown'",
@@ -177,7 +177,7 @@ export class DeliveryScheduler {
               now,
               now,
             );
-      })();
+      });
     } else if (result.outcome === "not-accepted") {
       this.store.db
         .query(
@@ -261,7 +261,7 @@ export class DeliveryScheduler {
     return true;
   }
   private lease() {
-    return this.store.db.transaction(() => {
+    return this.store.write(() => {
       const now = Date.now(),
         rows = this.store.db
           .query<DeliveryIntentRow, [number, number, number]>(
@@ -276,7 +276,7 @@ export class DeliveryScheduler {
         )
         .run(this.instanceId, now + this.options.leaseMs, now, row.id);
       return row;
-    })();
+    });
   }
   private async deliver(intent: DeliveryIntentRow) {
     const now = Date.now(),
@@ -297,7 +297,7 @@ export class DeliveryScheduler {
       return this.defer(intent.id, "manual-wake-required", 30_000);
     const attempt = id("atm"),
       number = intent.attempt_count + 1;
-    this.store.db.transaction(() => {
+    this.store.write(() => {
       const fenced = this.store.db
         .query("SELECT 1 FROM runtime_bindings WHERE id=? AND epoch=? AND status='active'")
         .get(binding.id, binding.epoch);
@@ -312,7 +312,7 @@ export class DeliveryScheduler {
           "INSERT INTO delivery_attempts(id,intent_id,attempt_number,adapter_id,binding_id,binding_epoch,started_at_ms,request_flushed_at_ms) VALUES(?,?,?,?,?,?,?,?)",
         )
         .run(attempt, intent.id, number, "codex.app-server", binding.id, binding.epoch, now, now);
-    })();
+    });
     const target = this.store.agent(intent.target_agent_id),
       payload: DeliveryPayload = JSON.parse(intent.payload_json),
       parties = this.store.db
@@ -376,7 +376,7 @@ export class DeliveryScheduler {
     });
     const completed = Date.now();
     if (result.outcome === "accepted") {
-      this.store.db.transaction(() => {
+      this.store.write(() => {
         this.store.db
           .query(
             "UPDATE delivery_intents SET state='accepted',state_reason=NULL,lease_owner=NULL,lease_expires_at_ms=NULL,runtime_execution_id=?,updated_at_ms=? WHERE id=?",
@@ -406,7 +406,7 @@ export class DeliveryScheduler {
               completed,
               completed,
             );
-      })();
+      });
       if (result.execution) {
         const principal = this.store.db
           .query<{ id: `prn_${string}` }, [BindingId]>(
@@ -459,7 +459,7 @@ export class DeliveryScheduler {
   }
   private recoverExpiredLeases() {
     const now = Date.now();
-    this.store.db.transaction(() => {
+    this.store.write(() => {
       this.store.db
         .query(
           "UPDATE delivery_intents SET state='pending',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE state='leased' AND lease_expires_at_ms<=?",
@@ -470,7 +470,7 @@ export class DeliveryScheduler {
           "UPDATE delivery_intents SET state='acceptance-unknown',state_reason='request-flushed-no-response',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE state='attempting' AND lease_expires_at_ms<=?",
         )
         .run(now, now);
-    })();
+    });
   }
   private finishAttempt(attempt: string, outcome: string, error: string, token?: string) {
     this.store.db
