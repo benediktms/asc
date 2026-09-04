@@ -11,6 +11,7 @@ import type {
   RuntimeInstallationId,
 } from "../../../contracts/runtime-adapter";
 import { loadConfig } from "../../config/src/index";
+import { z } from "zod";
 export interface StoredPart {
   content?:
     | { $case: "text"; value: string }
@@ -47,6 +48,48 @@ export interface StoredArtifact {
   metadata?: Record<string, unknown>;
   extensions: string[];
 }
+
+const storedPartSchema = z.object({
+    content: z
+      .discriminatedUnion("$case", [
+        z.object({ $case: z.literal("text"), value: z.string() }),
+        z.object({ $case: z.literal("url"), value: z.string() }),
+        z.object({ $case: z.literal("data"), value: z.json() }),
+        z.object({ $case: z.literal("raw"), value: z.unknown() }),
+      ])
+      .optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    filename: z.string(),
+    mediaType: z.string(),
+  }),
+  storedMessageSchema = z.object({
+    messageId: z.string(),
+    contextId: z.string(),
+    taskId: z.string(),
+    role: z.number(),
+    parts: z.array(storedPartSchema),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    extensions: z.array(z.string()),
+    referenceTaskIds: z.array(z.string()),
+  }),
+  storedArtifactSchema = z.object({
+    artifactId: z.string(),
+    name: z.string(),
+    description: z.string(),
+    parts: z.array(storedPartSchema),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    extensions: z.array(z.string()),
+  }),
+  storedTaskSchema = z.object({
+    id: z.string(),
+    contextId: z.string(),
+    status: z
+      .object({ state: z.number(), message: storedMessageSchema.optional(), timestamp: z.string() })
+      .optional(),
+    artifacts: z.array(storedArtifactSchema),
+    history: z.array(storedMessageSchema),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+  });
 
 const taskStates: Record<TaskState, number> = {
   submitted: 1,
@@ -212,7 +255,7 @@ export class Store {
       mac = createHmac("sha256", this.secret).update(payload).digest("base64url");
     return `${payload}.${mac}`;
   }
-  decodeCursor<T>(cursor: string): T {
+  decodeCursor(cursor: string): unknown {
     const [payload, signature, extra] = cursor.split("."),
       expected = payload
         ? createHmac("sha256", this.secret).update(payload).digest("base64url")
@@ -225,11 +268,12 @@ export class Store {
       !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
     )
       throw new Error("VALIDATION_FAILED: invalid cursor");
-    return parseJson<T>(Buffer.from(payload, "base64url").toString());
+    return JSON.parse(Buffer.from(payload, "base64url").toString());
   }
   cursorOffset(cursor?: string) {
     if (!cursor) return 0;
-    const value = this.decodeCursor<{ offset?: unknown }>(cursor).offset;
+    const decoded = this.decodeCursor(cursor),
+      value = isRecord(decoded) ? decoded.offset : undefined;
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
       throw new Error("VALIDATION_FAILED: invalid cursor");
     return value;
@@ -857,7 +901,7 @@ export class Store {
       }
       const state = transition(row.state, next),
         now = Date.now(),
-        task = parseJson<StoredTask>(row.a2a_snapshot_json);
+        task = parseTask(row.a2a_snapshot_json);
       task.status = {
         state: taskStates[state],
         message: summary
@@ -991,7 +1035,7 @@ export class Store {
         .get(taskId);
       if (!execution) return this.setTaskState(taskId, principalId, TaskState.Canceled, reason);
       const now = Date.now(),
-        task = parseJson<StoredTask>(row.a2a_snapshot_json);
+        task = parseTask(row.a2a_snapshot_json);
       task.metadata = {
         ...task.metadata,
         "urn:agent-communications:cancellation:v1": { requested: true, reason },
@@ -1041,7 +1085,7 @@ export class Store {
           extensions: [],
           referenceTaskIds: [],
         },
-        task = parseJson<StoredTask>(row.a2a_snapshot_json);
+        task = parseTask(row.a2a_snapshot_json);
       task.history.push(message);
       this.db
         .query(
@@ -1089,7 +1133,7 @@ export class Store {
       if (["completed", "failed", "canceled", "rejected"].includes(row.state))
         throw new Error("TASK_STATE_CONFLICT");
       const now = Date.now(),
-        task = parseJson<StoredTask>(row.a2a_snapshot_json);
+        task = parseTask(row.a2a_snapshot_json);
       task.artifacts.push(...artifacts);
       this.db
         .query(
@@ -1181,6 +1225,11 @@ function stringArray(json: string) {
   return value;
 }
 
-function parseJson<T>(json: string): T {
-  return JSON.parse(json) as T;
+function parseTask(json: string): StoredTask {
+  const result = storedTaskSchema.safeParse(JSON.parse(json));
+  if (!result.success) throw new Error("STORAGE_CORRUPT: invalid task snapshot");
+  return result.data;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

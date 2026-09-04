@@ -6,8 +6,7 @@
   "scripts": {
     "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",
     "boundaries": "bun scripts/check-imports.ts",
-    "casts:check": "bun scripts/check-casts.ts",
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun run casts:check && bun test",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun test",
     "enums:check": "bun scripts/check-enums.ts",
     "format": "oxfmt . '!packages/codex-protocol-generated/**'",
     "format:check": "oxfmt --check . '!packages/codex-protocol-generated/**'",

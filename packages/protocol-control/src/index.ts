@@ -480,15 +480,15 @@ export function controlHandler(
   };
 }
 
-export async function controlCall<T = unknown>(
+export async function controlCall(
   socketPath: string,
   tokenPath: string,
   method: string,
   params: unknown = {},
-): Promise<T> {
+): Promise<unknown> {
   const body = JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, params }),
     token = readFileSync(tokenPath, "utf8");
-  return await new Promise<T>((resolve, reject) => {
+  return await new Promise<unknown>((resolve, reject) => {
     let response = Buffer.alloc(0),
       expected = Infinity;
     Bun.connect({
@@ -526,7 +526,7 @@ export async function controlCall<T = unknown>(
         if (!isRecord(rpc)) throw new Error("Invalid control response");
         if (isRecord(rpc.error) && typeof rpc.error.message === "string")
           reject(new Error(rpc.error.message));
-        else resolve(rpc.result as T);
+        else resolve(rpc.result);
       } catch (error) {
         reject(error);
       }
