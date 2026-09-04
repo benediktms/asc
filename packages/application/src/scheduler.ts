@@ -12,11 +12,13 @@ import type {
   RuntimeAdapter,
   RuntimeAdapterContext,
   RuntimeDeliveryEnvelopeV1,
+  RuntimeDeliveryRequest,
   RuntimeEvent,
   RuntimeInstallationId,
   RuntimeExecutionId,
   NeutralPart,
 } from "../../../contracts/runtime-adapter";
+import { telemetry } from "../../observability/src/index";
 
 type DeliveryPayload =
   | { taskId: string; contextId: string; message: StoredMessage; replyExpected: boolean }
@@ -367,7 +369,7 @@ export class DeliveryScheduler {
           }),
       provenance: { authority: "peer-agent", trustedForPermissions: false },
     };
-    const result = await this.adapter.deliver({
+    const result = await this.runtimeDeliver({
       deliveryId: intent.id,
       target: {
         session: {
@@ -435,6 +437,7 @@ export class DeliveryScheduler {
           retryDelay(number, Math.random, this.options.retryBaseMs, this.options.retryCapMs),
       );
     } else if (result.outcome === "acceptance-unknown") {
+      telemetry.increment("acs_acceptance_unknown_total");
       this.finishAttempt(
         attempt,
         "acceptance-unknown",
@@ -467,6 +470,19 @@ export class DeliveryScheduler {
         "UPDATE delivery_intents SET state='deferred',state_reason=?,not_before_ms=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=?",
       )
       .run(reason, now + delay, now, intentId);
+  }
+  private async runtimeDeliver(request: RuntimeDeliveryRequest) {
+    const started = performance.now();
+    telemetry.increment("acs_delivery_attempts_total", {
+      adapter: this.adapter.descriptor.adapterId,
+    });
+    try {
+      return await this.adapter.deliver(request);
+    } finally {
+      telemetry.observe("acs_delivery_latency_ms", performance.now() - started, {
+        adapter: this.adapter.descriptor.adapterId,
+      });
+    }
   }
   private recoverExpiredLeases() {
     const now = Date.now();

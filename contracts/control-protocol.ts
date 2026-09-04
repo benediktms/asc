@@ -191,6 +191,12 @@ export interface ControlMethodMap {
         readonly status: "ready" | "degraded" | "unavailable" | "incompatible";
       }[];
       readonly startedAt: string;
+      readonly metrics: readonly {
+        readonly name: string;
+        readonly labels: Readonly<Record<string, string>>;
+        readonly value: number;
+        readonly count?: number;
+      }[];
     };
   };
 

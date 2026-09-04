@@ -22,6 +22,7 @@ import type {
   RuntimeSessionSnapshot,
 } from "../../../contracts/runtime-adapter";
 import { CodexAppServerClient, type CodexThread } from "./app-server-client";
+import { telemetry } from "../../observability/src/index";
 
 const capabilities = {
   listSessions: true,
@@ -36,6 +37,15 @@ const capabilities = {
   callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
   supportedPartKinds: ["text", "uri", "data"] as const,
 };
+const availabilityStates: RuntimeAvailability[] = [
+  "unknown",
+  "offline",
+  "dormant",
+  "idle",
+  "busy",
+  "awaiting-local-input",
+  "degraded",
+];
 
 export class CodexRuntimeAdapter implements RuntimeAdapter {
   readonly descriptor = {
@@ -139,6 +149,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const availability = query.availability;
     if (availability?.length)
       sessions = sessions.filter((item) => availability.includes(item.availability));
+    for (const state of availabilityStates)
+      telemetry.gauge(
+        "acs_runtime_sessions_by_state",
+        sessions.filter((session) => session.availability === state).length,
+        { state },
+      );
     return { sessions, nextCursor: page.nextCursor ?? undefined };
   }
   async inspectSession(session: RuntimeSessionRef): Promise<RuntimeSessionSnapshot> {

@@ -10,6 +10,7 @@ import type {
 import type { RuntimeAdapter, RuntimeInstallationId } from "../../../contracts/runtime-adapter";
 import type { ExecutorArtifact, ExecutorPart } from "../../../contracts/control-protocol";
 import { TaskState } from "../../domain/src/index";
+import { telemetry } from "../../observability/src/index";
 import { z } from "zod";
 
 const partSchema = z.discriminatedUnion("kind", [
@@ -106,6 +107,7 @@ export function controlHandler(
   adapter?: RuntimeAdapter,
 ) {
   return async (request: Request) => {
+    telemetry.increment("acs_control_requests_total");
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     if (request.headers.get("ACS-Control-Version") !== "1")
       return new Response("Unsupported control protocol version", { status: 426 });
@@ -158,6 +160,7 @@ export function controlHandler(
             database: "ok",
             adapters: [{ adapterId: "codex.app-server", status: probe?.state ?? "unavailable" }],
             startedAt,
+            metrics: store.metrics(),
           });
         }
         case "system.capabilities":

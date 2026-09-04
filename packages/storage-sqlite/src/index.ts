@@ -11,6 +11,7 @@ import type {
   RuntimeInstallationId,
 } from "../../../contracts/runtime-adapter";
 import { loadConfig } from "../../config/src/index";
+import { telemetry } from "../../observability/src/index";
 import { z } from "zod";
 export interface StoredPart {
   content?:
@@ -248,7 +249,28 @@ export class Store {
     this.db.close();
   }
   write<T>(operation: () => T): T {
-    return this.db.transaction(operation).immediate();
+    try {
+      return this.db.transaction(operation).immediate();
+    } catch (error) {
+      if (error instanceof Error && /SQLITE_BUSY|database is locked/i.test(error.message))
+        telemetry.increment("acs_sqlite_busy_total");
+      throw error;
+    }
+  }
+  metrics() {
+    for (const row of this.db
+      .query<{ state: string; count: number }, []>(
+        "SELECT state,count(*) count FROM a2a_tasks GROUP BY state",
+      )
+      .all())
+      telemetry.gauge("acs_tasks_by_state", row.count, { state: row.state });
+    for (const row of this.db
+      .query<{ state: string; count: number }, []>(
+        "SELECT state,count(*) count FROM delivery_intents GROUP BY state",
+      )
+      .all())
+      telemetry.gauge("acs_delivery_intents_by_state", row.count, { state: row.state });
+    return telemetry.snapshot();
   }
   hashToken(token: string) {
     return createHmac("sha256", this.secret).update(token).digest();

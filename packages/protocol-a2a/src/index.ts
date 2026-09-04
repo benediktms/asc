@@ -29,6 +29,7 @@ import {
   type A2ARequestHandler,
 } from "@a2a-js/sdk/server";
 import type { AgentRow, Store, StoredTask } from "../../storage-sqlite/src/index";
+import { telemetry } from "../../observability/src/index";
 
 const extension = "urn:agent-communications:delivery:v1";
 class PrincipalUser {
@@ -325,6 +326,21 @@ export async function handleA2A(
   request: Request,
   port: number,
   maxRequestBytes = 524288,
+): Promise<Response> {
+  const started = performance.now();
+  telemetry.increment("acs_a2a_requests_total");
+  try {
+    return await handleA2ARoute(store, request, port, maxRequestBytes);
+  } finally {
+    telemetry.observe("acs_a2a_request_duration_ms", performance.now() - started);
+  }
+}
+
+async function handleA2ARoute(
+  store: Store,
+  request: Request,
+  port: number,
+  maxRequestBytes: number,
 ): Promise<Response> {
   const url = new URL(request.url),
     match = url.pathname.match(/^\/agents\/([^/]+)\/(?:\.well-known\/agent-card\.json|a2a)$/);
