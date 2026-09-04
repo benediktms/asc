@@ -14,7 +14,7 @@ import type {
   RuntimeSessionSnapshot,
 } from "./runtime-adapter";
 
-export const ACS_CONTROL_PROTOCOL_VERSION = "1.0" as const;
+export const ACS_CONTROL_PROTOCOL_VERSION = "1.0";
 
 export interface ControlClientInfo {
   readonly name: string;

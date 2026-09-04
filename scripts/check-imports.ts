@@ -1,9 +1,9 @@
-const allowed = {
+const allowed: Record<string, readonly string[]> = {
   "@a2a-js/": ["packages/protocol-a2a/"],
   "@modelcontextprotocol/": ["packages/bridge-mcp-codex/"],
   "codex-protocol-generated": ["packages/runtime-codex/"],
   "bun:": ["packages/storage-sqlite/", "packages/runtime-codex/", "apps/acs/"],
-} as const;
+};
 
 const failures: string[] = [];
 for await (const file of new Bun.Glob("{apps,packages}/**/*.ts").scan({

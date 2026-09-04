@@ -1,19 +1,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { controlCall } from "../../protocol-control/src/index";
 import { paths } from "../../storage-sqlite/src/index";
 
-const result = (data: unknown) => ({
-  content: [{ type: "text" as const, text: JSON.stringify(data) }],
+const result = (data: unknown): CallToolResult => ({
+  content: [{ type: "text", text: JSON.stringify(data) }],
   structuredContent: {
-    schemaVersion: 1 as const,
-    ok: true as const,
+    schemaVersion: 1,
+    ok: true,
     correlationId: crypto.randomUUID(),
     data,
   },
 });
-const execute = async (operation: () => Promise<unknown>) => {
+const execute = async (operation: () => Promise<unknown>): Promise<CallToolResult> => {
   try {
     return result(await operation());
   } catch (error) {
@@ -21,10 +22,10 @@ const execute = async (operation: () => Promise<unknown>) => {
       code = message.split(":").at(0) ?? "UNKNOWN";
     return {
       isError: true,
-      content: [{ type: "text" as const, text: `${code}: ${message}` }],
+      content: [{ type: "text", text: `${code}: ${message}` }],
       structuredContent: {
-        schemaVersion: 1 as const,
-        ok: false as const,
+        schemaVersion: 1,
+        ok: false,
         correlationId: crypto.randomUUID(),
         error: {
           code,

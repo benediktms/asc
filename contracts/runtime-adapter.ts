@@ -5,7 +5,7 @@
  * Adapters translate vendor types at their own boundary.
  */
 
-export const RUNTIME_ADAPTER_API_VERSION = 1 as const;
+export const RUNTIME_ADAPTER_API_VERSION = 1;
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonValue };

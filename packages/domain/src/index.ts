@@ -45,23 +45,21 @@ export function transition(current: TaskState, next: TaskState): TaskState {
   return next;
 }
 
-const prefixes = [
-  "agt",
-  "prn",
-  "ins",
-  "bnd",
-  "ctx",
-  "tsk",
-  "msg",
-  "evt",
-  "int",
-  "atm",
-  "exe",
-  "sub",
-  "tok",
-  "clm",
-] as const;
-export type IdPrefix = (typeof prefixes)[number];
+export type IdPrefix =
+  | "agt"
+  | "prn"
+  | "ins"
+  | "bnd"
+  | "ctx"
+  | "tsk"
+  | "msg"
+  | "evt"
+  | "int"
+  | "atm"
+  | "exe"
+  | "sub"
+  | "tok"
+  | "clm";
 
 export function id<Prefix extends IdPrefix>(
   prefix: Prefix,
