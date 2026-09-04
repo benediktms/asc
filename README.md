@@ -5,6 +5,7 @@ Local-first A2A messaging for independently launched Codex threads.
 ```sh
 bun install
 bun run check
+bun run format
 bun run build
 ./dist/acs init
 ./dist/acs daemon run
@@ -13,18 +14,20 @@ bun run build
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.
 
-Codex delivery stays fail-closed until `acs codex doctor` reports the required
-runtime capabilities as proven.
+`bun run check` runs TypeScript, oxlint (including `no-explicit-any`), oxfmt,
+package import-boundary checks, and the test suite.
 
 ## Current conformance boundary
 
 Implemented: standalone Bun binary, SQLite migration and restart, authenticated
-Unix-socket control plane, agent catalogue/manual binding, A2A v1 Agent Cards and
-JSON-RPC send/get/list/cancel, durable idempotent acceptance, deferred delivery
-visibility, and the Codex MCP stdio tool surface with host-metadata attestation.
+versioned Unix-socket control plane, agent/claim/binding administration, runtime
+diagnostics, A2A v1 Agent Cards and JSON-RPC send/get/list/cancel, durable
+idempotent acceptance, retries and recovery controls, context delivery, result
+capture, task notifications, and the Codex MCP stdio tool surface with
+host-metadata attestation.
 
-Deliberately disabled pending the specification's mandatory phase-zero evidence:
-shared Codex app-server attachment, context injection, wake delivery, automatic
-turn result capture, runtime cancellation/reconciliation, and approval routing.
-`acs codex doctor` reports these gates and the daemon never substitutes an unsafe
-delivery mechanism.
+Context-only delivery is enabled. Wake delivery is fail-closed by default because
+current Codex queue input cannot preserve named tool-output provenance; it needs
+an explicit per-binding `--allow-non-atomic-wake` policy. Two-build MCP metadata,
+approval ownership, A2A TCK, and acceptance-unknown reconciliation remain release
+gates and are reported honestly rather than inferred from unit tests.

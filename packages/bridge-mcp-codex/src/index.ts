@@ -13,6 +13,36 @@ const result = (data: unknown) => ({
     data,
   },
 });
+const execute = async (operation: () => Promise<unknown>) => {
+  try {
+    return result(await operation());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error),
+      code = message.split(":")[0]!;
+    return {
+      isError: true,
+      content: [{ type: "text" as const, text: `${code}: ${message}` }],
+      structuredContent: {
+        schemaVersion: 1 as const,
+        ok: false as const,
+        correlationId: crypto.randomUUID(),
+        error: {
+          code,
+          message,
+          retryable: ["ACS_OVERLOADED", "RUNTIME_UNAVAILABLE"].includes(code),
+        },
+      },
+    };
+  }
+};
+type AgentDto = {
+  id: string;
+  slug: string;
+  displayName: string;
+  description: string;
+  availability: string;
+  skills: Array<{ id?: string; name?: string; tags?: string[] }>;
+};
 const attachment = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("uri"),
@@ -36,6 +66,11 @@ export async function runMcp(port = 7432) {
   const config = paths(),
     call = <T>(method: string, params: unknown = {}) =>
       controlCall<T>(config.runtime, config.bridgeToken, method, params);
+  await call("system.initialize", {
+    protocolVersion: "1.0",
+    client: { name: "acs-mcp-codex", version: "0.1.0", instanceId: String(process.pid) },
+    capabilities: {},
+  });
   const server = new McpServer({ name: "acs", version: "0.1.0" });
   const evidence = (extra: unknown) => ({
     harnessId: "codex",
@@ -46,7 +81,24 @@ export async function runMcp(port = 7432) {
   server.registerTool(
     "acs_identity",
     { description: "Show the calling Codex thread's ACS identity" },
-    async (extra) => result(await call("bridge.identity", { evidence: evidence(extra) })),
+    async (extra) =>
+      execute(async () => {
+        const identity = await call<{
+          attestation: { kind: string; reason?: string; bindingEpoch?: number };
+          agent?: AgentDto;
+        }>("bridge.identity", { evidence: evidence(extra) });
+        return {
+          state:
+            identity.attestation.kind === "attested"
+              ? "bound"
+              : identity.attestation.reason === "unbound-session"
+                ? "unbound"
+                : "unattested",
+          agent: identity.agent,
+          harness: "codex",
+          bindingEpoch: identity.attestation.bindingEpoch,
+        };
+      }),
   );
   server.registerTool(
     "acs_agents_list",
@@ -59,12 +111,35 @@ export async function runMcp(port = 7432) {
         cursor: z.string().optional(),
       },
     },
-    async () => result(await call("agents.list")),
+    async (args) =>
+      execute(async () => {
+        const page = await call<{ items: AgentDto[]; nextCursor?: string }>("agents.list", {
+          limit: args.limit,
+          cursor: args.cursor,
+        });
+        const items = page.items.filter(
+          (agent) =>
+            (args.status === "available"
+              ? agent.availability === "idle"
+              : args.status === "unavailable"
+                ? agent.availability !== "idle"
+                : true) &&
+            (!args.skill ||
+              agent.skills.some(
+                (skill) =>
+                  skill.id === args.skill ||
+                  skill.name === args.skill ||
+                  skill.tags?.includes(args.skill!),
+              )),
+        );
+        return { agents: items, nextCursor: page.nextCursor };
+      }),
   );
   server.registerTool(
     "acs_agent_get",
     { description: "Get one logical ACS agent", inputSchema: { agent: z.string() } },
-    async ({ agent }) => result(await call("agents.get", { agent })),
+    async ({ agent }) =>
+      execute(async () => (await call<{ agent: AgentDto }>("agents.get", { agent })).agent),
   );
   server.registerTool(
     "acs_send",
@@ -83,31 +158,32 @@ export async function runMcp(port = 7432) {
         clientRequestId: z.string().optional(),
       },
     },
-    async (args, extra) => {
-      const tid = threadId(extra);
-      if (!tid) throw new Error("UNATTESTED_CALLER");
-      const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
-        agent = await call<{ agent: { slug: string } }>("agents.get", { agent: args.to });
-      const rpc = await a2a(port, agent.agent.slug, auth.token, "SendMessage", {
-        message: {
-          messageId: args.clientRequestId ?? String(extra.requestId),
-          contextId: args.contextId,
-          taskId: args.taskId,
-          role: "ROLE_USER",
-          parts: parts(args.text, args.attachments),
-        },
-        configuration: { returnImmediately: true },
-        metadata: {
-          "urn:agent-communications:delivery:v1": {
-            mode: args.delivery,
-            priority: args.priority,
-            replyExpected: args.replyExpected,
-            notifyOn: args.notifyOn,
+    async (args, extra) =>
+      execute(async () => {
+        const tid = threadId(extra);
+        if (!tid) throw new Error("UNATTESTED_CALLER");
+        const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
+          agent = await call<{ agent: { slug: string } }>("agents.get", { agent: args.to });
+        const rpc = await a2a(port, agent.agent.slug, auth.token, "SendMessage", {
+          message: {
+            messageId: args.clientRequestId ?? String(extra.requestId),
+            contextId: args.contextId,
+            taskId: args.taskId,
+            role: "ROLE_USER",
+            parts: parts(args.text, args.attachments),
           },
-        },
-      });
-      return result(rpc);
-    },
+          configuration: { returnImmediately: true },
+          metadata: {
+            "urn:agent-communications:delivery:v1": {
+              mode: args.delivery,
+              priority: args.priority,
+              replyExpected: args.replyExpected,
+              notifyOn: args.notifyOn,
+            },
+          },
+        });
+        return rpc;
+      }),
   );
   server.registerTool(
     "acs_task_get",
@@ -115,21 +191,20 @@ export async function runMcp(port = 7432) {
       description: "Get an A2A task requested by this agent",
       inputSchema: { taskId: z.string(), historyLength: z.number().int().min(0).optional() },
     },
-    async (args, extra) => {
-      const tid = threadId(extra);
-      if (!tid) throw new Error("UNATTESTED_CALLER");
-      const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
-        target = await call<{ slug: string }>("bridge.taskTarget", {
-          threadId: tid,
-          taskId: args.taskId,
-        });
-      return result(
-        await a2a(port, target.slug, auth.token, "GetTask", {
+    async (args, extra) =>
+      execute(async () => {
+        const tid = threadId(extra);
+        if (!tid) throw new Error("UNATTESTED_CALLER");
+        const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
+          target = await call<{ slug: string }>("bridge.taskTarget", {
+            threadId: tid,
+            taskId: args.taskId,
+          });
+        return await a2a(port, target.slug, auth.token, "GetTask", {
           id: args.taskId,
           historyLength: args.historyLength,
-        }),
-      );
-    },
+        });
+      }),
   );
   server.registerTool(
     "acs_task_reply",
@@ -142,16 +217,16 @@ export async function runMcp(port = 7432) {
         clientRequestId: z.string().optional(),
       },
     },
-    async (args, extra) => {
-      const tid = threadId(extra);
-      if (!tid) throw new Error("UNATTESTED_CALLER");
-      const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
-        target = await call<{ slug: string }>("bridge.taskTarget", {
-          threadId: tid,
-          taskId: args.taskId,
-        });
-      return result(
-        await a2a(port, target.slug, auth.token, "SendMessage", {
+    async (args, extra) =>
+      execute(async () => {
+        const tid = threadId(extra);
+        if (!tid) throw new Error("UNATTESTED_CALLER");
+        const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
+          target = await call<{ slug: string }>("bridge.taskTarget", {
+            threadId: tid,
+            taskId: args.taskId,
+          });
+        return await a2a(port, target.slug, auth.token, "SendMessage", {
           message: {
             messageId: args.clientRequestId ?? String(extra.requestId),
             taskId: args.taskId,
@@ -159,9 +234,8 @@ export async function runMcp(port = 7432) {
             parts: parts(args.text, args.attachments),
           },
           configuration: { returnImmediately: true },
-        }),
-      );
-    },
+        });
+      }),
   );
   server.registerTool(
     "acs_task_cancel",
@@ -169,48 +243,60 @@ export async function runMcp(port = 7432) {
       description: "Cancel a task requested by this agent",
       inputSchema: { taskId: z.string(), reason: z.string().optional() },
     },
-    async (args, extra) => {
-      const tid = threadId(extra);
-      if (!tid) throw new Error("UNATTESTED_CALLER");
-      const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
-        target = await call<{ slug: string }>("bridge.taskTarget", {
-          threadId: tid,
-          taskId: args.taskId,
-        });
-      return result(
-        await a2a(port, target.slug, auth.token, "CancelTask", {
+    async (args, extra) =>
+      execute(async () => {
+        const tid = threadId(extra);
+        if (!tid) throw new Error("UNATTESTED_CALLER");
+        const auth = await call<{ token: string }>("bridge.issueA2AToken", { threadId: tid }),
+          target = await call<{ slug: string }>("bridge.taskTarget", {
+            threadId: tid,
+            taskId: args.taskId,
+          });
+        return await a2a(port, target.slug, auth.token, "CancelTask", {
           id: args.taskId,
           metadata: args.reason ? { reason: args.reason } : undefined,
-        }),
-      );
-    },
+        });
+      }),
   );
   server.registerTool(
     "acs_task_complete",
     {
       description: "Complete an assigned ACS task",
-      inputSchema: { taskId: z.string(), summary: z.string().min(1) },
+      inputSchema: {
+        taskId: z.string(),
+        summary: z.string().min(1),
+        artifacts: z.array(attachment).optional(),
+      },
     },
     async (args, extra) =>
-      result(await call("executor.task.complete", { ...args, threadId: threadId(extra) })),
+      execute(() => call("executor.task.complete", { ...args, threadId: threadId(extra) })),
   );
   server.registerTool(
     "acs_task_fail",
     {
       description: "Fail an assigned ACS task",
-      inputSchema: { taskId: z.string(), summary: z.string().min(1) },
+      inputSchema: {
+        taskId: z.string(),
+        summary: z.string().min(1),
+        retryable: z.boolean().optional(),
+      },
     },
     async (args, extra) =>
-      result(await call("executor.task.fail", { ...args, threadId: threadId(extra) })),
+      execute(() => call("executor.task.fail", { ...args, threadId: threadId(extra) })),
   );
   server.registerTool(
     "acs_task_request_input",
     {
       description: "Request input on an assigned ACS task",
-      inputSchema: { taskId: z.string(), question: z.string().min(1) },
+      inputSchema: {
+        taskId: z.string(),
+        question: z.string().min(1),
+        choices: z.array(z.string()).optional(),
+        blocking: z.boolean().optional(),
+      },
     },
     async (args, extra) =>
-      result(await call("executor.task.requestInput", { ...args, threadId: threadId(extra) })),
+      execute(() => call("executor.task.requestInput", { ...args, threadId: threadId(extra) })),
   );
   server.registerTool(
     "acs_inbox_list",
@@ -218,7 +304,7 @@ export async function runMcp(port = 7432) {
       description: "List non-terminal tasks assigned to this logical agent",
       inputSchema: { limit: z.number().int().min(1).max(100).optional() },
     },
-    async (_args, extra) => result(await call("inbox.list", { threadId: threadId(extra) })),
+    async (_args, extra) => execute(() => call("inbox.list", { threadId: threadId(extra) })),
   );
   await server.connect(new StdioServerTransport());
 }

@@ -69,4 +69,55 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("interrupts only the correlated ACS execution on cancellation", async () => {
+    const store = fixture(),
+      agent = store.createAgent("cancel-target"),
+      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    store.bind(agent.id, "thread-cancel");
+    const accepted = store.accept(
+      agent.id,
+      requester.id,
+      Message.fromJSON({ messageId: "cancel-one", role: "ROLE_USER", parts: [{ text: "work" }] }),
+      { mode: "append_context" },
+    );
+    const canceled: string[] = [],
+      adapter = {
+        descriptor: { adapterApiVersion: 1 },
+        async start() {},
+        async stop() {},
+        async *observe(signal: AbortSignal) {
+          yield { type: "adapter.connection", state: "online" };
+          await new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        },
+        async deliver() {
+          return {
+            outcome: "accepted",
+            acceptedAt: new Date().toISOString(),
+            execution: { opaqueId: "owned-turn", alreadyRunning: false },
+            evidence: { scheme: "fake", value: "owned-turn" },
+          };
+        },
+        async cancel(request: { execution: { opaqueId: string } }) {
+          canceled.push(request.execution.opaqueId);
+          return { outcome: "accepted", acceptedAt: new Date().toISOString() };
+        },
+      } as unknown as RuntimeAdapter;
+    const scheduler = new DeliveryScheduler(store, adapter, "test-cancel");
+    await scheduler.start();
+    await Bun.sleep(400);
+    store.requestCancellation(accepted.task.id, requester.id);
+    await Bun.sleep(400);
+    expect(canceled).toEqual(["owned-turn"]);
+    expect(
+      (
+        store.db.query("SELECT state FROM a2a_tasks WHERE id=?").get(accepted.task.id) as {
+          state: string;
+        }
+      ).state,
+    ).toBe("canceled");
+    await scheduler.stop();
+    store.close();
+  });
 });

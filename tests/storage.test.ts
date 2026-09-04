@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Message, Role } from "@a2a-js/sdk";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
+import { TaskState } from "../packages/domain/src/index";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -56,8 +57,8 @@ describe("durable acceptance", () => {
       notifyOn: ["terminal"],
       replyExpected: true,
     });
-    store.setTaskState(accepted.task.id, targetBinding.principalId, "working");
-    store.setTaskState(accepted.task.id, targetBinding.principalId, "completed", "done");
+    store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Working);
+    store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done");
     const notification = store.db
       .query(
         "SELECT kind,target_agent_id,pinned_binding_id,state FROM delivery_intents WHERE kind='task-event-notification'",
@@ -74,6 +75,34 @@ describe("durable acceptance", () => {
       pinned_binding_id: senderBinding.id,
       state: "pending",
     });
+    store.close();
+  });
+  test("allows only the assigned agent to publish and complete work", () => {
+    const store = fixture(),
+      target = store.createAgent("worker"),
+      stranger = store.createAgent("stranger"),
+      targetBinding = store.bind(target.id, "worker-thread"),
+      strangerBinding = store.bind(stranger.id, "stranger-thread"),
+      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    const accepted = store.accept(
+      target.id,
+      requester.id,
+      Message.fromJSON({ messageId: "request-3", role: Role.ROLE_USER, parts: [{ text: "work" }] }),
+      {},
+    );
+    const output = [
+      { content: { $case: "text" as const, value: "done" }, filename: "", mediaType: "text/plain" },
+    ];
+    expect(() =>
+      store.publishMessage(accepted.task.id, strangerBinding.principalId, output),
+    ).toThrow("TASK_NOT_ASSIGNED");
+    expect(
+      store.publishMessage(accepted.task.id, targetBinding.principalId, output).task.status?.state,
+    ).toBe(2);
+    expect(
+      store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done")
+        .status?.state,
+    ).toBe(3);
     store.close();
   });
 });

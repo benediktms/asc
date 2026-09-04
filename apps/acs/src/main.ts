@@ -5,6 +5,7 @@ import { controlCall, controlHandler } from "../../../packages/protocol-control/
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
 import { initFiles, paths, Store } from "../../../packages/storage-sqlite/src/index";
 import { CodexRuntimeAdapter } from "../../../packages/runtime-codex/src/index";
+import { CodexAppServerClient } from "../../../packages/runtime-codex/src/app-server-client";
 import { DeliveryScheduler } from "../../../packages/application/src/scheduler";
 
 const args = Bun.argv.slice(2),
@@ -29,14 +30,37 @@ async function main() {
   }
   const call = (method: string, params: unknown = {}) =>
     controlCall(config.runtime, config.token, method, params);
-  if (args[0] === "agents" && args[1] === "create")
-    return print(
-      await call("agents.create", {
-        slug: required(args[2], "agent slug"),
+  await call("system.initialize", {
+    protocolVersion: "1.0",
+    client: { name: "acs-cli", version: "0.1.0", instanceId: String(process.pid) },
+    capabilities: {},
+  });
+  if (args[0] === "agents" && args[1] === "create") {
+    const agent = required(args[2], "agent slug"),
+      created = await call("agents.create", {
+        slug: agent,
         displayName: option("--name"),
         description: option("--description"),
+      });
+    return print(
+      args.includes("--claim")
+        ? { created, claim: await call("agents.createClaim", { agent }) }
+        : created,
+    );
+  }
+  if (args[0] === "agents" && args[1] === "get")
+    return print(await call("agents.get", { agent: required(args[2], "agent") }));
+  if (args[0] === "agents" && args[1] === "update")
+    return print(
+      await call("agents.update", {
+        agent: required(args[2], "agent"),
+        displayName: option("--name"),
+        description: option("--description"),
+        enabled: args.includes("--enable") ? true : args.includes("--disable") ? false : undefined,
       }),
     );
+  if (args[0] === "agents" && args[1] === "delete")
+    return print(await call("agents.delete", { agent: required(args[2], "agent") }));
   if (args[0] === "agents" && args[1] === "list") return print(await call("agents.list"));
   if (args[0] === "bindings" && args[1] === "bind")
     return print(
@@ -47,7 +71,37 @@ async function main() {
       }),
     );
   if (args[0] === "bindings" && args[1] === "list") return print(await call("bindings.list"));
+  if (args[0] === "bindings" && args[1] === "get")
+    return print(await call("bindings.get", { bindingId: required(args[2], "binding ID") }));
+  if (args[0] === "bindings" && args[1] === "revoke")
+    return print(
+      await call("bindings.revoke", {
+        bindingId: required(args[2], "binding ID"),
+        reason: option("--reason"),
+      }),
+    );
+  if (args[0] === "runtimes" && args[1] === "list") return print(await call("runtimes.list"));
+  if (args[0] === "codex" && args[1] === "sessions" && args[2] === "list")
+    return print(await call("runtimes.sessions.list"));
   if (args[0] === "deliveries" && args[1] === "list") return print(await call("deliveries.list"));
+  if (args[0] === "deliveries" && args[1] === "get")
+    return print(await call("deliveries.get", { deliveryId: required(args[2], "delivery ID") }));
+  if (args[0] === "deliveries" && args[1] === "retry")
+    return print(await call("deliveries.retry", { deliveryId: required(args[2], "delivery ID") }));
+  if (args[0] === "deliveries" && args[1] === "cancel")
+    return print(
+      await call("deliveries.cancel", {
+        deliveryId: required(args[2], "delivery ID"),
+        reason: option("--reason"),
+      }),
+    );
+  if (args[0] === "deliveries" && args[1] === "resolve")
+    return print(
+      await call("deliveries.resolveUnknown", {
+        deliveryId: required(args[2], "delivery ID"),
+        resolution: required(option("--as"), "--as"),
+      }),
+    );
   if (args[0] === "token" && args[1] === "show") {
     console.log(readFileSync(config.token, "utf8"));
     return;
@@ -118,24 +172,38 @@ function required<T>(value: T | undefined, name: string): T {
 function print(value: unknown) {
   console.log(JSON.stringify(value, null, 2));
 }
-function doctor() {
+async function doctor() {
   const codex = Bun.spawnSync([process.env.ACS_CODEX_BINARY ?? "codex", "--version"]);
+  const socket =
+      process.env.ACS_CODEX_SOCKET ??
+      `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`,
+    client = new CodexAppServerClient(socket);
+  let sharedAppServer: string;
+  try {
+    await client.start();
+    const threads = await client.listThreads({ limit: 1, useStateDbOnly: true });
+    sharedAppServer = `ready (${threads.data.length} thread sampled)`;
+  } catch (error) {
+    sharedAppServer = `unavailable (${error instanceof Error ? error.message : String(error)})`;
+  } finally {
+    client.close();
+  }
   print({
     codex: codex.success ? codex.stdout.toString().trim() : "unavailable",
     phaseZero: {
       a2aOnBun: "locally testable",
       standaloneExecutable: "locally testable",
       mcpAttestation: "requires real two-build evidence",
-      sharedAppServer: "unproven",
-      safeDelivery: "unproven",
+      sharedAppServer,
+      safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",
       approvalOwnership: "unproven",
     },
-    mutatingDeliveryEnabled: false,
+    mutatingDeliveryEnabled: sharedAppServer.startsWith("ready"),
   });
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon run\n  acs agents create <slug> [--name name] [--description text]\n  acs agents list\n  acs bindings bind <agent> --session <codex-thread-id> [--allow-non-atomic-wake]\n  acs bindings list\n  acs deliveries list\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS 0.1.0\n\n  acs init\n  acs daemon run\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|update|delete <agent>\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--allow-non-atomic-wake]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --as <resolution>\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 

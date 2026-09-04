@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun test",
+    "boundaries": "bun scripts/check-imports.ts",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun test",
+    "enums:check": "bun scripts/check-enums.ts",
     "format": "oxfmt . '!packages/codex-protocol-generated/**'",
     "format:check": "oxfmt --check . '!packages/codex-protocol-generated/**'",
     "generate:codex": "bun scripts/generate-codex-protocol.ts",
-    "lint": "oxlint -D correctness -D suspicious -D perf -D typescript/no-explicit-any -A no-await-in-loop -A no-underscore-dangle --import-plugin --deny-warnings --ignore-pattern packages/codex-protocol-generated/** .",
+    "lint": "oxlint -D correctness -D suspicious -D perf -D typescript/no-explicit-any -D typescript/prefer-enum-initializers -A no-await-in-loop -A no-underscore-dangle --import-plugin --deny-warnings --ignore-pattern packages/codex-protocol-generated/** .",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },

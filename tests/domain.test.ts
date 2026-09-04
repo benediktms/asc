@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentSlug, canonical, id, transition } from "../packages/domain/src/index";
+import { agentSlug, canonical, id, TaskState, transition } from "../packages/domain/src/index";
 
 describe("domain", () => {
   test("UUIDv7 IDs are prefixed and time-sortable", () => {
@@ -13,9 +13,9 @@ describe("domain", () => {
     expect(current.slice(4, 17)).toBe("01a06ce5-7979");
   });
   test("state transitions reject illegal and terminal changes", () => {
-    expect(transition("submitted", "working")).toBe("working");
-    expect(transition("completed", "completed")).toBe("completed");
-    expect(() => transition("completed", "working")).toThrow("TASK_STATE_CONFLICT");
+    expect(transition(TaskState.Submitted, TaskState.Working)).toBe(TaskState.Working);
+    expect(transition(TaskState.Completed, TaskState.Completed)).toBe(TaskState.Completed);
+    expect(() => transition(TaskState.Completed, TaskState.Working)).toThrow("TASK_STATE_CONFLICT");
   });
   test("normalization is deterministic", () => {
     expect(agentSlug("@backend")).toBe("backend");

@@ -1,12 +1,22 @@
 import { readFileSync } from "node:fs";
-import type { Store } from "../../storage-sqlite/src/index";
+import type {
+  AgentRow,
+  BindingRow,
+  StoredArtifact,
+  StoredPart,
+  Store,
+} from "../../storage-sqlite/src/index";
 import type { RuntimeAdapter, RuntimeInstallationId } from "../../../contracts/runtime-adapter";
+import type { ExecutorArtifact, ExecutorPart } from "../../../contracts/control-protocol";
+import { TaskState } from "../../domain/src/index";
 
 type Params = {
   agent: string;
   allowNonAtomicWake?: boolean;
+  artifacts?: ExecutorArtifact[];
   bindingId: string;
   claimCode: string;
+  choices?: string[];
   deliveryId: string;
   description?: string;
   displayName?: string;
@@ -15,9 +25,13 @@ type Params = {
   question?: string;
   reason?: string;
   resolution: string;
+  retryable?: boolean;
+  blocking?: boolean;
   session: string | { opaqueId: string };
   slug: string;
   summary?: string;
+  parts?: ExecutorPart[];
+  limit?: number;
   taskId: string;
   threadId?: unknown;
   ttlSeconds?: number;
@@ -107,15 +121,20 @@ export function controlHandler(
           return ok(rpc.id, { accepted: true });
         case "agents.create":
           admin(principal.kind);
-          return ok(rpc.id, { agent: store.createAgent(p.slug, p.displayName, p.description) });
+          return ok(rpc.id, {
+            agent: agentDto(store, store.createAgent(p.slug, p.displayName, p.description)),
+          });
         case "agents.update":
           admin(principal.kind);
           return ok(rpc.id, {
-            agent: store.updateAgent(p.agent, {
-              displayName: p.displayName,
-              description: p.description,
-              enabled: p.enabled,
-            }),
+            agent: agentDto(
+              store,
+              store.updateAgent(p.agent, {
+                displayName: p.displayName,
+                description: p.description,
+                enabled: p.enabled,
+              }),
+            ),
           });
         case "agents.delete":
           admin(principal.kind);
@@ -127,10 +146,16 @@ export function controlHandler(
         case "agents.get": {
           const agent = store.agent(p.agent);
           if (!agent) throw new Error("AGENT_NOT_FOUND");
-          return ok(rpc.id, { agent });
+          return ok(rpc.id, { agent: agentDto(store, agent) });
         }
         case "agents.list":
-          return ok(rpc.id, { items: store.agents(), nextCursor: undefined });
+          return ok(rpc.id, {
+            items: store
+              .agents()
+              .slice(0, Math.min(p?.limit ?? 50, 100))
+              .map((agent) => agentDto(store, agent)),
+            nextCursor: undefined,
+          });
         case "bindings.bind":
           admin(principal.kind);
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
@@ -148,7 +173,10 @@ export function controlHandler(
           )
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
           return ok(rpc.id, {
-            binding: store.bind(p.agent, sessionId, Boolean(p.allowNonAtomicWake)),
+            binding: bindingDto(
+              store.bind(p.agent, sessionId, Boolean(p.allowNonAtomicWake)),
+              store,
+            ),
           });
         case "bindings.claim": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
@@ -167,23 +195,31 @@ export function controlHandler(
           )
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
           const binding = store.claim(p.claimCode, threadId);
-          return ok(rpc.id, { binding, agent: store.agent(binding.agentId) });
+          const agent = store.agent(binding.agentId);
+          return ok(rpc.id, {
+            binding: bindingDto(binding, store),
+            agent: agent ? agentDto(store, agent) : undefined,
+          });
         }
         case "bindings.get": {
           const binding = store.binding(p.bindingId);
           if (!binding) throw new Error("BINDING_NOT_FOUND");
-          return ok(rpc.id, { binding });
+          return ok(rpc.id, { binding: bindingDto(binding, store) });
         }
         case "bindings.list":
           return ok(rpc.id, {
-            items: store.db
-              .query("SELECT * FROM runtime_bindings ORDER BY created_at_ms DESC")
-              .all(),
+            items: (
+              store.db
+                .query("SELECT * FROM runtime_bindings ORDER BY created_at_ms DESC")
+                .all() as BindingRow[]
+            ).map((binding) => bindingDto(binding, store)),
             nextCursor: undefined,
           });
         case "bindings.revoke":
           admin(principal.kind);
-          return ok(rpc.id, { binding: store.revokeBinding(p.bindingId, p.reason) });
+          return ok(rpc.id, {
+            binding: bindingDto(store.revokeBinding(p.bindingId, p.reason)!, store),
+          });
         case "bindings.retargetPending": {
           admin(principal.kind);
           const agent = store.agent(p.agent);
@@ -233,7 +269,10 @@ export function controlHandler(
           const a = store.attest(p.evidence?.metadata?.threadId);
           return ok(rpc.id, {
             attestation: a,
-            agent: a.kind === "attested" ? store.agent(a.agentId) : undefined,
+            agent:
+              a.kind === "attested" && store.agent(a.agentId)
+                ? agentDto(store, store.agent(a.agentId)!)
+                : undefined,
           });
         }
         case "bridge.issueA2AToken": {
@@ -271,16 +310,45 @@ export function controlHandler(
           const a = store.attest(p.threadId);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           const state = rpc.method.endsWith("complete")
-            ? "completed"
+            ? TaskState.Completed
             : rpc.method.endsWith("fail")
-              ? "failed"
+              ? TaskState.Failed
               : rpc.method.endsWith("requestInput")
-                ? "input-required"
-                : "working";
+                ? TaskState.InputRequired
+                : TaskState.Working;
+          if (rpc.method.endsWith("complete") && p.artifacts?.length)
+            store.publishArtifacts(p.taskId, a.principalId, p.artifacts.map(toArtifact));
+          const details = rpc.method.endsWith("requestInput")
+            ? { choices: p.choices ?? [], blocking: p.blocking ?? true }
+            : rpc.method.endsWith("fail")
+              ? { retryable: p.retryable ?? false }
+              : {};
           return ok(rpc.id, {
-            task: store.setTaskState(p.taskId, a.principalId, state, p.summary ?? p.question ?? ""),
-            eventSequence: 0,
+            task: store.setTaskState(
+              p.taskId,
+              a.principalId,
+              state,
+              p.summary ?? p.question ?? "",
+              details,
+            ),
+            eventSequence: store.eventSequence(p.taskId),
           });
+        }
+        case "executor.task.publishMessage": {
+          const a = store.attest(p.threadId);
+          if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
+          return ok(
+            rpc.id,
+            store.publishMessage(p.taskId, a.principalId, (p.parts ?? []).map(toPart), p.summary),
+          );
+        }
+        case "executor.task.publishArtifact": {
+          const a = store.attest(p.threadId);
+          if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
+          return ok(
+            rpc.id,
+            store.publishArtifacts(p.taskId, a.principalId, (p.artifacts ?? []).map(toArtifact)),
+          );
         }
         case "deliveries.list":
           return ok(rpc.id, {
@@ -371,4 +439,81 @@ export async function controlCall<T = unknown>(
 
 function admin(kind: string) {
   if (kind !== "local-user") throw new Error("NOT_AUTHORIZED");
+}
+function agentDto(store: Store, agent: AgentRow) {
+  const binding = store.db
+    .query("SELECT * FROM runtime_bindings WHERE agent_id=? AND status='active'")
+    .get(agent.id) as BindingRow | null;
+  return {
+    id: agent.id,
+    slug: agent.slug,
+    displayName: agent.display_name,
+    description: agent.description,
+    enabled: Boolean(agent.enabled),
+    skills: JSON.parse(agent.skills_json) as unknown[],
+    availability: binding?.last_observed_availability ?? "unknown",
+    binding: binding
+      ? { id: binding.id, harnessId: "codex", epoch: binding.epoch, status: binding.status }
+      : undefined,
+    createdAt: new Date(agent.created_at_ms).toISOString(),
+    updatedAt: new Date(agent.updated_at_ms).toISOString(),
+  };
+}
+function bindingDto(
+  binding: BindingRow | { id: string; agentId: string; sessionId: string; epoch: number },
+  store: Store,
+) {
+  const row = "agent_id" in binding ? binding : store.binding(binding.id)!;
+  return {
+    id: row.id,
+    agentId: row.agent_id,
+    installationId: row.installation_id,
+    harnessId: "codex",
+    session: { installationId: row.installation_id, opaqueId: row.session_opaque_id },
+    epoch: row.epoch,
+    status: row.status,
+    continuityPolicy: row.continuity_policy,
+    deliveryPolicy: JSON.parse(row.delivery_policy_json) as Record<string, unknown>,
+    createdAt: new Date(row.created_at_ms).toISOString(),
+    activatedAt: row.activated_at_ms ? new Date(row.activated_at_ms).toISOString() : undefined,
+    revokedAt: row.revoked_at_ms ? new Date(row.revoked_at_ms).toISOString() : undefined,
+  };
+}
+function toPart(part: ExecutorPart): StoredPart {
+  if (part.kind === "text")
+    return {
+      content: { $case: "text", value: part.text },
+      filename: "",
+      mediaType: part.mediaType ?? "text/plain",
+    };
+  if (part.kind === "uri")
+    return {
+      content: { $case: "url", value: part.uri },
+      filename: part.name ?? "",
+      mediaType: part.mediaType ?? "application/octet-stream",
+    };
+  return {
+    content: { $case: "data", value: part.data },
+    filename: part.name ?? "",
+    mediaType: part.mediaType,
+  };
+}
+function toArtifact(artifact: ExecutorArtifact): StoredArtifact {
+  const part: ExecutorPart =
+    artifact.kind === "uri"
+      ? { kind: "uri", uri: artifact.uri ?? "", name: artifact.name, mediaType: artifact.mediaType }
+      : {
+          kind: "data",
+          data: artifact.data ?? null,
+          name: artifact.name,
+          mediaType: artifact.mediaType ?? "application/json",
+        };
+  return {
+    artifactId: crypto.randomUUID(),
+    name: artifact.name,
+    description: artifact.description ?? "",
+    parts: [toPart(part)],
+    metadata: undefined,
+    extensions: [],
+  };
 }

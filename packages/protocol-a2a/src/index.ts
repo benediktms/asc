@@ -17,13 +17,14 @@ import {
   JsonRpcPushNotificationNotSupportedError,
   JsonRpcTaskNotCancelableError,
   JsonRpcTaskNotFoundError,
+  JsonRpcTransportError,
 } from "@a2a-js/sdk/errors";
 import {
   JsonRpcTransportHandler,
   ServerCallContext,
   type A2ARequestHandler,
 } from "@a2a-js/sdk/server";
-import type { AgentRow, Store } from "../../storage-sqlite/src/index";
+import type { AgentRow, Store, StoredTask } from "../../storage-sqlite/src/index";
 
 const extension = "urn:agent-communications:delivery:v1";
 class PrincipalUser {
@@ -135,13 +136,19 @@ class Handler implements A2ARequestHandler {
   ) {
     return this.getAgentCard();
   }
-  async sendMessage(params: SendMessageRequest, context: ServerCallContext) {
-    return this.store.accept(
-      this.agent.id,
-      context.user!.userName,
-      params.message!,
-      delivery(params.metadata),
-    ).task;
+  async sendMessage(params: SendMessageRequest, context: ServerCallContext): Promise<Task> {
+    try {
+      return asTask(
+        this.store.accept(
+          this.agent.id,
+          context.user!.userName,
+          params.message!,
+          delivery(params.metadata),
+        ).task,
+      );
+    } catch (error) {
+      throw applicationError(error);
+    }
   }
   async *sendMessageStream(
     params: SendMessageRequest,
@@ -154,7 +161,7 @@ class Handler implements A2ARequestHandler {
   async getTask(params: GetTaskRequest, context: ServerCallContext) {
     const task = this.store.task(params.id, context.user!.userName, this.agent.id);
     if (!task) throw new JsonRpcTaskNotFoundError();
-    return trim(task, params.historyLength);
+    return trim(asTask(task), params.historyLength);
   }
   async listTasks(params: ListTasksRequest, context: ServerCallContext) {
     let tasks = this.store.listTasks(this.agent.id, context.user!.userName);
@@ -163,7 +170,9 @@ class Handler implements A2ARequestHandler {
       tasks = tasks.filter((task) => task.status?.state === params.status);
     const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100),
       offset = Number(params.pageToken || 0),
-      page = tasks.slice(offset, offset + pageSize).map((task) => trim(task, params.historyLength));
+      page = tasks
+        .slice(offset, offset + pageSize)
+        .map((task) => trim(asTask(task), params.historyLength));
     return {
       tasks: page,
       nextPageToken: offset + pageSize < tasks.length ? String(offset + pageSize) : "",
@@ -184,7 +193,7 @@ class Handler implements A2ARequestHandler {
       ].includes(task.status.state)
     )
       throw new JsonRpcTaskNotCancelableError();
-    return this.store.setTaskState(params.id, context.user!.userName, "canceled");
+    return asTask(this.store.requestCancellation(params.id, context.user!.userName));
   }
   async *resubscribe(
     params: SubscribeToTaskRequest,
@@ -214,13 +223,13 @@ class Handler implements A2ARequestHandler {
   private async *updates(task: Task, principalId: string): AsyncGenerator<StreamResponse> {
     let sequence = this.store.eventSequence(task.id);
     while (!terminal(task.status?.state)) {
-      await Bun.sleep(250);
+      await new Promise((resolve) => setTimeout(resolve, 250));
       const events = this.store.eventsAfter(task.id, sequence);
       for (const event of events) {
         sequence = event.sequence;
         const current = this.store.task(task.id, principalId);
         if (!current) return;
-        task = current;
+        task = asTask(current);
         yield {
           payload: {
             $case: "statusUpdate",
@@ -241,6 +250,34 @@ function trim(task: Task, length?: number): Task {
   return length === undefined
     ? task
     : { ...task, history: length === 0 ? [] : task.history.slice(-length) };
+}
+function asTask(task: StoredTask): Task {
+  return task as unknown as Task;
+}
+function applicationError(error: unknown) {
+  if (error instanceof JsonRpcTransportError) return error;
+  const message = error instanceof Error ? error.message : String(error),
+    raw = message.split(":")[0]!,
+    code = raw.startsWith("ACS_")
+      ? raw
+      : raw === "TASK_STATE_CONFLICT"
+        ? "ACS_TASK_STATE_CONFLICT"
+        : raw === "VALIDATION_FAILED"
+          ? "ACS_VALIDATION_FAILED"
+          : "ACS_STORAGE_UNAVAILABLE";
+  return new JsonRpcTransportError({
+    jsonrpc: "2.0",
+    id: null,
+    error: {
+      code: -32010,
+      message,
+      data: {
+        code,
+        retryable: code === "ACS_STORAGE_UNAVAILABLE" || code === "ACS_OVERLOADED",
+        correlationId: crypto.randomUUID(),
+      },
+    },
+  });
 }
 function terminal(state?: TaskState) {
   return (
@@ -281,6 +318,14 @@ export async function handleA2A(store: Store, request: Request, port: number): P
     body,
     context,
   );
+  if (isAcsErrorResponse(result)) {
+    const code = result.error.message.split(":")[0]!;
+    result.error.data = {
+      code,
+      retryable: code === "ACS_STORAGE_UNAVAILABLE" || code === "ACS_OVERLOADED",
+      correlationId: crypto.randomUUID(),
+    };
+  }
   if (Symbol.asyncIterator in Object(result)) {
     const iterator = (result as AsyncGenerator<StreamResponse>)[Symbol.asyncIterator](),
       encoder = new TextEncoder();
@@ -306,4 +351,18 @@ export async function handleA2A(store: Store, request: Request, port: number): P
     });
   }
   return Response.json(result);
+}
+function isAcsErrorResponse(
+  value: unknown,
+): value is { error: { message: string; data?: Record<string, unknown> } } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "error" in value &&
+    typeof value.error === "object" &&
+    value.error !== null &&
+    "message" in value.error &&
+    typeof value.error.message === "string" &&
+    value.error.message.startsWith("ACS_")
+  );
 }

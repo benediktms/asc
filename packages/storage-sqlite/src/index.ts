@@ -1,20 +1,56 @@
 import { Database } from "bun:sqlite";
 import migration from "../../../storage/001_initial.sql" with { type: "text" };
-import { agentSlug, canonical, id, transition, type TaskState } from "../../domain/src/index";
+import { agentSlug, canonical, id, TaskState, transition } from "../../domain/src/index";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
-import { Role, TaskState as A2ATaskState, type Message, type Task } from "@a2a-js/sdk";
+import type { JsonValue } from "../../../contracts/runtime-adapter";
+export interface StoredPart {
+  content?:
+    | { $case: "text"; value: string }
+    | { $case: "url"; value: string }
+    | { $case: "data"; value: JsonValue }
+    | { $case: "raw"; value: unknown };
+  metadata?: Record<string, unknown>;
+  filename: string;
+  mediaType: string;
+}
+export interface StoredMessage {
+  messageId: string;
+  contextId: string;
+  taskId: string;
+  role: number;
+  parts: StoredPart[];
+  metadata?: Record<string, unknown>;
+  extensions: string[];
+  referenceTaskIds: string[];
+}
+export interface StoredTask {
+  id: string;
+  contextId: string;
+  status?: { state: number; message?: StoredMessage; timestamp: string };
+  artifacts: StoredArtifact[];
+  history: StoredMessage[];
+  metadata?: Record<string, unknown>;
+}
+export interface StoredArtifact {
+  artifactId: string;
+  name: string;
+  description: string;
+  parts: StoredPart[];
+  metadata?: Record<string, unknown>;
+  extensions: string[];
+}
 
-const taskStates: Record<TaskState, A2ATaskState> = {
-  submitted: A2ATaskState.TASK_STATE_SUBMITTED,
-  working: A2ATaskState.TASK_STATE_WORKING,
-  "input-required": A2ATaskState.TASK_STATE_INPUT_REQUIRED,
-  "auth-required": A2ATaskState.TASK_STATE_AUTH_REQUIRED,
-  completed: A2ATaskState.TASK_STATE_COMPLETED,
-  failed: A2ATaskState.TASK_STATE_FAILED,
-  canceled: A2ATaskState.TASK_STATE_CANCELED,
-  rejected: A2ATaskState.TASK_STATE_REJECTED,
+const taskStates: Record<TaskState, number> = {
+  submitted: 1,
+  working: 2,
+  completed: 3,
+  failed: 4,
+  canceled: 5,
+  "input-required": 6,
+  rejected: 7,
+  "auth-required": 8,
 };
 
 export interface AgentRow {
@@ -41,6 +77,7 @@ export interface BindingRow {
   created_at_ms: number;
   activated_at_ms: number | null;
   revoked_at_ms: number | null;
+  last_observed_availability: string | null;
 }
 export interface DeliveryIntentRow {
   id: string;
@@ -470,7 +507,7 @@ export class Store {
       .get(taskId, agentId) as { a2a_snapshot_json: string } | null;
     return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
   }
-  task(idValue: string, principalId: string, targetAgentId?: string): Task | undefined {
+  task(idValue: string, principalId: string, targetAgentId?: string): StoredTask | undefined {
     const row = this.db
       .query(
         "SELECT t.* FROM a2a_tasks t LEFT JOIN principals p ON p.id=? WHERE t.id=? AND (? IS NULL OR t.target_agent_id=?) AND (t.requester_principal_id=? OR p.agent_id=t.target_agent_id)",
@@ -484,7 +521,7 @@ export class Store {
       ) as TaskRow | null;
     return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
   }
-  listTasks(agentId: string, principalId: string): Task[] {
+  listTasks(agentId: string, principalId: string): StoredTask[] {
     return (
       this.db
         .query(
@@ -516,9 +553,9 @@ export class Store {
   accept(
     agentId: string,
     principalId: string,
-    message: Message,
+    message: StoredMessage,
     options: DeliveryOptions,
-  ): { task: Task; deliveryId: string; duplicate: boolean } {
+  ): { task: StoredTask; deliveryId: string; duplicate: boolean } {
     if (!message.messageId || !message.parts.length)
       throw new Error("VALIDATION_FAILED: messageId and parts are required");
     if (message.parts.length > 32) throw new Error("ACS_MESSAGE_TOO_LARGE");
@@ -561,8 +598,9 @@ export class Store {
       )
         throw new Error("ACS_TASK_STATE_CONFLICT");
       if (message.taskId && !continuation) throw new Error("ACS_TASK_NOT_VISIBLE");
-      let state: TaskState = continuation?.state ?? "submitted";
-      if (continuation?.state === "input-required") state = transition(state, "working");
+      let state: TaskState = continuation?.state ?? TaskState.Submitted;
+      if (continuation?.state === TaskState.InputRequired)
+        state = transition(state, TaskState.Working);
       if (["completed", "failed", "canceled", "rejected"].includes(state))
         throw new Error("ACS_TASK_STATE_CONFLICT");
       if (!continuation)
@@ -571,11 +609,11 @@ export class Store {
             "INSERT INTO conversation_contexts(id,target_agent_id,requester_principal_id,requester_agent_id,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?)",
           )
           .run(contextId, agentId, principalId, requester.agent_id, now, now);
-      const inbound: Message = { ...message, contextId, taskId, role: Role.ROLE_USER };
+      const inbound: StoredMessage = { ...message, contextId, taskId, role: 1 };
       const history = continuation
         ? [...(JSON.parse(continuation.a2a_snapshot_json).history ?? []), inbound]
         : [inbound];
-      const task: Task = {
+      const task: StoredTask = {
         id: taskId,
         contextId,
         status: {
@@ -708,7 +746,13 @@ export class Store {
     });
     return result();
   }
-  setTaskState(taskId: string, principalId: string, next: TaskState, summary = ""): Task {
+  setTaskState(
+    taskId: string,
+    principalId: string,
+    next: TaskState,
+    summary = "",
+    details: Record<string, unknown> = {},
+  ): StoredTask {
     return this.db.transaction(() => {
       const row = this.db.query("SELECT * FROM a2a_tasks WHERE id=?").get(taskId) as TaskRow | null;
       if (!row) throw new Error("TASK_NOT_FOUND");
@@ -719,7 +763,7 @@ export class Store {
         throw new Error("TASK_NOT_ASSIGNED");
       const state = transition(row.state, next),
         now = Date.now(),
-        task = JSON.parse(row.a2a_snapshot_json) as Task;
+        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
       task.status = {
         state: taskStates[state],
         message: summary
@@ -727,7 +771,7 @@ export class Store {
               messageId: id("msg"),
               contextId: task.contextId,
               taskId,
-              role: Role.ROLE_AGENT,
+              role: 2,
               parts: [
                 {
                   content: { $case: "text", value: summary },
@@ -736,7 +780,7 @@ export class Store {
                   mediaType: "text/plain",
                 },
               ],
-              metadata: undefined,
+              metadata: Object.keys(details).length ? details : undefined,
               extensions: [],
               referenceTaskIds: [],
             }
@@ -776,7 +820,7 @@ export class Store {
           row.next_event_sequence,
           eventType[state],
           principalId,
-          JSON.stringify({ summary }),
+          JSON.stringify({ summary, ...details }),
           now,
         );
       this.db
@@ -820,13 +864,153 @@ export class Store {
             now,
           );
       }
-      if (state === "canceled")
+      if (state === TaskState.Canceled)
         this.db
           .query(
             "UPDATE delivery_intents SET state='canceled',state_reason='task-canceled',updated_at_ms=? WHERE task_id=? AND kind='a2a-message' AND state IN ('pending','deferred','leased')",
           )
           .run(now, taskId);
       return task;
+    })();
+  }
+  requestCancellation(taskId: string, principalId: string, reason = "") {
+    return this.db.transaction(() => {
+      const row = this.db
+        .query("SELECT * FROM a2a_tasks WHERE id=? AND requester_principal_id=?")
+        .get(taskId, principalId) as TaskRow | null;
+      if (!row) throw new Error("ACS_TASK_NOT_VISIBLE");
+      if (
+        [TaskState.Completed, TaskState.Failed, TaskState.Canceled, TaskState.Rejected].includes(
+          row.state,
+        )
+      )
+        throw new Error("TASK_STATE_CONFLICT");
+      const execution = this.db
+        .query(
+          "SELECT 1 FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id WHERE i.task_id=? AND e.state IN ('accepted','started','awaiting-local-input') LIMIT 1",
+        )
+        .get(taskId);
+      if (!execution) return this.setTaskState(taskId, principalId, TaskState.Canceled, reason);
+      const now = Date.now(),
+        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+      task.metadata = {
+        ...task.metadata,
+        "urn:agent-communications:cancellation:v1": { requested: true, reason },
+      };
+      this.db
+        .query(
+          "UPDATE a2a_tasks SET cancellation_requested=1,a2a_snapshot_json=?,updated_at_ms=? WHERE id=?",
+        )
+        .run(JSON.stringify(task), now, taskId);
+      this.db
+        .query(
+          "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
+        )
+        .run(
+          id("evt"),
+          taskId,
+          row.next_event_sequence,
+          "cancellation-requested",
+          principalId,
+          JSON.stringify({ reason }),
+          now,
+        );
+      this.db
+        .query("UPDATE a2a_tasks SET next_event_sequence=next_event_sequence+1 WHERE id=?")
+        .run(taskId);
+      return task;
+    })();
+  }
+  publishMessage(taskId: string, principalId: string, parts: StoredPart[], summary = "") {
+    if (!parts.length) throw new Error("VALIDATION_FAILED: message parts required");
+    return this.db.transaction(() => {
+      let row = this.assignedTask(taskId, principalId);
+      if (row.state === TaskState.Submitted) {
+        this.setTaskState(taskId, principalId, TaskState.Working);
+        row = this.assignedTask(taskId, principalId);
+      }
+      if (["completed", "failed", "canceled", "rejected"].includes(row.state))
+        throw new Error("TASK_STATE_CONFLICT");
+      const now = Date.now(),
+        message: StoredMessage = {
+          messageId: id("msg"),
+          contextId: row.context_id,
+          taskId,
+          role: 2,
+          parts,
+          metadata: summary ? { summary } : undefined,
+          extensions: [],
+          referenceTaskIds: [],
+        },
+        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+      task.history.push(message);
+      this.db
+        .query(
+          "INSERT INTO a2a_messages(id,external_message_id,task_id,context_id,sender_principal_id,sender_agent_id,target_agent_id,role,parts_json,metadata_json,canonical_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          id("msg"),
+          message.messageId,
+          taskId,
+          row.context_id,
+          principalId,
+          row.target_agent_id,
+          row.target_agent_id,
+          "agent",
+          JSON.stringify(parts),
+          JSON.stringify(message.metadata ?? {}),
+          this.payloadHash(message),
+          now,
+        );
+      this.db
+        .query(
+          "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
+        )
+        .run(
+          id("evt"),
+          taskId,
+          row.next_event_sequence,
+          "message-published",
+          principalId,
+          JSON.stringify({ messageId: message.messageId }),
+          now,
+        );
+      this.db
+        .query(
+          "UPDATE a2a_tasks SET a2a_snapshot_json=?,next_event_sequence=next_event_sequence+1,updated_at_ms=? WHERE id=?",
+        )
+        .run(JSON.stringify(task), now, taskId);
+      return { task, eventSequence: row.next_event_sequence };
+    })();
+  }
+  publishArtifacts(taskId: string, principalId: string, artifacts: StoredArtifact[]) {
+    if (!artifacts.length) throw new Error("VALIDATION_FAILED: artifacts required");
+    return this.db.transaction(() => {
+      const row = this.assignedTask(taskId, principalId);
+      if (["completed", "failed", "canceled", "rejected"].includes(row.state))
+        throw new Error("TASK_STATE_CONFLICT");
+      const now = Date.now(),
+        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+      task.artifacts.push(...artifacts);
+      this.db
+        .query(
+          "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
+        )
+        .run(
+          id("evt"),
+          taskId,
+          row.next_event_sequence,
+          "artifact-published",
+          principalId,
+          JSON.stringify({ artifactIds: artifacts.map((artifact) => artifact.artifactId) }),
+          now,
+        );
+      this.db
+        .query(
+          "UPDATE a2a_tasks SET a2a_snapshot_json=?,next_event_sequence=next_event_sequence+1,updated_at_ms=? WHERE id=?",
+        )
+        .run(JSON.stringify(task), now, taskId);
+      return { task, eventSequence: row.next_event_sequence };
     })();
   }
   retryDelivery(deliveryId: string) {
@@ -877,5 +1061,14 @@ export class Store {
       )
       .run(state, Date.now(), Date.now(), deliveryId);
     return this.db.query("SELECT * FROM delivery_intents WHERE id=?").get(deliveryId);
+  }
+  private assignedTask(taskId: string, principalId: string) {
+    const row = this.db
+      .query(
+        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id WHERE t.id=? AND p.disabled_at_ms IS NULL",
+      )
+      .get(principalId, taskId) as TaskRow | null;
+    if (!row) throw new Error("TASK_NOT_ASSIGNED");
+    return row;
   }
 }

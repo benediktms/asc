@@ -1,6 +1,11 @@
-import type { Message, Part } from "@a2a-js/sdk";
-import { id } from "../../domain/src/index";
-import type { BindingRow, DeliveryIntentRow, Store } from "../../storage-sqlite/src/index";
+import { id, TaskState } from "../../domain/src/index";
+import type {
+  BindingRow,
+  DeliveryIntentRow,
+  StoredMessage,
+  StoredPart,
+  Store,
+} from "../../storage-sqlite/src/index";
 import type {
   BindingId,
   DeliveryId,
@@ -9,11 +14,12 @@ import type {
   RuntimeDeliveryEnvelopeV1,
   RuntimeEvent,
   RuntimeInstallationId,
+  RuntimeExecutionId,
   NeutralPart,
 } from "../../../contracts/runtime-adapter";
 
 type DeliveryPayload =
-  | { taskId: string; contextId: string; message: Message; replyExpected: boolean }
+  | { taskId: string; contextId: string; message: StoredMessage; replyExpected: boolean }
   | { taskId: string; contextId: string; state: string; sequence: number; summary: string };
 type PartiesRow = {
   display_name: string;
@@ -68,11 +74,65 @@ export class DeliveryScheduler {
     if (this.busy) return;
     this.busy = true;
     try {
+      if (await this.cancelOne()) return;
       const intent = this.lease();
       if (intent) await this.deliver(intent);
     } finally {
       this.busy = false;
     }
+  }
+  private async cancelOne() {
+    const row = this.store.db
+      .query(
+        "SELECT e.id,e.runtime_execution_opaque_id,e.binding_id,e.binding_epoch,b.installation_id,b.session_opaque_id,b.delivery_policy_json,i.task_id,t.requester_principal_id FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE t.cancellation_requested=1 AND t.state NOT IN ('completed','failed','canceled','rejected') AND e.state IN ('accepted','started','awaiting-local-input') LIMIT 1",
+      )
+      .get() as {
+      id: string;
+      runtime_execution_opaque_id: string;
+      binding_id: string;
+      binding_epoch: number;
+      installation_id: string;
+      session_opaque_id: string;
+      delivery_policy_json: string;
+      task_id: string;
+      requester_principal_id: string;
+    } | null;
+    if (
+      !row ||
+      !(JSON.parse(row.delivery_policy_json) as { interruptOnCancel?: boolean }).interruptOnCancel
+    )
+      return false;
+    const result = await this.adapter.cancel({
+      execution: {
+        normalizedId: row.id as RuntimeExecutionId,
+        opaqueId: row.runtime_execution_opaque_id,
+        session: {
+          installationId: row.installation_id as RuntimeInstallationId,
+          opaqueId: row.session_opaque_id,
+        },
+        bindingId: row.binding_id as BindingId,
+        bindingEpoch: row.binding_epoch,
+      },
+      reason: "A2A cancellation requested",
+    });
+    if (result.outcome !== "accepted" && result.outcome !== "not-running") return false;
+    this.store.db
+      .query(
+        "UPDATE runtime_executions SET state='interrupted',completed_at_ms=?,updated_at_ms=? WHERE id=? AND state IN ('accepted','started','awaiting-local-input')",
+      )
+      .run(Date.now(), Date.now(), row.id);
+    try {
+      this.store.setTaskState(
+        row.task_id,
+        row.requester_principal_id,
+        TaskState.Canceled,
+        "Canceled by requester",
+      );
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("TASK_STATE_CONFLICT"))
+        throw error;
+    }
+    return true;
   }
   private lease() {
     return this.store.db.transaction(() => {
@@ -222,7 +282,7 @@ export class DeliveryScheduler {
         const principal = this.store.db
           .query("SELECT id FROM principals WHERE binding_id=?")
           .get(binding.id) as { id: string };
-        this.store.setTaskState(intent.task_id, principal.id, "working");
+        this.store.setTaskState(intent.task_id, principal.id, TaskState.Working);
       }
     } else if (result.outcome === "deferred") {
       this.finishAttempt(attempt, "deferred", result.reason);
@@ -294,6 +354,16 @@ export class DeliveryScheduler {
       )
       .get(event.execution.opaqueId) as ExecutionRow | null;
     if (!execution) return;
+    const taskState = this.store.db
+      .query("SELECT state FROM a2a_tasks WHERE id=?")
+      .get(execution.task_id) as { state: string } | null;
+    if (
+      !taskState ||
+      [TaskState.Completed, TaskState.Failed, TaskState.Canceled, TaskState.Rejected].includes(
+        taskState.state as TaskState,
+      )
+    )
+      return;
     const now = Date.now(),
       state =
         event.outcome === "completed"
@@ -316,7 +386,7 @@ export class DeliveryScheduler {
     this.store.setTaskState(
       execution.task_id,
       principal.id,
-      event.outcome === "completed" ? "completed" : "failed",
+      event.outcome === "completed" ? TaskState.Completed : TaskState.Failed,
       summary || event.outcome,
     );
   }
@@ -326,7 +396,7 @@ export function retryDelay(attempt: number, random = Math.random) {
   return Math.floor(random() * Math.min(30_000, 250 * 2 ** Math.min(attempt, 16)));
 }
 
-function toNeutral(part: Part): NeutralPart {
+function toNeutral(part: StoredPart): NeutralPart {
   if (part.content?.$case === "text")
     return {
       kind: "text",

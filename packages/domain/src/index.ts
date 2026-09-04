@@ -1,23 +1,41 @@
-export type TaskState =
-  | "submitted"
-  | "working"
-  | "input-required"
-  | "auth-required"
-  | "completed"
-  | "failed"
-  | "canceled"
-  | "rejected";
+export enum TaskState {
+  Submitted = "submitted",
+  Working = "working",
+  InputRequired = "input-required",
+  AuthRequired = "auth-required",
+  Completed = "completed",
+  Failed = "failed",
+  Canceled = "canceled",
+  Rejected = "rejected",
+}
 
-const terminal = new Set<TaskState>(["completed", "failed", "canceled", "rejected"]);
+const terminal = new Set<TaskState>([
+  TaskState.Completed,
+  TaskState.Failed,
+  TaskState.Canceled,
+  TaskState.Rejected,
+]);
 const transitions: Record<TaskState, readonly TaskState[]> = {
-  submitted: ["working", "input-required", "failed", "canceled", "rejected"],
-  working: ["input-required", "auth-required", "completed", "failed", "canceled"],
-  "input-required": ["working", "failed", "canceled"],
-  "auth-required": ["working", "failed", "canceled"],
-  completed: [],
-  failed: [],
-  canceled: [],
-  rejected: [],
+  [TaskState.Submitted]: [
+    TaskState.Working,
+    TaskState.InputRequired,
+    TaskState.Failed,
+    TaskState.Canceled,
+    TaskState.Rejected,
+  ],
+  [TaskState.Working]: [
+    TaskState.InputRequired,
+    TaskState.AuthRequired,
+    TaskState.Completed,
+    TaskState.Failed,
+    TaskState.Canceled,
+  ],
+  [TaskState.InputRequired]: [TaskState.Working, TaskState.Failed, TaskState.Canceled],
+  [TaskState.AuthRequired]: [TaskState.Working, TaskState.Failed, TaskState.Canceled],
+  [TaskState.Completed]: [],
+  [TaskState.Failed]: [],
+  [TaskState.Canceled]: [],
+  [TaskState.Rejected]: [],
 };
 
 export function transition(current: TaskState, next: TaskState): TaskState {
