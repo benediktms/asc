@@ -222,15 +222,14 @@ function print(value: unknown) {
 async function doctor() {
   const codex = Bun.spawnSync([settings.codex.binary, "--version"]);
   const installedCodex = codex.success ? codex.stdout.toString().trim() : undefined,
-    installedCodexVersion = installedCodex ? codexVersion(installedCodex) : undefined,
-    compatible = installedCodexVersion === TESTED_CODEX_VERSION,
     socket =
       process.env.ACS_CODEX_SOCKET ??
       `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`,
     client = new CodexAppServerClient(socket);
-  let sharedAppServer: string;
+  let sharedAppServer: string, runningCodexVersion: string | undefined;
   try {
-    await client.start();
+    const initialized = await client.start();
+    runningCodexVersion = codexVersion(initialized.userAgent);
     const threads = await client.listThreads({ limit: 1, useStateDbOnly: true });
     sharedAppServer = `ready (${threads.data.length} thread sampled)`;
   } catch (error) {
@@ -242,7 +241,8 @@ async function doctor() {
     codex: {
       installed: installedCodex ?? "unavailable",
       testedVersion: TESTED_CODEX_VERSION,
-      compatibility: compatible ? "tested" : "untested",
+      runningVersion: runningCodexVersion ?? "unavailable",
+      compatibility: runningCodexVersion === TESTED_CODEX_VERSION ? "tested" : "untested",
     },
     phaseZero: {
       a2aOnBun: "locally testable",
@@ -252,7 +252,8 @@ async function doctor() {
       safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",
       approvalOwnership: "unproven",
     },
-    mutatingDeliveryEnabled: compatible && sharedAppServer.startsWith("ready"),
+    mutatingDeliveryEnabled:
+      runningCodexVersion === TESTED_CODEX_VERSION && sharedAppServer.startsWith("ready"),
   });
 }
 function usage() {
