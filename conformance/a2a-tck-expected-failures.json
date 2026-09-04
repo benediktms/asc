@@ -1,0 +1,34 @@
+[
+  {
+    "requirement": "DM-ART-001",
+    "rationale": "The TCK asks the agent model to choose four artifact shapes; the deterministic Codex emulator intentionally emits only a final text message."
+  },
+  {
+    "requirement": "DM-MSG-001",
+    "rationale": "ACS always durably accepts SendMessage as a Task; a direct Message response is optional agent behavior outside the ACS v1 contract."
+  },
+  {
+    "requirement": "CORE-SEND-003",
+    "rationale": "ACS returns the required ContentTypeNotSupportedError, but this pinned TCK requirement omits expected_error so its generic runner marks the error as a failure."
+  },
+  {
+    "requirement": "CORE-EXECUTION-MODE-001",
+    "rationale": "The pinned TCK reuses messageId complete-task with a different request; ACS correctly returns its mandatory idempotency conflict."
+  },
+  {
+    "requirement": "CORE-EXECUTION-MODE-002",
+    "rationale": "The pinned TCK reuses messageId complete-task with a different request; ACS correctly returns its mandatory idempotency conflict."
+  },
+  {
+    "requirement": "CORE-MULTI-001a",
+    "rationale": "The pinned TCK reuses messageId complete-task with a different request; ACS correctly returns its mandatory idempotency conflict."
+  },
+  {
+    "requirement": "CORE-MULTI-002a",
+    "rationale": "ACS accepts client context IDs, while this conditional requirement tests rejection and also reuses messageId complete-task with different content."
+  },
+  {
+    "requirement": "CORE-MULTI-003",
+    "rationale": "The pinned TCK reuses messageId complete-task with a different request; ACS correctly returns its mandatory idempotency conflict."
+  }
+]

@@ -13,7 +13,8 @@
     "generate:codex": "bun scripts/generate-codex-protocol.ts",
     "lint": "oxlint -D correctness -D suspicious -D perf -D typescript/no-explicit-any -D typescript/prefer-enum-initializers -A no-await-in-loop -A no-underscore-dangle --import-plugin --deny-warnings --ignore-pattern packages/codex-protocol-generated/** .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:a2a-tck": "bun scripts/run-a2a-tck.ts"
   },
   "dependencies": {
     "@a2a-js/sdk": "1.1.0",

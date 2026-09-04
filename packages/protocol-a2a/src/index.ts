@@ -14,10 +14,14 @@ import {
   type TaskPushNotificationConfig,
 } from "@a2a-js/sdk";
 import {
+  JsonRpcContentTypeNotSupportedError,
   JsonRpcPushNotificationNotSupportedError,
   JsonRpcTaskNotCancelableError,
   JsonRpcTaskNotFoundError,
   JsonRpcTransportError,
+  JsonRpcUnsupportedOperationError,
+  JsonRpcVersionNotSupportedError,
+  toJsonRpcError,
 } from "@a2a-js/sdk/errors";
 import {
   JsonRpcTransportHandler,
@@ -255,14 +259,17 @@ function asTask(task: StoredTask): Task {
 function applicationError(error: unknown) {
   if (error instanceof JsonRpcTransportError) return error;
   const message = error instanceof Error ? error.message : String(error),
-    raw = message.split(":")[0]!,
-    code = raw.startsWith("ACS_")
-      ? raw
-      : raw === "TASK_STATE_CONFLICT"
-        ? "ACS_TASK_STATE_CONFLICT"
-        : raw === "VALIDATION_FAILED"
-          ? "ACS_VALIDATION_FAILED"
-          : "ACS_STORAGE_UNAVAILABLE";
+    raw = message.split(":")[0]!;
+  if (raw === "ACS_TASK_NOT_VISIBLE") return new JsonRpcTaskNotFoundError();
+  if (raw === "ACS_UNSUPPORTED_CONTENT") return new JsonRpcContentTypeNotSupportedError();
+  if (raw === "ACS_TASK_STATE_CONFLICT") return new JsonRpcUnsupportedOperationError();
+  const code = raw.startsWith("ACS_")
+    ? raw
+    : raw === "TASK_STATE_CONFLICT"
+      ? "ACS_TASK_STATE_CONFLICT"
+      : raw === "VALIDATION_FAILED"
+        ? "ACS_VALIDATION_FAILED"
+        : "ACS_STORAGE_UNAVAILABLE";
   return new JsonRpcTransportError({
     jsonrpc: "2.0",
     id: null,
@@ -347,12 +354,31 @@ export async function handleA2A(
   const body = await request.text();
   if (Buffer.byteLength(body) > maxRequestBytes)
     return new Response("Request too large", { status: 413 });
-  let method: unknown;
+  let payload: Record<string, unknown> | undefined;
   try {
     const parsed = JSON.parse(body);
-    method = isRecord(parsed) ? parsed.method : undefined;
+    payload = isRecord(parsed) ? parsed : undefined;
   } catch {
-    method = undefined;
+    payload = undefined;
+  }
+  const method = payload?.method,
+    rpcId = typeof payload?.id === "string" || typeof payload?.id === "number" ? payload.id : null,
+    requestedVersion = request.headers.get("A2A-Version");
+  if (requestedVersion && requestedVersion !== "1.0")
+    return Response.json({
+      jsonrpc: "2.0",
+      id: rpcId,
+      error: toJsonRpcError(new JsonRpcVersionNotSupportedError()),
+    });
+  if (method === "SubscribeToTask") {
+    const params = payload && isRecord(payload.params) ? payload.params : undefined,
+      taskId = params?.id;
+    if (typeof taskId === "string" && !store.task(taskId, principal.id, agent.id))
+      return Response.json({
+        jsonrpc: "2.0",
+        id: rpcId,
+        error: toJsonRpcError(new JsonRpcTaskNotFoundError()),
+      });
   }
   const requiredScope =
     method === "SendMessage" || method === "SendStreamingMessage"
@@ -364,7 +390,7 @@ export async function handleA2A(
     return new Response("Forbidden", { status: 403 });
   const context = new ServerCallContext({
     user: new PrincipalUser(principal.id),
-    requestedVersion: request.headers.get("A2A-Version") ?? "1.0",
+    requestedVersion: requestedVersion ?? "1.0",
   });
   const result = await new JsonRpcTransportHandler(new Handler(store, agent, port)).handle(
     body,

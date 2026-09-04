@@ -22,3 +22,20 @@ jobs:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
       - run: bun run check
+
+  a2a-tck:
+    runs-on: ubuntu-latest
+    env:
+      A2A_TCK_DIR: ${{ runner.temp }}/a2a-tck
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: git clone https://github.com/a2aproject/a2a-tck.git "$A2A_TCK_DIR"
+      - run: git checkout 263b9cfaf16a554bdfb166a7ba5b67716e946349
+        working-directory: ${{ env.A2A_TCK_DIR }}
+      - run: python3 -m pip install uv
+      - run: python3 -m uv sync --directory "$A2A_TCK_DIR"
+      - run: bun run test:a2a-tck

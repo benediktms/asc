@@ -51,6 +51,7 @@ describe("A2A JSON-RPC", () => {
           task?: { id: string; status?: { state: string } };
         };
         error?: {
+          code?: number;
           message: string;
           data?: { code?: string; retryable?: boolean; correlationId?: string };
         };
@@ -69,6 +70,19 @@ describe("A2A JSON-RPC", () => {
     });
     expect(conflict.error?.data?.code).toBe("ACS_IDEMPOTENCY_CONFLICT");
     expect(conflict.error?.data?.retryable).toBe(false);
+    expect(
+      (
+        await call("SendMessage", {
+          message: {
+            messageId: "missing-continuation",
+            taskId: "tsk_missing",
+            role: "ROLE_USER",
+            parts: [{ text: "work" }],
+          },
+        })
+      ).error?.code,
+    ).toBe(-32001);
+    expect((await call("SubscribeToTask", { id: "tsk_missing" })).error?.code).toBe(-32001);
     const read = (await call("GetTask", { id: taskId })).result;
     expect(read?.task?.id ?? read?.id).toBe(taskId);
     const canceled = (await call("CancelTask", { id: taskId })).result;
@@ -102,7 +116,27 @@ describe("A2A JSON-RPC", () => {
       7432,
     );
     expect(forbidden.status).toBe(403);
+    const unsupportedVersion = await handleA2A(
+      store,
+      new Request("http://localhost/agents/backend/a2a", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "A2A-Version": "99.0",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "version", method: "GetTask", params: {} }),
+      }),
+      7432,
+    );
+    expect(record(await unsupportedVersion.json()).error).toMatchObject({ code: -32009 });
     expect(store.agent(agent.id)?.slug).toBe("backend");
     store.close();
   });
 });
+
+function record(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("expected object");
+  return Object.fromEntries(Object.entries(value));
+}
