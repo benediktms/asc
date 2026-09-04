@@ -23,17 +23,18 @@ describe("Codex app-server transport", () => {
         data(socket, data) {
           const text = Buffer.from(data).toString();
           if (text.startsWith("GET ")) {
-            const key = text.match(/Sec-WebSocket-Key: (.+)\r/i)![1]!,
-              accept = createHash("sha1")
-                .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-                .digest("base64");
+            const key = text.match(/Sec-WebSocket-Key: (.+)\r/i)?.at(1);
+            if (!key) throw new Error("missing WebSocket key");
+            const accept = createHash("sha1")
+              .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+              .digest("base64");
             socket.write(
               `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
             );
             return;
           }
           const frame = Buffer.from(data),
-            length = frame[1]! & 0x7f,
+            length = byte(frame, 1) & 0x7f,
             offset = length === 126 ? 4 : 2,
             mask = frame.subarray(offset, offset + 4),
             payload = frame.subarray(
@@ -41,7 +42,7 @@ describe("Codex app-server transport", () => {
               offset + 4 + (length === 126 ? frame.readUInt16BE(2) : length),
             );
           received = Buffer.from(
-            payload.map((value, index) => value ^ mask[index % 4]!),
+            payload.map((value, index) => value ^ byte(mask, index % 4)),
           ).toString();
           const request = JSON.parse(received),
             body = Buffer.from(
@@ -64,3 +65,9 @@ describe("Codex app-server transport", () => {
     server.stop();
   });
 });
+
+function byte(buffer: Uint8Array, index: number) {
+  const value = buffer.at(index);
+  if (value === undefined) throw new Error("invalid WebSocket frame");
+  return value;
+}

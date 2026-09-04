@@ -142,13 +142,11 @@ class Handler implements A2ARequestHandler {
   }
   async sendMessage(params: SendMessageRequest, context: ServerCallContext): Promise<Task> {
     try {
+      const message = params.message;
+      if (!message) throw new Error("VALIDATION_FAILED: message is required");
       return asTask(
-        this.store.accept(
-          this.agent.id,
-          context.user!.userName,
-          params.message!,
-          delivery(params.metadata),
-        ).task,
+        this.store.accept(this.agent.id, principalName(context), message, delivery(params.metadata))
+          .task,
       );
     } catch (error) {
       throw applicationError(error);
@@ -160,16 +158,16 @@ class Handler implements A2ARequestHandler {
   ): AsyncGenerator<StreamResponse> {
     const task = await this.sendMessage(params, context);
     yield { payload: { $case: "task", value: task } };
-    yield* this.updates(task, context.user!.userName);
+    yield* this.updates(task, principalName(context));
   }
   async getTask(params: GetTaskRequest, context: ServerCallContext) {
-    const task = this.store.task(params.id, context.user!.userName, this.agent.id);
+    const task = this.store.task(params.id, principalName(context), this.agent.id);
     if (!task) throw new JsonRpcTaskNotFoundError();
     return trim(asTask(task), params.historyLength);
   }
   async listTasks(params: ListTasksRequest, context: ServerCallContext) {
     const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100),
-      page = this.store.listTasks(this.agent.id, context.user!.userName, {
+      page = this.store.listTasks(this.agent.id, principalName(context), {
         contextId: params.contextId,
         state: taskState(params.status),
         cursor: params.pageToken,
@@ -183,7 +181,7 @@ class Handler implements A2ARequestHandler {
     };
   }
   async cancelTask(params: CancelTaskRequest, context: ServerCallContext) {
-    const task = this.store.task(params.id, context.user!.userName, this.agent.id);
+    const task = this.store.task(params.id, principalName(context), this.agent.id);
     if (!task) throw new JsonRpcTaskNotFoundError();
     if (
       task.status &&
@@ -195,7 +193,7 @@ class Handler implements A2ARequestHandler {
       ].includes(task.status.state)
     )
       throw new JsonRpcTaskNotCancelableError();
-    return asTask(this.store.requestCancellation(params.id, context.user!.userName));
+    return asTask(this.store.requestCancellation(params.id, principalName(context)));
   }
   async *resubscribe(
     params: SubscribeToTaskRequest,
@@ -203,7 +201,7 @@ class Handler implements A2ARequestHandler {
   ): AsyncGenerator<StreamResponse> {
     const task = await this.getTask({ tenant: params.tenant, id: params.id }, context);
     yield { payload: { $case: "task", value: task } };
-    yield* this.updates(task, context.user!.userName);
+    yield* this.updates(task, principalName(context));
   }
   async createTaskPushNotificationConfig(
     _params: TaskPushNotificationConfig,
@@ -259,7 +257,7 @@ function asTask(task: StoredTask): Task {
 function applicationError(error: unknown) {
   if (error instanceof JsonRpcTransportError) return error;
   const message = error instanceof Error ? error.message : String(error),
-    raw = message.split(":")[0]!;
+    raw = message.split(":").at(0) ?? "UNKNOWN";
   if (raw === "ACS_TASK_NOT_VISIBLE") return new JsonRpcTaskNotFoundError();
   if (raw === "ACS_UNSUPPORTED_CONTENT") return new JsonRpcContentTypeNotSupportedError();
   if (raw === "ACS_TASK_STATE_CONFLICT") return new JsonRpcUnsupportedOperationError();
@@ -331,7 +329,9 @@ export async function handleA2A(
   const url = new URL(request.url),
     match = url.pathname.match(/^\/agents\/([^/]+)\/(?:\.well-known\/agent-card\.json|a2a)$/);
   if (!match) return new Response("Not found", { status: 404 });
-  const agent = store.agent(match[1]!);
+  const slug = match.at(1);
+  if (!slug) return new Response("Not found", { status: 404 });
+  const agent = store.agent(slug);
   if (!agent || !agent.enabled) return new Response("Not found", { status: 404 });
   if (request.method === "GET" && url.pathname.endsWith("agent-card.json")) {
     const json = AgentCard.toJSON(card(agent, port));
@@ -397,7 +397,7 @@ export async function handleA2A(
     context,
   );
   if (isAcsErrorResponse(result)) {
-    const code = result.error.message.split(":")[0]!;
+    const code = result.error.message.split(":").at(0) ?? "UNKNOWN";
     result.error.data = {
       code,
       retryable: code === "ACS_STORAGE_UNAVAILABLE" || code === "ACS_OVERLOADED",
@@ -432,6 +432,11 @@ export async function handleA2A(
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function principalName(context: ServerCallContext) {
+  const name = context.user?.userName;
+  if (!name) throw new Error("NOT_AUTHENTICATED");
+  return name;
 }
 function isAsyncIterable(value: unknown): value is AsyncIterable<StreamResponse> {
   return isRecord(value) && Symbol.asyncIterator in value;

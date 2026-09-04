@@ -52,7 +52,7 @@ describe("delivery scheduler", () => {
   test("leases and accepts context delivery through the runtime port", async () => {
     const store = fixture(),
       agent = store.createAgent("backend"),
-      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      principal = authenticated(store);
     store.bind(agent.id, "thread-1");
     const accepted = store.accept(
       agent.id,
@@ -82,7 +82,7 @@ describe("delivery scheduler", () => {
   test("recovers an expired delivery lease after restart", async () => {
     const store = fixture(),
       agent = store.createAgent("expired-lease-worker"),
-      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      principal = authenticated(store);
     store.bind(agent.id, "expired-lease-thread");
     const accepted = store.accept(
       agent.id,
@@ -119,7 +119,7 @@ describe("delivery scheduler", () => {
   test("interrupts only the correlated ACS execution on cancellation", async () => {
     const store = fixture(),
       agent = store.createAgent("cancel-target"),
-      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      requester = authenticated(store);
     store.bind(agent.id, "thread-cancel");
     const accepted = store.accept(
       agent.id,
@@ -148,7 +148,7 @@ describe("delivery scheduler", () => {
     expect(
       store.db
         .query<{ state: string }, [string]>("SELECT state FROM a2a_tasks WHERE id=?")
-        .get(accepted.task.id)!.state,
+        .get(accepted.task.id)?.state,
     ).toBe("canceled");
     await scheduler.stop();
     store.close();
@@ -156,7 +156,7 @@ describe("delivery scheduler", () => {
   test("reconciles an ambiguous runtime write without redelivery", async () => {
     const store = fixture(),
       agent = store.createAgent("ambiguous-target"),
-      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      requester = authenticated(store);
     store.bind(agent.id, "thread-ambiguous");
     const accepted = store.accept(
       agent.id,
@@ -199,3 +199,9 @@ describe("delivery scheduler", () => {
     store.close();
   });
 });
+
+function authenticated(store: Store) {
+  const principal = store.authenticate(readFileSync(store.config.token, "utf8"));
+  if (!principal) throw new Error("missing test principal");
+  return principal;
+}

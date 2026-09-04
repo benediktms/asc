@@ -82,7 +82,7 @@ const fail = (id: Rpc["id"] | null, error: unknown) =>
   Response.json(
     (() => {
       const message = error instanceof Error ? error.message : String(error),
-        code = message.split(":")[0]!;
+        code = message.split(":").at(0) ?? "UNKNOWN";
       return {
         jsonrpc: "2.0",
         id,
@@ -244,11 +244,14 @@ export function controlHandler(
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const session = required(p.session, "session"),
             sessionId = typeof session === "string" ? session : session.opaqueId;
-          const bindInstallation = store.db
-            .query<{ id: RuntimeInstallationId }, []>(
-              "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-            )
-            .get()!;
+          const bindInstallation = required(
+            store.db
+              .query<{ id: RuntimeInstallationId }, []>(
+                "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+              )
+              .get(),
+            "runtime installation",
+          );
           if (
             (
               await adapter.inspectSession({
@@ -269,11 +272,14 @@ export function controlHandler(
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const threadId = p.evidence?.metadata?.threadId;
           if (typeof threadId !== "string") throw new Error("UNATTESTED_CALLER");
-          const claimInstallation = store.db
-            .query<{ id: RuntimeInstallationId }, []>(
-              "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-            )
-            .get()!;
+          const claimInstallation = required(
+            store.db
+              .query<{ id: RuntimeInstallationId }, []>(
+                "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+              )
+              .get(),
+            "runtime installation",
+          );
           if (
             (
               await adapter.inspectSession({
@@ -323,7 +329,10 @@ export function controlHandler(
         }
         case "bindings.revoke":
           admin(principal.kind);
-          const revoked = store.revokeBinding(required(p.bindingId, "bindingId"), p.reason)!;
+          const revoked = required(
+            store.revokeBinding(required(p.bindingId, "bindingId"), p.reason),
+            "binding",
+          );
           audit("binding.revoke", "binding", revoked.id, { reason: p.reason ?? "revoked" });
           return ok(rpc.id, { binding: bindingDto(revoked, store) });
         case "bindings.retargetPending": {
@@ -362,11 +371,14 @@ export function controlHandler(
               typeof inspectSessionInput === "string"
                 ? inspectSessionInput
                 : inspectSessionInput.opaqueId;
-          const inspectInstallation = store.db
-            .query<{ id: RuntimeInstallationId }, []>(
-              "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-            )
-            .get()!;
+          const inspectInstallation = required(
+            store.db
+              .query<{ id: RuntimeInstallationId }, []>(
+                "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+              )
+              .get(),
+            "runtime installation",
+          );
           return ok(rpc.id, {
             session: await adapter.inspectSession({
               installationId: inspectInstallation.id,
@@ -380,12 +392,10 @@ export function controlHandler(
         }
         case "bridge.identity": {
           const a = store.attest(p.evidence?.metadata?.threadId);
+          const agent = a.kind === "attested" ? store.agent(a.agentId) : undefined;
           return ok(rpc.id, {
             attestation: a,
-            agent:
-              a.kind === "attested" && store.agent(a.agentId)
-                ? agentDto(store, store.agent(a.agentId)!)
-                : undefined,
+            agent: agent ? agentDto(store, agent) : undefined,
           });
         }
         case "bridge.issueA2AToken": {
@@ -686,7 +696,7 @@ function bindingDto(
   binding: BindingRow | { id: string; agentId: string; sessionId: string; epoch: number },
   store: Store,
 ) {
-  const row = "agent_id" in binding ? binding : store.binding(binding.id)!;
+  const row = "agent_id" in binding ? binding : required(store.binding(binding.id), "binding");
   return {
     id: row.id,
     agentId: row.agent_id,
@@ -757,8 +767,8 @@ function parseRpc(value: unknown): Rpc {
     params: paramsSchema.parse(value.params ?? {}),
   };
 }
-function required<T>(value: T | undefined, name: string): T {
-  if (value === undefined) throw new Error(`VALIDATION_FAILED: missing ${name}`);
+function required<T>(value: T | null | undefined, name: string): T {
+  if (value === undefined || value === null) throw new Error(`VALIDATION_FAILED: missing ${name}`);
   return value;
 }
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -432,7 +432,7 @@ export class Store {
         "INSERT INTO agents(id,slug,display_name,description,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?)",
       )
       .run(agentId, slug, displayName ?? slug, description, now, now);
-    return this.agent(slug)!;
+    return must(this.agent(slug), "AGENT_NOT_FOUND");
   }
   updateAgent(
     value: string,
@@ -452,7 +452,7 @@ export class Store {
         Date.now(),
         agent.id,
       );
-    return this.agent(agent.id)!;
+    return must(this.agent(agent.id), "AGENT_NOT_FOUND");
   }
   deleteAgent(value: string) {
     const agent = this.agent(value);
@@ -484,19 +484,25 @@ export class Store {
   bind(agentValue: string, sessionId: string, allowNonAtomicWake = false) {
     const agent = this.agent(agentValue);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
-    const installation = this.db
-      .query<{ id: RuntimeInstallationId }, []>(
-        "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-      )
-      .get()!;
+    const installation = must(
+      this.db
+        .query<{ id: RuntimeInstallationId }, []>(
+          "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+        )
+        .get(),
+      "STORAGE_CORRUPT: runtime installation missing",
+    );
     const now = Date.now(),
       bindingId = id("bnd"),
       epoch =
-        (this.db
-          .query<{ value: number | null }, [`agt_${string}`]>(
-            "SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?",
-          )
-          .get(agent.id)!.value ?? 0) + 1;
+        (must(
+          this.db
+            .query<{ value: number | null }, [`agt_${string}`]>(
+              "SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?",
+            )
+            .get(agent.id),
+          "STORAGE_CORRUPT: binding epoch query failed",
+        ).value ?? 0) + 1;
     return this.write(() => {
       this.db
         .query(
@@ -712,21 +718,24 @@ export class Store {
         .all(...params),
       page = rows.slice(0, options.limit),
       last = page.at(-1),
-      total = this.db
-        .query<
-          { count: number },
-          [string, string, string | null, string | null, string | null, string | null]
-        >(
-          "SELECT count(*) count FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? AND (? IS NULL OR context_id=?) AND (? IS NULL OR state=?)",
-        )
-        .get(
-          agentId,
-          principalId,
-          options.contextId ?? null,
-          options.contextId ?? null,
-          options.state ?? null,
-          options.state ?? null,
-        )!.count;
+      total = must(
+        this.db
+          .query<
+            { count: number },
+            [string, string, string | null, string | null, string | null, string | null]
+          >(
+            "SELECT count(*) count FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? AND (? IS NULL OR context_id=?) AND (? IS NULL OR state=?)",
+          )
+          .get(
+            agentId,
+            principalId,
+            options.contextId ?? null,
+            options.contextId ?? null,
+            options.state ?? null,
+            options.state ?? null,
+          ),
+        "STORAGE_CORRUPT: task count query failed",
+      ).count;
     return {
       tasks: page.map((row) => parseTask(row.a2a_snapshot_json)),
       nextCursor:
@@ -823,22 +832,28 @@ export class Store {
       return { ...JSON.parse(existing.response_json), duplicate: true };
     }
     return this.write(() => {
-      const queued = this.db
-        .query<{ count: number }, [string]>(
-          "SELECT count(*) count FROM delivery_intents WHERE target_agent_id=? AND state IN ('pending','leased','attempting','deferred','acceptance-unknown')",
-        )
-        .get(agentId)!.count;
+      const queued = must(
+        this.db
+          .query<{ count: number }, [string]>(
+            "SELECT count(*) count FROM delivery_intents WHERE target_agent_id=? AND state IN ('pending','leased','attempting','deferred','acceptance-unknown')",
+          )
+          .get(agentId),
+        "STORAGE_CORRUPT: delivery count query failed",
+      ).count;
       if (queued >= this.limits.maxQueuedDeliveryIntents) throw new Error("ACS_OVERLOADED");
       const now = Date.now(),
         contextId = message.contextId || id("ctx"),
         taskId = message.taskId || id("tsk"),
         messageRowId = id("msg"),
         deliveryId = id("int");
-      const requester = this.db
-        .query<{ agent_id: `agt_${string}` | null; binding_id: BindingId | null }, [string]>(
-          "SELECT agent_id,binding_id FROM principals WHERE id=?",
-        )
-        .get(principalId)!;
+      const requester = must(
+        this.db
+          .query<{ agent_id: `agt_${string}` | null; binding_id: BindingId | null }, [string]>(
+            "SELECT agent_id,binding_id FROM principals WHERE id=?",
+          )
+          .get(principalId),
+        "NOT_AUTHENTICATED",
+      );
       const continuation = message.taskId
         ? this.db.query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?").get(message.taskId)
         : null;
@@ -1340,6 +1355,10 @@ function stringArray(json: string) {
   const value: unknown = JSON.parse(json);
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string"))
     throw new Error("STORAGE_CORRUPT: expected string array");
+  return value;
+}
+function must<T>(value: T | null | undefined, message: string): T {
+  if (value === undefined || value === null) throw new Error(message);
   return value;
 }
 

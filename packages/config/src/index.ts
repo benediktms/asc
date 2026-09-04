@@ -176,9 +176,12 @@ export function loadConfig(path = configPath()): AcsConfig {
 export function parseListen(value: string) {
   const match = value.match(/^(127\.0\.0\.1|localhost):(\d+)$/) ?? value.match(/^(\[::1\]):(\d+)$/);
   if (!match) throw new Error("VALIDATION_FAILED: A2A listener must be loopback host:port");
+  const host = match.at(1),
+    rawPort = match.at(2);
+  if (!host || !rawPort) throw new Error("VALIDATION_FAILED: invalid daemon.a2a_listen");
   return {
-    hostname: match[1] === "[::1]" ? "::1" : match[1]!,
-    port: positive(Number(match[2]), "daemon.a2a_listen"),
+    hostname: host === "[::1]" ? "::1" : host,
+    port: positive(Number(rawPort), "daemon.a2a_listen"),
   };
 }
 

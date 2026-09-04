@@ -197,14 +197,14 @@ export class CodexAppServerClient {
     const offset = 2 + extra;
     mask.copy(frame, offset);
     for (let index = 0; index < size; index++)
-      frame[offset + 4 + index] = payload[index]! ^ mask[index % 4]!;
+      frame[offset + 4 + index] = byte(payload, index) ^ byte(mask, index % 4);
     this.socket.write(frame);
   }
 
   private readFrames() {
     while (this.bytes.length >= 2) {
-      const first = this.bytes[0]!,
-        second = this.bytes[1]!,
+      const first = byte(this.bytes, 0),
+        second = byte(this.bytes, 1),
         masked = Boolean(second & 0x80);
       let length = second & 0x7f,
         offset = 2;
@@ -226,7 +226,7 @@ export class CodexAppServerClient {
       );
       if (masked) {
         const mask = this.bytes.subarray(offset, offset + 4);
-        payload = Buffer.from(payload.map((value, index) => value ^ mask[index % 4]!));
+        payload = Buffer.from(payload.map((value, index) => value ^ byte(mask, index % 4)));
       }
       this.bytes = this.bytes.subarray(offset + maskOffset + length);
       const opcode = first & 0x0f,
@@ -280,6 +280,11 @@ export class CodexAppServerClient {
 
 function record(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new Error("invalid app-server response");
+  return value;
+}
+function byte(buffer: Uint8Array, index: number) {
+  const value = buffer.at(index);
+  if (value === undefined) throw new Error("invalid app-server frame");
   return value;
 }
 function isRecord(value: unknown): value is Record<string, unknown> {

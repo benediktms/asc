@@ -235,14 +235,14 @@ function mutations(methods: string[]) {
 
 function decodeClientFrame(frame: Buffer) {
   if (frame.length < 6) return undefined;
-  const lengthCode = frame[1]! & 0x7f,
+  const lengthCode = byte(frame, 1) & 0x7f,
     offset = lengthCode === 126 ? 4 : 2,
     length = lengthCode === 126 ? frame.readUInt16BE(2) : lengthCode,
     mask = frame.subarray(offset, offset + 4),
     payload = frame.subarray(offset + 4, offset + 4 + length);
   if (payload.length < length) return undefined;
   return {
-    text: Buffer.from(payload.map((value, index) => value ^ mask[index % 4]!)).toString(),
+    text: Buffer.from(payload.map((value, index) => value ^ byte(mask, index % 4))).toString(),
     consumed: offset + 4 + length,
   };
 }
@@ -255,6 +255,12 @@ function serverFrame(text: string) {
   header[1] = 126;
   header.writeUInt16BE(body.length, 2);
   return Buffer.concat([header, body]);
+}
+
+function byte(buffer: Uint8Array, index: number) {
+  const value = buffer.at(index);
+  if (value === undefined) throw new Error("invalid WebSocket frame");
+  return value;
 }
 
 function record(value: unknown): Record<string, unknown> {

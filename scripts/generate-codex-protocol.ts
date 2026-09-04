@@ -42,7 +42,8 @@ try {
   ];
   const copied = new Set<string>();
   while (queue.length) {
-    const file = queue.pop()!;
+    const file = queue.pop();
+    if (!file) break;
     if (copied.has(file)) continue;
     copied.add(file);
     const input = join(source, file),
@@ -50,9 +51,11 @@ try {
       target = join(output, "src", file);
     mkdirSync(dirname(target), { recursive: true });
     cpSync(input, target);
-    for (const match of content.matchAll(/from\s+"(.+)"/g))
-      if (match[1]!.startsWith("."))
-        queue.push(`${relative(source, resolve(dirname(input), match[1]!))}.ts`);
+    for (const match of content.matchAll(/from\s+"(.+)"/g)) {
+      const dependency = match.at(1);
+      if (dependency?.startsWith("."))
+        queue.push(`${relative(source, resolve(dirname(input), dependency))}.ts`);
+    }
   }
   for (const file of [
     "ClientRequest.json",

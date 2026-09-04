@@ -67,11 +67,14 @@ export class DeliveryScheduler {
   ) {}
 
   async start() {
-    const installation = this.store.db
-      .query<{ id: RuntimeInstallationId }, []>(
-        "SELECT id FROM runtime_installations WHERE adapter_id='codex.app-server' LIMIT 1",
-      )
-      .get()!;
+    const installation = required(
+      this.store.db
+        .query<{ id: RuntimeInstallationId }, []>(
+          "SELECT id FROM runtime_installations WHERE adapter_id='codex.app-server' LIMIT 1",
+        )
+        .get(),
+      "runtime installation",
+    );
     this.context = {
       installationId: installation.id,
       instanceId: this.instanceId,
@@ -115,7 +118,9 @@ export class DeliveryScheduler {
           .catch((error: unknown) => {
             this.defer(
               intent.id,
-              error instanceof Error ? error.message.split(":")[0]! : "delivery-error",
+              error instanceof Error
+                ? (error.message.split(":").at(0) ?? "delivery-error")
+                : "delivery-error",
               retryDelay(
                 intent.attempt_count + 1,
                 Math.random,
@@ -201,7 +206,7 @@ export class DeliveryScheduler {
   }
   private async connect() {
     try {
-      await this.adapter.start(this.context!);
+      await this.adapter.start(required(this.context, "adapter context"));
       this.connected = true;
       this.observeTask = this.observe();
     } catch {
@@ -315,11 +320,14 @@ export class DeliveryScheduler {
     });
     const target = this.store.agent(intent.target_agent_id),
       payload: DeliveryPayload = JSON.parse(intent.payload_json),
-      parties = this.store.db
-        .query<PartiesRow, [`tsk_${string}`]>(
-          "SELECT p.display_name,a.id requester_agent_id,a.slug requester_slug,target.id target_agent_id,target.slug target_slug FROM a2a_tasks t JOIN principals p ON p.id=t.requester_principal_id LEFT JOIN agents a ON a.id=t.requester_agent_id JOIN agents target ON target.id=t.target_agent_id WHERE t.id=?",
-        )
-        .get(intent.task_id)!;
+      parties = required(
+        this.store.db
+          .query<PartiesRow, [`tsk_${string}`]>(
+            "SELECT p.display_name,a.id requester_agent_id,a.slug requester_slug,target.id target_agent_id,target.slug target_slug FROM a2a_tasks t JOIN principals p ON p.id=t.requester_principal_id LEFT JOIN agents a ON a.id=t.requester_agent_id JOIN agents target ON target.id=t.target_agent_id WHERE t.id=?",
+          )
+          .get(intent.task_id),
+        "delivery parties",
+      );
     if (!target) throw new Error("target agent missing");
     const notification = intent.kind === "task-event-notification";
     const envelope: RuntimeDeliveryEnvelopeV1 = {
@@ -408,11 +416,14 @@ export class DeliveryScheduler {
             );
       });
       if (result.execution) {
-        const principal = this.store.db
-          .query<{ id: `prn_${string}` }, [BindingId]>(
-            "SELECT id FROM principals WHERE binding_id=?",
-          )
-          .get(binding.id)!;
+        const principal = required(
+          this.store.db
+            .query<{ id: `prn_${string}` }, [BindingId]>(
+              "SELECT id FROM principals WHERE binding_id=?",
+            )
+            .get(binding.id),
+          "binding principal",
+        );
         this.store.setTaskState(intent.task_id, principal.id, TaskState.Working);
       }
     } else if (result.outcome === "deferred") {
@@ -519,9 +530,14 @@ export class DeliveryScheduler {
         "UPDATE runtime_executions SET state=?,final_parts_json=?,completed_at_ms=?,updated_at_ms=? WHERE id=?",
       )
       .run(state, JSON.stringify(event.finalParts), now, now, execution.id);
-    const principal = this.store.db
-        .query<{ id: `prn_${string}` }, [BindingId]>("SELECT id FROM principals WHERE binding_id=?")
-        .get(execution.binding_id)!,
+    const principal = required(
+        this.store.db
+          .query<{ id: `prn_${string}` }, [BindingId]>(
+            "SELECT id FROM principals WHERE binding_id=?",
+          )
+          .get(execution.binding_id),
+        "binding principal",
+      ),
       summary = event.finalParts
         .filter((part): part is Extract<NeutralPart, { kind: "text" }> => part.kind === "text")
         .map((part) => part.text)
@@ -543,6 +559,10 @@ function interruptOnCancel(json: string) {
     "interruptOnCancel" in value &&
     value.interruptOnCancel === true
   );
+}
+function required<T>(value: T | null | undefined, name: string): T {
+  if (value === undefined || value === null) throw new Error(`missing ${name}`);
+  return value;
 }
 
 export function retryDelay(attempt: number, random = Math.random, base = 250, cap = 30_000) {

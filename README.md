@@ -14,10 +14,10 @@ bun run build
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.
 
-`bun run check` runs TypeScript, oxlint (including `no-explicit-any` and a ban
-on handwritten type assertions), oxfmt, package import-boundary checks, and the
-test suite. Persistence uses Bun's native SQLite driver directly; there is no
-ORM.
+`bun run check` runs TypeScript, oxlint (including `no-explicit-any` and bans on
+handwritten type assertions and non-null assertions), oxfmt, package
+import-boundary checks, and the test suite. Persistence uses Bun's native SQLite
+driver directly; there is no ORM.
 
 The pinned official A2A JSON-RPC profile can be run with:
 

@@ -60,7 +60,7 @@ describe("control protocol", () => {
         .query<{ n: number }, []>(
           "SELECT count(*) n FROM audit_events WHERE action IN ('agent.create','binding.bind')",
         )
-        .get()!.n,
+        .get()?.n,
     ).toBe(2);
     const bridgeToken = readFileSync(paths.bridgeToken, "utf8"),
       denied = (await call("agents.create", { slug: "forbidden" }, "1", bridgeToken)).json();
@@ -119,7 +119,7 @@ describe("control protocol", () => {
       activeBindings = await call("bindings.list", { agent: "beta", status: ["active"] });
     expect(activeBindings.items.map((item) => item.id)).toEqual([betaBinding.id]);
 
-    const principal = store.authenticate(token)!;
+    const principal = required(store.authenticate(token), "principal");
     for (const messageId of ["page-one", "page-two"])
       store.accept(
         beta.id,
@@ -175,4 +175,8 @@ function record(value: unknown): Record<string, unknown> {
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function required<T>(value: T | null | undefined, name: string): T {
+  if (value === null || value === undefined) throw new Error(`missing ${name}`);
+  return value;
 }

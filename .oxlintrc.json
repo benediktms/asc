@@ -5,6 +5,7 @@
       {
         "assertionStyle": "never"
       }
-    ]
+    ],
+    "typescript/no-non-null-assertion": "error"
   }
 }

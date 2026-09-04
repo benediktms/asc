@@ -18,7 +18,7 @@ const execute = async (operation: () => Promise<unknown>) => {
     return result(await operation());
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error),
-      code = message.split(":")[0]!;
+      code = message.split(":").at(0) ?? "UNKNOWN";
     return {
       isError: true,
       content: [{ type: "text" as const, text: `${code}: ${message}` }],

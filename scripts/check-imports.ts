@@ -11,7 +11,8 @@ for await (const file of new Bun.Glob("{apps,packages}/**/*.ts").scan({
 })) {
   const source = await Bun.file(import.meta.dir + "/../" + file).text();
   for (const match of source.matchAll(/(?:from\s+|import\s+)["']([^"']+)["']/g)) {
-    const specifier = match[1]!;
+    const specifier = match.at(1);
+    if (!specifier) continue;
     for (const [marker, roots] of Object.entries(allowed))
       if (specifier.includes(marker) && !roots.some((root) => file.startsWith(root)))
         failures.push(`${file}: ${specifier}`);

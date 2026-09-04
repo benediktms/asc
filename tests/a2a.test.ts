@@ -90,7 +90,7 @@ describe("A2A JSON-RPC", () => {
     expect(
       store.db
         .query<{ n: number }, [string]>("SELECT count(*) n FROM delivery_intents WHERE task_id=?")
-        .get(taskId)!.n,
+        .get(taskId)?.n,
     ).toBe(1);
     const limited = store.createToken();
     store.db

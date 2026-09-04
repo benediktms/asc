@@ -136,8 +136,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         useStateDbOnly: true,
       });
     let sessions = page.data.map((thread) => this.snapshot(thread));
-    if (query.availability?.length)
-      sessions = sessions.filter((item) => query.availability!.includes(item.availability));
+    const availability = query.availability;
+    if (availability?.length)
+      sessions = sessions.filter((item) => availability.includes(item.availability));
     return { sessions, nextCursor: page.nextCursor ?? undefined };
   }
   async inspectSession(session: RuntimeSessionRef): Promise<RuntimeSessionSnapshot> {
@@ -160,7 +161,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   async *observe(signal: AbortSignal): AsyncIterable<RuntimeEvent> {
     while (!this.stopped && !signal.aborted) {
       if (this.events.length) {
-        yield this.events.shift()!;
+        const event = this.events.shift();
+        if (event) yield event;
         continue;
       }
       await new Promise<void>((resolve) => {
@@ -197,7 +199,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
             ? "busy"
             : "policy",
       };
-    const fence = await this.context!.assertBindingFence(
+    const fence = await this.requireContext().assertBindingFence(
       request.target.bindingId,
       request.target.bindingEpoch,
     );
@@ -266,7 +268,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   async cancel(request: RuntimeCancelRequest): Promise<RuntimeCancelResult> {
     if (!this.executions.has(request.execution.opaqueId))
       return { outcome: "rejected", reason: "not-owned", retryable: false };
-    const fence = await this.context!.assertBindingFence(
+    const fence = await this.requireContext().assertBindingFence(
       request.execution.bindingId,
       request.execution.bindingEpoch,
     );
@@ -286,7 +288,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   }
   private snapshot(thread: CodexThread): RuntimeSessionSnapshot {
     return {
-      session: { installationId: this.context!.installationId, opaqueId: thread.id },
+      session: { installationId: this.requireContext().installationId, opaqueId: thread.id },
       availability: status(thread),
       observedAt: new Date().toISOString(),
       revision: String(thread.updatedAt),
@@ -317,6 +319,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (!this.client || this.stopped) throw new Error("adapter not started");
     return this.client;
   }
+  private requireContext() {
+    if (!this.context) throw new Error("adapter not started");
+    return this.context;
+  }
   private emit(event: RuntimeEvent) {
     this.events.push(event);
     this.wake();
@@ -326,7 +332,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   }
   private handleNotification(method: string, params: unknown) {
     if (method === "thread/status/changed" && isThreadStatusChanged(params)) {
-      const session = { installationId: this.context!.installationId, opaqueId: params.threadId };
+      const session = {
+        installationId: this.requireContext().installationId,
+        opaqueId: params.threadId,
+      };
       this.emit({
         type: "session.observed",
         session,

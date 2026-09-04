@@ -26,6 +26,11 @@ function fixture(limits: Partial<Store["limits"]> = {}) {
 function requestMessage(messageId: string) {
   return Message.fromJSON({ messageId, role: Role.ROLE_USER, parts: [{ text: "work" }] });
 }
+function authenticated(store: Store) {
+  const principal = store.authenticate(readFileSync(store.config.token, "utf8"));
+  if (!principal) throw new Error("missing test principal");
+  return principal;
+}
 
 describe("durable acceptance", () => {
   test("signs opaque cursors and rejects tampering", () => {
@@ -38,7 +43,7 @@ describe("durable acceptance", () => {
   test("paginates tasks by stable key when newer work arrives", async () => {
     const store = fixture(),
       agent = store.createAgent("paged-worker"),
-      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      principal = authenticated(store);
     const ids: string[] = [];
     for (const messageId of ["page-1", "page-2", "page-3"]) {
       ids.push(
@@ -74,7 +79,7 @@ describe("durable acceptance", () => {
   test("commits one task and one delivery for an idempotent message", () => {
     const store = fixture(),
       agent = store.createAgent("backend"),
-      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      principal = authenticated(store);
     const message = Message.fromJSON({
       messageId: "request-1",
       role: Role.ROLE_USER,
@@ -90,7 +95,7 @@ describe("durable acceptance", () => {
   test("rejects target overload without partial acceptance", () => {
     const store = fixture({ maxQueuedDeliveryIntents: 1 }),
       agent = store.createAgent("overloaded-worker"),
-      principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      principal = authenticated(store);
     store.accept(agent.id, principal.id, requestMessage("overload-1"), {});
     expect(() => store.accept(agent.id, principal.id, requestMessage("overload-2"), {})).toThrow(
       "ACS_OVERLOADED",
@@ -113,7 +118,7 @@ describe("durable acceptance", () => {
     for (const failureTable of tables) {
       const store = fixture(),
         agent = store.createAgent(`rollback-${failureTable.replaceAll("_", "-")}`),
-        principal = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+        principal = authenticated(store);
       store.db.exec(
         `CREATE TEMP TRIGGER fail_acceptance BEFORE INSERT ON ${failureTable} BEGIN SELECT RAISE(ABORT, 'injected failure'); END`,
       );
@@ -138,7 +143,7 @@ describe("durable acceptance", () => {
     const store = fixture(),
       config = store.config,
       agent = store.createAgent("restart-worker"),
-      principal = store.authenticate(readFileSync(config.token, "utf8"))!,
+      principal = authenticated(store),
       accepted = store.accept(
         agent.id,
         principal.id,
@@ -167,7 +172,7 @@ describe("durable acceptance", () => {
     const store = fixture(),
       target = store.createAgent("projection-worker"),
       binding = store.bind(target.id, "projection-thread"),
-      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!,
+      requester = authenticated(store),
       accepted = store.accept(
         target.id,
         requester.id,
@@ -262,7 +267,8 @@ describe("durable acceptance", () => {
       >(
         "SELECT kind,target_agent_id,pinned_binding_id,state FROM delivery_intents WHERE kind='task-event-notification'",
       )
-      .get()!;
+      .get();
+    if (!notification) throw new Error("missing task notification");
     expect(notification).toEqual({
       kind: "task-event-notification",
       target_agent_id: sender.id,
@@ -277,7 +283,7 @@ describe("durable acceptance", () => {
       stranger = store.createAgent("stranger"),
       targetBinding = store.bind(target.id, "worker-thread"),
       strangerBinding = store.bind(stranger.id, "stranger-thread"),
-      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+      requester = authenticated(store);
     const accepted = store.accept(
       target.id,
       requester.id,
@@ -303,7 +309,7 @@ describe("durable acceptance", () => {
     const store = fixture(),
       target = store.createAgent("rebound-worker"),
       first = store.bind(target.id, "old-thread"),
-      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!,
+      requester = authenticated(store),
       accepted = store.accept(
         target.id,
         requester.id,

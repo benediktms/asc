@@ -71,8 +71,8 @@ export function id<Prefix extends IdPrefix>(
   const timestamp = BigInt(now);
   for (let index = 0; index < 6; index++)
     bytes[index] = Number((timestamp >> BigInt((5 - index) * 8)) & 255n);
-  bytes[6] = 0x70 | (bytes[6]! & 0x0f);
-  bytes[8] = 0x80 | (bytes[8]! & 0x3f);
+  bytes[6] = 0x70 | ((bytes.at(6) ?? 0) & 0x0f);
+  bytes[8] = 0x80 | ((bytes.at(8) ?? 0) & 0x3f);
   const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
   return `${prefix}_${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
