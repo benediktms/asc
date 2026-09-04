@@ -169,13 +169,36 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   }
   async listSessions(query: RuntimeSessionQuery): Promise<RuntimeSessionPage> {
     const client = this.requireClient(),
+      loaded = await client.loadedThreads(),
       page = await client.listThreads({
         cursor: query.cursor,
         limit: Math.min(query.limit ?? 50, 100),
         searchTerm: query.text,
         useStateDbOnly: true,
-      });
-    let sessions = page.data.map((thread) => this.snapshot(thread));
+      }),
+      stored = new Set(page.data.map((thread) => thread.id)),
+      loadedSnapshots = await Promise.all(
+        loaded.data
+          .filter((threadId) => !stored.has(threadId))
+          .map((threadId) =>
+            this.inspectSession({
+              installationId: this.requireContext().installationId,
+              opaqueId: threadId,
+            }),
+          ),
+      );
+    let sessions = [
+      ...loadedSnapshots.filter((session) => session.availability !== "offline"),
+      ...page.data.map((thread) => this.snapshot(thread)),
+    ];
+    if (query.text) {
+      const search = query.text.toLocaleLowerCase();
+      sessions = sessions.filter((session) =>
+        Object.values(session.attributes).some((value) =>
+          typeof value === "string" ? value.toLocaleLowerCase().includes(search) : false,
+        ),
+      );
+    }
     const availability = query.availability;
     if (availability?.length)
       sessions = sessions.filter((item) => availability.includes(item.availability));
