@@ -184,9 +184,11 @@ export function parseListen(value: string) {
 
 type ObjectValue = Record<string, unknown>;
 function object(value: unknown, name: string): ObjectValue {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error(`VALIDATION_FAILED: ${name} must be a table`);
-  return value as ObjectValue;
+  if (!isObject(value)) throw new Error(`VALIDATION_FAILED: ${name} must be a table`);
+  return value;
+}
+function isObject(value: unknown): value is ObjectValue {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function section(parent: ObjectValue, name: string, allowed: string[]) {
   const value = parent[name] === undefined ? {} : object(parent[name], name);

@@ -28,7 +28,20 @@ type PartiesRow = {
   target_agent_id: string;
   target_slug: string;
 };
-type ExecutionRow = { id: string; task_id: string; binding_id: string };
+type ExecutionRow = {
+  id: RuntimeExecutionId;
+  task_id: `tsk_${string}`;
+  binding_id: BindingId;
+};
+type ReconciliationRow = {
+  id: DeliveryId;
+  payload_hash: string;
+  pinned_binding_id: BindingId;
+  pinned_binding_epoch: number;
+  installation_id: RuntimeInstallationId;
+  session_opaque_id: string;
+  reconciliation_token: string;
+};
 
 export class DeliveryScheduler {
   private timer?: Timer;
@@ -55,10 +68,12 @@ export class DeliveryScheduler {
 
   async start() {
     const installation = this.store.db
-      .query("SELECT id FROM runtime_installations WHERE adapter_id='codex.app-server' LIMIT 1")
-      .get() as { id: string };
+      .query<{ id: RuntimeInstallationId }, []>(
+        "SELECT id FROM runtime_installations WHERE adapter_id='codex.app-server' LIMIT 1",
+      )
+      .get()!;
     this.context = {
-      installationId: installation.id as RuntimeInstallationId,
+      installationId: installation.id,
       instanceId: this.instanceId,
       clock: { now: () => new Date().toISOString() },
       logger: { debug() {}, info() {}, warn() {}, error() {} },
@@ -90,6 +105,7 @@ export class DeliveryScheduler {
         if (Date.now() >= this.nextConnectAt) await this.connect();
         return;
       }
+      if (await this.reconcileOne()) return;
       if (await this.cancelOne()) return;
       while (this.inFlight.size < this.options.concurrency) {
         const intent = this.lease();
@@ -119,6 +135,70 @@ export class DeliveryScheduler {
       this.scheduling = false;
     }
   }
+  private async reconcileOne() {
+    const now = Date.now(),
+      row = this.store.db
+        .query<ReconciliationRow, [number]>(
+          "SELECT i.id,i.payload_hash,i.pinned_binding_id,i.pinned_binding_epoch,b.installation_id,b.session_opaque_id,a.reconciliation_token FROM delivery_intents i JOIN runtime_bindings b ON b.id=i.pinned_binding_id JOIN delivery_attempts a ON a.intent_id=i.id AND a.attempt_number=i.attempt_count WHERE i.state='acceptance-unknown' AND i.not_before_ms<=? AND a.reconciliation_token IS NOT NULL LIMIT 1",
+        )
+        .get(now);
+    if (!row) return false;
+    const result = await this.adapter.reconcile({
+      deliveryId: row.id,
+      target: {
+        session: {
+          installationId: row.installation_id,
+          opaqueId: row.session_opaque_id,
+        },
+        bindingId: row.pinned_binding_id,
+        bindingEpoch: row.pinned_binding_epoch,
+      },
+      payloadHash: row.payload_hash,
+      reconciliationToken: row.reconciliation_token,
+    });
+    if (result.outcome === "accepted") {
+      this.store.db.transaction(() => {
+        this.store.db
+          .query(
+            "UPDATE delivery_intents SET state='accepted',state_reason=NULL,runtime_execution_id=?,updated_at_ms=? WHERE id=? AND state='acceptance-unknown'",
+          )
+          .run(result.execution?.opaqueId ?? null, now, row.id);
+        if (result.execution)
+          this.store.db
+            .query(
+              "INSERT OR IGNORE INTO runtime_executions(id,intent_id,binding_id,binding_epoch,runtime_execution_opaque_id,state,accepted_at_ms,updated_at_ms) VALUES(?,?,?,?,?,'accepted',?,?)",
+            )
+            .run(
+              id("exe"),
+              row.id,
+              row.pinned_binding_id,
+              row.pinned_binding_epoch,
+              result.execution.opaqueId,
+              now,
+              now,
+            );
+      })();
+    } else if (result.outcome === "not-accepted") {
+      this.store.db
+        .query(
+          "UPDATE delivery_intents SET state=?,state_reason=?,not_before_ms=?,updated_at_ms=? WHERE id=? AND state='acceptance-unknown'",
+        )
+        .run(
+          result.safeToRetry ? "pending" : "failed-terminal",
+          result.safeToRetry ? null : "reconciliation-not-accepted",
+          now,
+          now,
+          row.id,
+        );
+    } else {
+      this.store.db
+        .query(
+          "UPDATE delivery_intents SET state_reason=?,not_before_ms=?,updated_at_ms=? WHERE id=? AND state='acceptance-unknown'",
+        )
+        .run(result.reason, now + 30_000, now, row.id);
+    }
+    return true;
+  }
   private async connect() {
     try {
       await this.adapter.start(this.context!);
@@ -130,34 +210,33 @@ export class DeliveryScheduler {
   }
   private async cancelOne() {
     const row = this.store.db
-      .query(
+      .query<
+        {
+          id: RuntimeExecutionId;
+          runtime_execution_opaque_id: string;
+          binding_id: BindingId;
+          binding_epoch: number;
+          installation_id: RuntimeInstallationId;
+          session_opaque_id: string;
+          delivery_policy_json: string;
+          task_id: `tsk_${string}`;
+          requester_principal_id: `prn_${string}`;
+        },
+        []
+      >(
         "SELECT e.id,e.runtime_execution_opaque_id,e.binding_id,e.binding_epoch,b.installation_id,b.session_opaque_id,b.delivery_policy_json,i.task_id,t.requester_principal_id FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE t.cancellation_requested=1 AND t.state NOT IN ('completed','failed','canceled','rejected') AND e.state IN ('accepted','started','awaiting-local-input') LIMIT 1",
       )
-      .get() as {
-      id: string;
-      runtime_execution_opaque_id: string;
-      binding_id: string;
-      binding_epoch: number;
-      installation_id: string;
-      session_opaque_id: string;
-      delivery_policy_json: string;
-      task_id: string;
-      requester_principal_id: string;
-    } | null;
-    if (
-      !row ||
-      !(JSON.parse(row.delivery_policy_json) as { interruptOnCancel?: boolean }).interruptOnCancel
-    )
-      return false;
+      .get();
+    if (!row || !interruptOnCancel(row.delivery_policy_json)) return false;
     const result = await this.adapter.cancel({
       execution: {
-        normalizedId: row.id as RuntimeExecutionId,
+        normalizedId: row.id,
         opaqueId: row.runtime_execution_opaque_id,
         session: {
-          installationId: row.installation_id as RuntimeInstallationId,
+          installationId: row.installation_id,
           opaqueId: row.session_opaque_id,
         },
-        bindingId: row.binding_id as BindingId,
+        bindingId: row.binding_id,
         bindingEpoch: row.binding_epoch,
       },
       reason: "A2A cancellation requested",
@@ -185,10 +264,10 @@ export class DeliveryScheduler {
     return this.store.db.transaction(() => {
       const now = Date.now(),
         rows = this.store.db
-          .query(
+          .query<DeliveryIntentRow, [number, number, number]>(
             "SELECT * FROM delivery_intents WHERE state IN ('pending','deferred') AND not_before_ms<=? AND (deadline_ms IS NULL OR deadline_ms>?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY priority DESC,not_before_ms,created_at_ms LIMIT 100",
           )
-          .all(now, now, now) as DeliveryIntentRow[],
+          .all(now, now, now),
         row = rows.find((item) => !this.lanes.has(item.target_agent_id));
       if (!row) return null;
       this.store.db
@@ -201,15 +280,17 @@ export class DeliveryScheduler {
   }
   private async deliver(intent: DeliveryIntentRow) {
     const now = Date.now(),
-      binding = (
-        intent.pinned_binding_id
-          ? this.store.db
-              .query("SELECT * FROM runtime_bindings WHERE id=? AND epoch=? AND status='active'")
-              .get(intent.pinned_binding_id, intent.pinned_binding_epoch)
-          : this.store.db
-              .query("SELECT * FROM runtime_bindings WHERE agent_id=? AND status='active'")
-              .get(intent.target_agent_id)
-      ) as BindingRow | null;
+      binding = intent.pinned_binding_id
+        ? this.store.db
+            .query<BindingRow, [BindingId, number | null]>(
+              "SELECT * FROM runtime_bindings WHERE id=? AND epoch=? AND status='active'",
+            )
+            .get(intent.pinned_binding_id, intent.pinned_binding_epoch)
+        : this.store.db
+            .query<BindingRow, [`agt_${string}`]>(
+              "SELECT * FROM runtime_bindings WHERE agent_id=? AND status='active'",
+            )
+            .get(intent.target_agent_id);
     if (!binding) return this.defer(intent.id, "offline", 30_000);
     const policy = JSON.parse(binding.delivery_policy_json);
     if (intent.mode === "wake_when_idle" && policy.wakeStrategy !== "non-atomic-idle-check")
@@ -233,17 +314,17 @@ export class DeliveryScheduler {
         .run(attempt, intent.id, number, "codex.app-server", binding.id, binding.epoch, now, now);
     })();
     const target = this.store.agent(intent.target_agent_id),
-      payload = JSON.parse(intent.payload_json) as DeliveryPayload,
+      payload: DeliveryPayload = JSON.parse(intent.payload_json),
       parties = this.store.db
-        .query(
+        .query<PartiesRow, [`tsk_${string}`]>(
           "SELECT p.display_name,a.id requester_agent_id,a.slug requester_slug,target.id target_agent_id,target.slug target_slug FROM a2a_tasks t JOIN principals p ON p.id=t.requester_principal_id LEFT JOIN agents a ON a.id=t.requester_agent_id JOIN agents target ON target.id=t.target_agent_id WHERE t.id=?",
         )
-        .get(intent.task_id) as PartiesRow;
+        .get(intent.task_id)!;
     if (!target) throw new Error("target agent missing");
     const notification = intent.kind === "task-event-notification";
     const envelope: RuntimeDeliveryEnvelopeV1 = {
       schema: "urn:agent-communications:runtime-envelope:v1",
-      deliveryId: intent.id as DeliveryId,
+      deliveryId: intent.id,
       kind: notification ? "a2a-task-event" : "a2a-message",
       from: notification
         ? { agentId: parties.target_agent_id, name: parties.target_slug }
@@ -279,13 +360,13 @@ export class DeliveryScheduler {
       provenance: { authority: "peer-agent", trustedForPermissions: false },
     };
     const result = await this.adapter.deliver({
-      deliveryId: intent.id as DeliveryId,
+      deliveryId: intent.id,
       target: {
         session: {
-          installationId: binding.installation_id as RuntimeInstallationId,
+          installationId: binding.installation_id,
           opaqueId: binding.session_opaque_id,
         },
-        bindingId: binding.id as BindingId,
+        bindingId: binding.id,
         bindingEpoch: binding.epoch,
       },
       mode: intent.mode,
@@ -328,8 +409,10 @@ export class DeliveryScheduler {
       })();
       if (result.execution) {
         const principal = this.store.db
-          .query("SELECT id FROM principals WHERE binding_id=?")
-          .get(binding.id) as { id: string };
+          .query<{ id: `prn_${string}` }, [BindingId]>(
+            "SELECT id FROM principals WHERE binding_id=?",
+          )
+          .get(binding.id)!;
         this.store.setTaskState(intent.task_id, principal.id, TaskState.Working);
       }
     } else if (result.outcome === "deferred") {
@@ -409,18 +492,18 @@ export class DeliveryScheduler {
   private project(event: RuntimeEvent) {
     if (event.type !== "execution.completed") return;
     const execution = this.store.db
-      .query(
+      .query<ExecutionRow, [string]>(
         "SELECT e.*,i.task_id,b.id binding_id FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE e.runtime_execution_opaque_id=?",
       )
-      .get(event.execution.opaqueId) as ExecutionRow | null;
+      .get(event.execution.opaqueId);
     if (!execution) return;
     const taskState = this.store.db
-      .query("SELECT state FROM a2a_tasks WHERE id=?")
-      .get(execution.task_id) as { state: string } | null;
+      .query<{ state: TaskState }, [`tsk_${string}`]>("SELECT state FROM a2a_tasks WHERE id=?")
+      .get(execution.task_id);
     if (
       !taskState ||
       [TaskState.Completed, TaskState.Failed, TaskState.Canceled, TaskState.Rejected].includes(
-        taskState.state as TaskState,
+        taskState.state,
       )
     )
       return;
@@ -437,8 +520,8 @@ export class DeliveryScheduler {
       )
       .run(state, JSON.stringify(event.finalParts), now, now, execution.id);
     const principal = this.store.db
-        .query("SELECT id FROM principals WHERE binding_id=?")
-        .get(execution.binding_id) as { id: string },
+        .query<{ id: `prn_${string}` }, [BindingId]>("SELECT id FROM principals WHERE binding_id=?")
+        .get(execution.binding_id)!,
       summary = event.finalParts
         .filter((part): part is Extract<NeutralPart, { kind: "text" }> => part.kind === "text")
         .map((part) => part.text)
@@ -450,6 +533,16 @@ export class DeliveryScheduler {
       summary || event.outcome,
     );
   }
+}
+
+function interruptOnCancel(json: string) {
+  const value: unknown = JSON.parse(json);
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "interruptOnCancel" in value &&
+    value.interruptOnCancel === true
+  );
 }
 
 export function retryDelay(attempt: number, random = Math.random, base = 250, cap = 30_000) {

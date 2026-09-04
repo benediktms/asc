@@ -2,9 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RuntimeAdapter } from "../contracts/runtime-adapter";
 import { controlHandler } from "../packages/protocol-control/src/index";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
+import { FakeRuntimeAdapter } from "./fake-runtime-adapter";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -23,19 +23,17 @@ describe("control protocol", () => {
       secret: join(root, "secret.key"),
     };
     const store = new Store(paths),
-      inspected: string[] = [];
-    const adapter = {
-      descriptor: { capabilities: {} },
-      async inspectSession(session: { opaqueId: string }) {
-        inspected.push(session.opaqueId);
-        return {
-          session,
-          availability: "idle",
-          observedAt: new Date().toISOString(),
-          attributes: {},
-        };
-      },
-    } as unknown as RuntimeAdapter;
+      inspected: string[] = [],
+      adapter = new FakeRuntimeAdapter();
+    adapter.inspectSession = async (session) => {
+      inspected.push(session.opaqueId);
+      return {
+        session,
+        availability: "idle",
+        observedAt: new Date().toISOString(),
+        attributes: {},
+      };
+    };
     const handler = controlHandler(store, new Date().toISOString(), () => {}, adapter),
       token = readFileSync(paths.token, "utf8");
     const call = async (method: string, params: unknown, version = "1", bearer = token) =>
@@ -57,13 +55,11 @@ describe("control protocol", () => {
     expect(inspected).toEqual(["thread-1"]);
     expect((await call("agents.list", {}, "2")).status).toBe(426);
     expect(
-      (
-        store.db
-          .query(
-            "SELECT count(*) n FROM audit_events WHERE action IN ('agent.create','binding.bind')",
-          )
-          .get() as { n: number }
-      ).n,
+      store.db
+        .query<{ n: number }, []>(
+          "SELECT count(*) n FROM audit_events WHERE action IN ('agent.create','binding.bind')",
+        )
+        .get()!.n,
     ).toBe(2);
     const bridgeToken = readFileSync(paths.bridgeToken, "utf8"),
       denied = (await call("agents.create", { slug: "forbidden" }, "1", bridgeToken)).json();

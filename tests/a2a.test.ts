@@ -44,7 +44,7 @@ describe("A2A JSON-RPC", () => {
         }),
         7432,
       );
-      return (await response.json()) as {
+      const result: {
         result?: {
           id?: string;
           status?: { state: string };
@@ -54,7 +54,8 @@ describe("A2A JSON-RPC", () => {
           message: string;
           data?: { code?: string; retryable?: boolean; correlationId?: string };
         };
-      };
+      } = await response.json();
+      return result;
     };
     const sent = await call("SendMessage", {
       message: { messageId: "a2a-1", role: "ROLE_USER", parts: [{ text: "work" }] },
@@ -73,11 +74,9 @@ describe("A2A JSON-RPC", () => {
     const canceled = (await call("CancelTask", { id: taskId })).result;
     expect(canceled?.task?.status?.state ?? canceled?.status?.state).toBe("TASK_STATE_CANCELED");
     expect(
-      (
-        store.db.query("SELECT count(*) n FROM delivery_intents WHERE task_id=?").get(taskId) as {
-          n: number;
-        }
-      ).n,
+      store.db
+        .query<{ n: number }, [string]>("SELECT count(*) n FROM delivery_intents WHERE task_id=?")
+        .get(taskId)!.n,
     ).toBe(1);
     const limited = store.createToken();
     store.db

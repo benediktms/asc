@@ -4,7 +4,12 @@ import { agentSlug, canonical, id, TaskState, transition } from "../../domain/sr
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
-import type { JsonValue } from "../../../contracts/runtime-adapter";
+import type {
+  BindingId,
+  DeliveryId,
+  JsonValue,
+  RuntimeInstallationId,
+} from "../../../contracts/runtime-adapter";
 import { loadConfig } from "../../config/src/index";
 export interface StoredPart {
   content?:
@@ -55,7 +60,7 @@ const taskStates: Record<TaskState, number> = {
 };
 
 export interface AgentRow {
-  id: string;
+  id: `agt_${string}`;
   slug: string;
   display_name: string;
   description: string;
@@ -67,9 +72,9 @@ export interface AgentRow {
   deleted_at_ms: number | null;
 }
 export interface BindingRow {
-  id: string;
-  agent_id: string;
-  installation_id: string;
+  id: BindingId;
+  agent_id: `agt_${string}`;
+  installation_id: RuntimeInstallationId;
   session_opaque_id: string;
   epoch: number;
   status: "pending" | "active" | "stale" | "revoked";
@@ -81,25 +86,25 @@ export interface BindingRow {
   last_observed_availability: string | null;
 }
 export interface DeliveryIntentRow {
-  id: string;
+  id: DeliveryId;
   kind: "a2a-message" | "task-event-notification";
-  task_id: string;
-  target_agent_id: string;
+  task_id: `tsk_${string}`;
+  target_agent_id: `agt_${string}`;
   mode: "wake_when_idle" | "append_context" | "join_active";
   state: string;
   attempt_count: number;
   payload_json: string;
   payload_hash: string;
   deadline_ms: number | null;
-  pinned_binding_id: string | null;
+  pinned_binding_id: BindingId | null;
   pinned_binding_epoch: number | null;
 }
 interface TaskRow {
-  id: string;
-  context_id: string;
-  target_agent_id: string;
-  requester_principal_id: string;
-  requester_agent_id: string | null;
+  id: `tsk_${string}`;
+  context_id: `ctx_${string}`;
+  target_agent_id: `agt_${string}`;
+  requester_principal_id: `prn_${string}`;
+  requester_agent_id: `agt_${string}` | null;
   state: TaskState;
   next_event_sequence: number;
   a2a_snapshot_json: string;
@@ -220,7 +225,7 @@ export class Store {
       !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
     )
       throw new Error("VALIDATION_FAILED: invalid cursor");
-    return JSON.parse(Buffer.from(payload, "base64url").toString()) as T;
+    return parseJson<T>(Buffer.from(payload, "base64url").toString());
   }
   cursorOffset(cursor?: string) {
     if (!cursor) return 0;
@@ -254,8 +259,10 @@ export class Store {
   }
   private bootstrap() {
     const principal = this.db
-      .query("SELECT id FROM principals WHERE kind='local-user' LIMIT 1")
-      .get() as { id: string } | null;
+      .query<{ id: `prn_${string}` }, []>(
+        "SELECT id FROM principals WHERE kind='local-user' LIMIT 1",
+      )
+      .get();
     if (principal) return;
     const now = Date.now(),
       principalId = id("prn"),
@@ -316,25 +323,28 @@ export class Store {
   }
   authenticate(token: string) {
     const rows = this.db
-      .query(
+      .query<
+        {
+          id: `prn_${string}`;
+          kind: string;
+          agent_id: `agt_${string}` | null;
+          binding_id: BindingId | null;
+          token_id: `tok_${string}`;
+          token_hash: Uint8Array;
+          scopes_json: string;
+        },
+        [number]
+      >(
         "SELECT p.id,p.kind,p.agent_id,p.binding_id,t.id token_id,t.token_hash,t.scopes_json FROM auth_tokens t JOIN principals p ON p.id=t.principal_id WHERE t.revoked_at_ms IS NULL AND p.disabled_at_ms IS NULL AND (t.expires_at_ms IS NULL OR t.expires_at_ms>?)",
       )
-      .all(Date.now()) as Array<{
-      id: string;
-      kind: string;
-      agent_id: string | null;
-      binding_id: string | null;
-      token_id: string;
-      token_hash: Uint8Array;
-      scopes_json: string;
-    }>;
+      .all(Date.now());
     const hash = this.hashToken(token);
     const row = rows.find((candidate) => timingSafeEqual(hash, Buffer.from(candidate.token_hash)));
     if (!row) return null;
     this.db
       .query("UPDATE auth_tokens SET last_used_at_ms=? WHERE id=?")
       .run(Date.now(), row.token_id);
-    return { ...row, scopes: JSON.parse(row.scopes_json) as string[] };
+    return { ...row, scopes: stringArray(row.scopes_json) };
   }
   createToken(kind: "external-a2a-client" | "service" = "external-a2a-client") {
     const now = Date.now(),
@@ -411,28 +421,32 @@ export class Store {
   }
   agent(value: string) {
     return this.db
-      .query("SELECT * FROM agents WHERE deleted_at_ms IS NULL AND (id=? OR slug=?)")
-      .get(value, value.replace(/^@/, "")) as AgentRow | null;
+      .query<AgentRow, [string, string]>(
+        "SELECT * FROM agents WHERE deleted_at_ms IS NULL AND (id=? OR slug=?)",
+      )
+      .get(value, value.replace(/^@/, ""));
   }
   agents() {
     return this.db
-      .query("SELECT * FROM agents WHERE deleted_at_ms IS NULL ORDER BY slug")
-      .all() as AgentRow[];
+      .query<AgentRow, []>("SELECT * FROM agents WHERE deleted_at_ms IS NULL ORDER BY slug")
+      .all();
   }
   bind(agentValue: string, sessionId: string, allowNonAtomicWake = false) {
     const agent = this.agent(agentValue);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
     const installation = this.db
-      .query("SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1")
-      .get() as { id: string };
+      .query<{ id: RuntimeInstallationId }, []>(
+        "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+      )
+      .get()!;
     const now = Date.now(),
       bindingId = id("bnd"),
       epoch =
-        ((
-          this.db
-            .query("SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?")
-            .get(agent.id) as { value: number | null }
-        ).value ?? 0) + 1;
+        (this.db
+          .query<{ value: number | null }, [`agt_${string}`]>(
+            "SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?",
+          )
+          .get(agent.id)!.value ?? 0) + 1;
     return this.db.transaction(() => {
       this.db
         .query(
@@ -476,8 +490,8 @@ export class Store {
   }
   binding(bindingId: string) {
     return this.db
-      .query("SELECT * FROM runtime_bindings WHERE id=?")
-      .get(bindingId) as BindingRow | null;
+      .query<BindingRow, [string]>("SELECT * FROM runtime_bindings WHERE id=?")
+      .get(bindingId);
   }
   revokeBinding(bindingId: string, reason = "revoked") {
     const binding = this.binding(bindingId);
@@ -513,10 +527,10 @@ export class Store {
   }
   claim(code: string, sessionId: string) {
     const row = this.db
-      .query(
+      .query<{ id: `clm_${string}`; agent_id: `agt_${string}` }, [Buffer, number]>(
         "SELECT * FROM binding_claims WHERE code_hash=? AND consumed_at_ms IS NULL AND expires_at_ms>?",
       )
-      .get(this.hashToken(code), Date.now()) as { id: string; agent_id: string } | null;
+      .get(this.hashToken(code), Date.now());
     if (!row) throw new Error("VALIDATION_FAILED: invalid or expired claim");
     return this.db.transaction(() => {
       const binding = this.bind(row.agent_id, sessionId);
@@ -532,17 +546,20 @@ export class Store {
     if (typeof threadId !== "string" || !threadId || threadId.length > 512)
       return { kind: "unattested", reason: "missing-session-id" } as const;
     const row = this.db
-      .query(
+      .query<
+        {
+          binding_id: BindingId;
+          epoch: number;
+          agent_id: `agt_${string}`;
+          principal_id: `prn_${string}`;
+          slug: string;
+          display_name: string;
+        },
+        [string]
+      >(
         "SELECT b.id binding_id,b.epoch,b.agent_id,p.id principal_id,a.slug,a.display_name FROM runtime_bindings b JOIN principals p ON p.binding_id=b.id JOIN agents a ON a.id=b.agent_id WHERE b.session_opaque_id=? AND b.status='active' AND p.disabled_at_ms IS NULL",
       )
-      .get(threadId) as {
-      binding_id: string;
-      epoch: number;
-      agent_id: string;
-      principal_id: string;
-      slug: string;
-      display_name: string;
-    } | null;
+      .get(threadId);
     return row
       ? ({
           kind: "attested",
@@ -576,62 +593,52 @@ export class Store {
     return token;
   }
   inbox(agentId: string) {
-    return (
-      this.db
-        .query(
-          "SELECT a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND state NOT IN ('completed','failed','canceled','rejected') ORDER BY updated_at_ms DESC LIMIT 100",
-        )
-        .all(agentId) as Array<{ a2a_snapshot_json: string }>
-    ).map((row) => JSON.parse(row.a2a_snapshot_json));
+    return this.db
+      .query<{ a2a_snapshot_json: string }, [string]>(
+        "SELECT a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND state NOT IN ('completed','failed','canceled','rejected') ORDER BY updated_at_ms DESC LIMIT 100",
+      )
+      .all(agentId)
+      .map((row) => JSON.parse(row.a2a_snapshot_json));
   }
   inboxTask(agentId: string, taskId: string) {
     const row = this.db
-      .query("SELECT a2a_snapshot_json FROM a2a_tasks WHERE id=? AND target_agent_id=?")
-      .get(taskId, agentId) as { a2a_snapshot_json: string } | null;
+      .query<{ a2a_snapshot_json: string }, [string, string]>(
+        "SELECT a2a_snapshot_json FROM a2a_tasks WHERE id=? AND target_agent_id=?",
+      )
+      .get(taskId, agentId);
     return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
   }
   task(idValue: string, principalId: string, targetAgentId?: string): StoredTask | undefined {
     const row = this.db
-      .query(
+      .query<TaskRow, [string, string, string | null, string | null, string]>(
         "SELECT t.* FROM a2a_tasks t LEFT JOIN principals p ON p.id=? WHERE t.id=? AND (? IS NULL OR t.target_agent_id=?) AND (t.requester_principal_id=? OR p.agent_id=t.target_agent_id)",
       )
-      .get(
-        principalId,
-        idValue,
-        targetAgentId ?? null,
-        targetAgentId ?? null,
-        principalId,
-      ) as TaskRow | null;
+      .get(principalId, idValue, targetAgentId ?? null, targetAgentId ?? null, principalId);
     return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
   }
   listTasks(agentId: string, principalId: string): StoredTask[] {
-    return (
-      this.db
-        .query(
-          "SELECT a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? ORDER BY updated_at_ms DESC LIMIT 100",
-        )
-        .all(agentId, principalId) as Array<{ a2a_snapshot_json: string }>
-    ).map((row) => JSON.parse(row.a2a_snapshot_json));
+    return this.db
+      .query<{ a2a_snapshot_json: string }, [string, string]>(
+        "SELECT a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND requester_principal_id=? ORDER BY updated_at_ms DESC LIMIT 100",
+      )
+      .all(agentId, principalId)
+      .map((row) => JSON.parse(row.a2a_snapshot_json));
   }
   eventSequence(taskId: string) {
     return Number(
-      (
-        this.db
-          .query("SELECT max(sequence) sequence FROM task_events WHERE task_id=?")
-          .get(taskId) as { sequence: number | null } | null
-      )?.sequence ?? 0,
+      this.db
+        .query<{ sequence: number | null }, [string]>(
+          "SELECT max(sequence) sequence FROM task_events WHERE task_id=?",
+        )
+        .get(taskId)?.sequence ?? 0,
     );
   }
   eventsAfter(taskId: string, sequence: number) {
     return this.db
-      .query(
+      .query<{ sequence: number; event_type: string; payload_json: string }, [string, number]>(
         "SELECT sequence,event_type,payload_json FROM task_events WHERE task_id=? AND sequence>? ORDER BY sequence",
       )
-      .all(taskId, sequence) as Array<{
-      sequence: number;
-      event_type: string;
-      payload_json: string;
-    }>;
+      .all(taskId, sequence);
   }
   accept(
     agentId: string,
@@ -653,8 +660,10 @@ export class Store {
     const scope = `${principalId}:${agentId}`,
       requestHash = this.payloadHash({ message, options });
     const existing = this.db
-      .query("SELECT request_hash,response_json FROM idempotency_records WHERE scope=? AND key=?")
-      .get(scope, message.messageId) as { request_hash: string; response_json: string } | null;
+      .query<{ request_hash: string; response_json: string }, [string, string]>(
+        "SELECT request_hash,response_json FROM idempotency_records WHERE scope=? AND key=?",
+      )
+      .get(scope, message.messageId);
     if (existing) {
       if (existing.request_hash !== requestHash) throw new Error("ACS_IDEMPOTENCY_CONFLICT");
       return { ...JSON.parse(existing.response_json), duplicate: true };
@@ -666,12 +675,12 @@ export class Store {
         messageRowId = id("msg"),
         deliveryId = id("int");
       const requester = this.db
-        .query("SELECT agent_id,binding_id FROM principals WHERE id=?")
-        .get(principalId) as { agent_id: string | null; binding_id: string | null };
+        .query<{ agent_id: `agt_${string}` | null; binding_id: BindingId | null }, [string]>(
+          "SELECT agent_id,binding_id FROM principals WHERE id=?",
+        )
+        .get(principalId)!;
       const continuation = message.taskId
-        ? (this.db
-            .query("SELECT * FROM a2a_tasks WHERE id=?")
-            .get(message.taskId) as TaskRow | null)
+        ? this.db.query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?").get(message.taskId)
         : null;
       if (
         continuation &&
@@ -768,7 +777,7 @@ export class Store {
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
       const mode = options.mode ?? this.limits.defaultMode,
-        priority = { low: 0, normal: 10, high: 20 }[options.priority as string] ?? 10;
+        priority = { low: 0, normal: 10, high: 20 }[options.priority ?? "normal"];
       const payload = {
         taskId,
         contextId,
@@ -837,16 +846,18 @@ export class Store {
     details: Record<string, unknown> = {},
   ): StoredTask {
     return this.db.transaction(() => {
-      const row = this.db.query("SELECT * FROM a2a_tasks WHERE id=?").get(taskId) as TaskRow | null;
+      const row = this.db
+        .query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?")
+        .get(taskId);
       if (!row) throw new Error("TASK_NOT_FOUND");
-      const binding = this.db
-        .query("SELECT 1 FROM principals WHERE id=? AND agent_id=?")
-        .get(principalId, row.target_agent_id);
-      if (row.requester_principal_id !== principalId && !binding)
-        throw new Error("TASK_NOT_ASSIGNED");
+      if (row.requester_principal_id === principalId) {
+        if (next !== TaskState.Canceled) throw new Error("TASK_NOT_ASSIGNED");
+      } else {
+        this.assignedTask(taskId, principalId);
+      }
       const state = transition(row.state, next),
         now = Date.now(),
-        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+        task = parseJson<StoredTask>(row.a2a_snapshot_json);
       task.status = {
         state: taskStates[state],
         message: summary
@@ -910,15 +921,18 @@ export class Store {
         .query("UPDATE a2a_tasks SET next_event_sequence=next_event_sequence+1 WHERE id=?")
         .run(taskId);
       const subscriptions = this.db
-        .query("SELECT * FROM task_subscriptions WHERE task_id=? AND status='active'")
-        .all(taskId) as Array<{
-        subscriber_agent_id: string;
-        origin_binding_id: string;
-        origin_binding_epoch: number;
-        event_filter_json: string;
-      }>;
+        .query<
+          {
+            subscriber_agent_id: `agt_${string}`;
+            origin_binding_id: BindingId;
+            origin_binding_epoch: number;
+            event_filter_json: string;
+          },
+          [string]
+        >("SELECT * FROM task_subscriptions WHERE task_id=? AND status='active'")
+        .all(taskId);
       for (const subscription of subscriptions) {
-        const filters = JSON.parse(subscription.event_filter_json) as string[],
+        const filters = stringArray(subscription.event_filter_json),
           isTerminal = ["completed", "failed", "canceled", "rejected"].includes(state);
         if (!filters.includes(state) && !(isTerminal && filters.includes("terminal"))) continue;
         const payload = {
@@ -959,8 +973,10 @@ export class Store {
   requestCancellation(taskId: string, principalId: string, reason = "") {
     return this.db.transaction(() => {
       const row = this.db
-        .query("SELECT * FROM a2a_tasks WHERE id=? AND requester_principal_id=?")
-        .get(taskId, principalId) as TaskRow | null;
+        .query<TaskRow, [string, string]>(
+          "SELECT * FROM a2a_tasks WHERE id=? AND requester_principal_id=?",
+        )
+        .get(taskId, principalId);
       if (!row) throw new Error("ACS_TASK_NOT_VISIBLE");
       if (
         [TaskState.Completed, TaskState.Failed, TaskState.Canceled, TaskState.Rejected].includes(
@@ -975,7 +991,7 @@ export class Store {
         .get(taskId);
       if (!execution) return this.setTaskState(taskId, principalId, TaskState.Canceled, reason);
       const now = Date.now(),
-        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+        task = parseJson<StoredTask>(row.a2a_snapshot_json);
       task.metadata = {
         ...task.metadata,
         "urn:agent-communications:cancellation:v1": { requested: true, reason },
@@ -1025,7 +1041,7 @@ export class Store {
           extensions: [],
           referenceTaskIds: [],
         },
-        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+        task = parseJson<StoredTask>(row.a2a_snapshot_json);
       task.history.push(message);
       this.db
         .query(
@@ -1073,7 +1089,7 @@ export class Store {
       if (["completed", "failed", "canceled", "rejected"].includes(row.state))
         throw new Error("TASK_STATE_CONFLICT");
       const now = Date.now(),
-        task = JSON.parse(row.a2a_snapshot_json) as StoredTask;
+        task = parseJson<StoredTask>(row.a2a_snapshot_json);
       task.artifacts.push(...artifacts);
       this.db
         .query(
@@ -1098,8 +1114,8 @@ export class Store {
   }
   retryDelivery(deliveryId: string) {
     const delivery = this.db
-      .query("SELECT * FROM delivery_intents WHERE id=?")
-      .get(deliveryId) as DeliveryIntentRow | null;
+      .query<DeliveryIntentRow, [string]>("SELECT * FROM delivery_intents WHERE id=?")
+      .get(deliveryId);
     if (!delivery) throw new Error("DELIVERY_NOT_FOUND");
     if (!["deferred", "failed-terminal"].includes(delivery.state))
       throw new Error("TASK_STATE_CONFLICT");
@@ -1112,8 +1128,8 @@ export class Store {
   }
   cancelDelivery(deliveryId: string, reason = "operator-canceled") {
     const delivery = this.db
-      .query("SELECT * FROM delivery_intents WHERE id=?")
-      .get(deliveryId) as DeliveryIntentRow | null;
+      .query<DeliveryIntentRow, [string]>("SELECT * FROM delivery_intents WHERE id=?")
+      .get(deliveryId);
     if (!delivery) throw new Error("DELIVERY_NOT_FOUND");
     if (["accepted", "canceled", "superseded"].includes(delivery.state))
       throw new Error("TASK_STATE_CONFLICT");
@@ -1126,8 +1142,10 @@ export class Store {
   }
   resolveUnknown(deliveryId: string, resolution: string) {
     const delivery = this.db
-      .query("SELECT * FROM delivery_intents WHERE id=? AND state='acceptance-unknown'")
-      .get(deliveryId) as DeliveryIntentRow | null;
+      .query<DeliveryIntentRow, [string]>(
+        "SELECT * FROM delivery_intents WHERE id=? AND state='acceptance-unknown'",
+      )
+      .get(deliveryId);
     if (!delivery) throw new Error("ACCEPTANCE_UNKNOWN");
     const state =
       resolution === "accepted"
@@ -1147,11 +1165,22 @@ export class Store {
   }
   private assignedTask(taskId: string, principalId: string) {
     const row = this.db
-      .query(
-        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id WHERE t.id=? AND p.disabled_at_ms IS NULL",
+      .query<TaskRow, [string, string]>(
+        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id JOIN runtime_bindings b ON b.id=p.binding_id AND b.status='active' WHERE t.id=? AND p.disabled_at_ms IS NULL AND (NOT EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.pinned_binding_id IS NOT NULL) OR EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.pinned_binding_id=b.id AND i.pinned_binding_epoch=b.epoch))",
       )
-      .get(principalId, taskId) as TaskRow | null;
+      .get(principalId, taskId);
     if (!row) throw new Error("TASK_NOT_ASSIGNED");
     return row;
   }
+}
+
+function stringArray(json: string) {
+  const value: unknown = JSON.parse(json);
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string"))
+    throw new Error("STORAGE_CORRUPT: expected string array");
+  return value;
+}
+
+function parseJson<T>(json: string): T {
+  return JSON.parse(json) as T;
 }

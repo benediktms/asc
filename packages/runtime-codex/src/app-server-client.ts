@@ -42,29 +42,33 @@ export class CodexAppServerClient {
 
   async start(): Promise<InitializeResponse> {
     await this.connect();
-    const initialized = await this.request<InitializeResponse>("initialize", {
-      clientInfo: {
-        name: "agent_communications_service",
-        title: "Agent Communications Service",
-        version: "0.1.0",
-      },
-      capabilities: { experimentalApi: true },
-    });
+    const initialized = decodeResponse<InitializeResponse>(
+      await this.request("initialize", {
+        clientInfo: {
+          name: "agent_communications_service",
+          title: "Agent Communications Service",
+          version: "0.1.0",
+        },
+        capabilities: { experimentalApi: true },
+      }),
+    );
     this.notify("initialized", {});
     return initialized;
   }
 
   async loadedThreads(cursor: string | null = null): Promise<ThreadLoadedListResponse> {
-    return this.request("thread/loaded/list", { cursor, limit: 100 });
+    return decodeResponse<ThreadLoadedListResponse>(
+      await this.request("thread/loaded/list", { cursor, limit: 100 }),
+    );
   }
   async listThreads(params: ThreadListParams = {}): Promise<ThreadListResponse> {
-    return this.request("thread/list", params);
+    return decodeResponse<ThreadListResponse>(await this.request("thread/list", params));
   }
   async readThread(params: ThreadReadParams): Promise<ThreadReadResponse> {
-    return this.request("thread/read", params);
+    return decodeResponse<ThreadReadResponse>(await this.request("thread/read", params));
   }
   async startThread(params: ThreadStartParams): Promise<ThreadStartResponse> {
-    return this.request("thread/start", params);
+    return decodeResponse<ThreadStartResponse>(await this.request("thread/start", params));
   }
   async deleteThread(threadId: string): Promise<void> {
     await this.request("thread/delete", { threadId });
@@ -73,21 +77,21 @@ export class CodexAppServerClient {
     await this.request("thread/inject_items", params);
   }
   async startTurn(params: TurnStartParams): Promise<TurnStartResponse> {
-    return this.request("turn/start", params);
+    return decodeResponse<TurnStartResponse>(await this.request("turn/start", params));
   }
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     await this.request("turn/interrupt", { threadId, turnId });
   }
 
-  async request<T>(method: string, params: unknown): Promise<T> {
+  async request(method: string, params: unknown): Promise<unknown> {
     if (!this.upgraded) throw new Error("app-server client is not connected");
     const id = this.nextId++;
-    const promise = new Promise<T>((resolve, reject) => {
+    const promise = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`app-server timeout: ${method}`));
       }, this.timeoutMs);
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
+      this.pending.set(id, { resolve, reject, timer });
     });
     this.sendFrame(0x1, Buffer.from(JSON.stringify({ id, method, params })));
     return promise;
@@ -257,4 +261,10 @@ export class CodexAppServerClient {
     }
     this.pending.clear();
   }
+}
+
+function decodeResponse<T>(value: unknown): T {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("invalid app-server response");
+  return value as T;
 }

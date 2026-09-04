@@ -335,11 +335,14 @@ async function a2a(port: number, slug: string, token: string, method: string, pa
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, params }),
   });
-  const rpc = (await response.json()) as {
-    error?: { message: string };
-    result?: unknown;
-  };
-  if (!response.ok || rpc.error)
-    throw new Error(rpc.error?.message ?? `${response.status} ${response.statusText}`);
+  const rpc: unknown = await response.json();
+  if (!isRecord(rpc)) throw new Error("Invalid A2A response");
+  const error =
+    isRecord(rpc.error) && typeof rpc.error.message === "string" ? rpc.error.message : undefined;
+  if (!response.ok || error) throw new Error(error ?? `${response.status} ${response.statusText}`);
   return rpc.result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

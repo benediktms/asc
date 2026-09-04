@@ -10,7 +10,7 @@ import {
   type SendMessageRequest,
   type StreamResponse,
   type SubscribeToTaskRequest,
-  type Task,
+  Task,
   type TaskPushNotificationConfig,
 } from "@a2a-js/sdk";
 import {
@@ -41,9 +41,9 @@ function delivery(metadata: Record<string, unknown> | undefined): {
   replyExpected: boolean;
   expiresAt?: string;
 } {
-  const value = (metadata?.[extension] ?? {}) as Record<string, unknown>;
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error("VALIDATION_FAILED: delivery extension must be an object");
+  const raw = metadata?.[extension],
+    value = raw === undefined ? {} : raw;
+  if (!isRecord(value)) throw new Error("VALIDATION_FAILED: delivery extension must be an object");
   const allowed = new Set(["mode", "priority", "notifyOn", "replyExpected", "expiresAt"]);
   if (Object.keys(value).some((key) => !allowed.has(key)))
     throw new Error("VALIDATION_FAILED: unknown delivery option");
@@ -80,9 +80,9 @@ function delivery(metadata: Record<string, unknown> | undefined): {
   return {
     mode,
     priority,
-    notifyOn: notifyOn as string[],
+    notifyOn: notifyOn.map(String),
     replyExpected: value.replyExpected ?? true,
-    expiresAt: value.expiresAt as string | undefined,
+    expiresAt: value.expiresAt,
   };
 }
 
@@ -154,7 +154,7 @@ class Handler implements A2ARequestHandler {
     params: SendMessageRequest,
     context: ServerCallContext,
   ): AsyncGenerator<StreamResponse> {
-    const task = (await this.sendMessage(params, context)) as Task;
+    const task = await this.sendMessage(params, context);
     yield { payload: { $case: "task", value: task } };
     yield* this.updates(task, context.user!.userName);
   }
@@ -260,7 +260,7 @@ function trim(task: Task, length?: number): Task {
     : { ...task, history: length === 0 ? [] : task.history.slice(-length) };
 }
 function asTask(task: StoredTask): Task {
-  return task as unknown as Task;
+  return Task.fromJSON(task);
 }
 function applicationError(error: unknown) {
   if (error instanceof JsonRpcTransportError) return error;
@@ -310,12 +310,15 @@ export async function handleA2A(
   if (!match) return new Response("Not found", { status: 404 });
   const agent = store.agent(match[1]!);
   if (!agent || !agent.enabled) return new Response("Not found", { status: 404 });
-  if (request.method === "GET" && url.pathname.endsWith("agent-card.json"))
+  if (request.method === "GET" && url.pathname.endsWith("agent-card.json")) {
+    const json = AgentCard.toJSON(card(agent, port));
+    if (!isRecord(json)) throw new Error("Agent Card serialization failed");
     return Response.json({
-      ...(AgentCard.toJSON(card(agent, port)) as Record<string, unknown>),
+      ...json,
       description: agent.description,
       skills: JSON.parse(agent.skills_json),
     });
+  }
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.startsWith("application/json"))
@@ -330,7 +333,8 @@ export async function handleA2A(
     return new Response("Request too large", { status: 413 });
   let method: unknown;
   try {
-    method = (JSON.parse(body) as { method?: unknown }).method;
+    const parsed = JSON.parse(body);
+    method = isRecord(parsed) ? parsed.method : undefined;
   } catch {
     method = undefined;
   }
@@ -358,8 +362,8 @@ export async function handleA2A(
       correlationId: crypto.randomUUID(),
     };
   }
-  if (Symbol.asyncIterator in Object(result)) {
-    const iterator = (result as AsyncGenerator<StreamResponse>)[Symbol.asyncIterator](),
+  if (isAsyncIterable(result)) {
+    const iterator = result[Symbol.asyncIterator](),
       encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
@@ -383,6 +387,12 @@ export async function handleA2A(
     });
   }
   return Response.json(result);
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isAsyncIterable(value: unknown): value is AsyncIterable<StreamResponse> {
+  return isRecord(value) && Symbol.asyncIterator in value;
 }
 function isAcsErrorResponse(
   value: unknown,

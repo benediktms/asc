@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Message } from "@a2a-js/sdk";
 import { DeliveryScheduler, retryDelay } from "../packages/application/src/scheduler";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
-import type { RuntimeAdapter } from "../contracts/runtime-adapter";
+import { FakeRuntimeAdapter } from "./fake-runtime-adapter";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -32,19 +32,10 @@ describe("delivery scheduler", () => {
   test("starts degraded and reconnects when the runtime appears", async () => {
     const store = fixture();
     let starts = 0;
-    const adapter = {
-      descriptor: { adapterApiVersion: 1 },
-      async start() {
-        if (++starts === 1) throw new Error("offline");
-      },
-      async stop() {},
-      async *observe(signal: AbortSignal) {
-        yield { type: "adapter.connection", state: "online" };
-        await new Promise<void>((resolve) =>
-          signal.addEventListener("abort", () => resolve(), { once: true }),
-        );
-      },
-    } as unknown as RuntimeAdapter;
+    const adapter = new FakeRuntimeAdapter();
+    adapter.start = async () => {
+      if (++starts === 1) throw new Error("offline");
+    };
     const scheduler = new DeliveryScheduler(store, adapter, "reconnect", {
       concurrency: 1,
       leaseMs: 1000,
@@ -69,31 +60,21 @@ describe("delivery scheduler", () => {
       Message.fromJSON({ messageId: "one", role: "ROLE_USER", parts: [{ text: "work" }] }),
       { mode: "append_context" },
     );
-    const adapter = {
-      descriptor: { adapterApiVersion: 1 },
-      async start() {},
-      async stop() {},
-      async *observe(signal: AbortSignal) {
-        yield { type: "adapter.connection", state: "online" };
-        await new Promise<void>((resolve) =>
-          signal.addEventListener("abort", () => resolve(), { once: true }),
-        );
-      },
-      async deliver() {
-        return {
-          outcome: "accepted",
-          acceptedAt: new Date().toISOString(),
-          evidence: { scheme: "fake", value: "ok" },
-        };
-      },
-    } as unknown as RuntimeAdapter;
+    const adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => ({
+      outcome: "accepted",
+      acceptedAt: new Date().toISOString(),
+      evidence: { scheme: "fake", value: "ok" },
+    });
     const scheduler = new DeliveryScheduler(store, adapter, "test");
     await scheduler.start();
     await Bun.sleep(400);
     expect(
       store.db
-        .query("SELECT state,attempt_count FROM delivery_intents WHERE id=?")
-        .get(accepted.deliveryId) as { state: string; attempt_count: number },
+        .query<{ state: string; attempt_count: number }, [string]>(
+          "SELECT state,attempt_count FROM delivery_intents WHERE id=?",
+        )
+        .get(accepted.deliveryId),
     ).toEqual({ state: "accepted", attempt_count: 1 });
     await scheduler.stop();
     store.close();
@@ -110,29 +91,17 @@ describe("delivery scheduler", () => {
       { mode: "append_context" },
     );
     const canceled: string[] = [],
-      adapter = {
-        descriptor: { adapterApiVersion: 1 },
-        async start() {},
-        async stop() {},
-        async *observe(signal: AbortSignal) {
-          yield { type: "adapter.connection", state: "online" };
-          await new Promise<void>((resolve) =>
-            signal.addEventListener("abort", () => resolve(), { once: true }),
-          );
-        },
-        async deliver() {
-          return {
-            outcome: "accepted",
-            acceptedAt: new Date().toISOString(),
-            execution: { opaqueId: "owned-turn", alreadyRunning: false },
-            evidence: { scheme: "fake", value: "owned-turn" },
-          };
-        },
-        async cancel(request: { execution: { opaqueId: string } }) {
-          canceled.push(request.execution.opaqueId);
-          return { outcome: "accepted", acceptedAt: new Date().toISOString() };
-        },
-      } as unknown as RuntimeAdapter;
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => ({
+      outcome: "accepted",
+      acceptedAt: new Date().toISOString(),
+      execution: { opaqueId: "owned-turn", alreadyRunning: false },
+      evidence: { scheme: "fake", value: "owned-turn" },
+    });
+    adapter.cancel = async (request) => {
+      canceled.push(request.execution.opaqueId);
+      return { outcome: "accepted", acceptedAt: new Date().toISOString() };
+    };
     const scheduler = new DeliveryScheduler(store, adapter, "test-cancel");
     await scheduler.start();
     await Bun.sleep(400);
@@ -140,12 +109,55 @@ describe("delivery scheduler", () => {
     await Bun.sleep(400);
     expect(canceled).toEqual(["owned-turn"]);
     expect(
-      (
-        store.db.query("SELECT state FROM a2a_tasks WHERE id=?").get(accepted.task.id) as {
-          state: string;
-        }
-      ).state,
+      store.db
+        .query<{ state: string }, [string]>("SELECT state FROM a2a_tasks WHERE id=?")
+        .get(accepted.task.id)!.state,
     ).toBe("canceled");
+    await scheduler.stop();
+    store.close();
+  });
+  test("reconciles an ambiguous runtime write without redelivery", async () => {
+    const store = fixture(),
+      agent = store.createAgent("ambiguous-target"),
+      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!;
+    store.bind(agent.id, "thread-ambiguous");
+    const accepted = store.accept(
+      agent.id,
+      requester.id,
+      Message.fromJSON({
+        messageId: "ambiguous-one",
+        role: "ROLE_USER",
+        parts: [{ text: "work" }],
+      }),
+      { mode: "append_context" },
+    );
+    let deliveries = 0,
+      reconciliations = 0;
+    const adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => {
+      deliveries++;
+      return {
+        outcome: "acceptance-unknown",
+        ambiguity: "connection-reset",
+        reconciliationToken: "marker",
+      };
+    };
+    adapter.reconcile = async () => {
+      reconciliations++;
+      return {
+        outcome: "accepted",
+        execution: { opaqueId: "recovered-turn" },
+        evidence: { marker: "found" },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "test-reconcile");
+    await scheduler.start();
+    await Bun.sleep(700);
+    expect(deliveries).toBe(1);
+    expect(reconciliations).toBe(1);
+    expect(
+      store.db.query("SELECT state FROM delivery_intents WHERE id=?").get(accepted.deliveryId),
+    ).toEqual({ state: "accepted" });
     await scheduler.stop();
     store.close();
   });

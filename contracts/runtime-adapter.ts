@@ -11,12 +11,10 @@ export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonValue };
 export type JsonObject = { readonly [key: string]: JsonValue };
 
-type Brand<T, B extends string> = T & { readonly __brand: B };
-
-export type RuntimeInstallationId = Brand<string, "RuntimeInstallationId">;
-export type BindingId = Brand<string, "BindingId">;
-export type DeliveryId = Brand<string, "DeliveryId">;
-export type RuntimeExecutionId = Brand<string, "RuntimeExecutionId">;
+export type RuntimeInstallationId = `ins_${string}`;
+export type BindingId = `bnd_${string}`;
+export type DeliveryId = `int_${string}`;
+export type RuntimeExecutionId = `exe_${string}`;
 
 export type NeutralPart =
   | {

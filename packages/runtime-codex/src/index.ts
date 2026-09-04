@@ -1,8 +1,5 @@
 import type { Thread } from "../../codex-protocol-generated/src/v2/Thread";
-import type { ThreadItem } from "../../codex-protocol-generated/src/v2/ThreadItem";
 import type { ResponseItem } from "../../codex-protocol-generated/src/ResponseItem";
-import type { ItemCompletedNotification } from "../../codex-protocol-generated/src/v2/ItemCompletedNotification";
-import type { TurnCompletedNotification } from "../../codex-protocol-generated/src/v2/TurnCompletedNotification";
 import type { ThreadStatus } from "../../codex-protocol-generated/src/v2/ThreadStatus";
 import type { JsonValue } from "../../codex-protocol-generated/src/serde_json/JsonValue";
 import type {
@@ -211,7 +208,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       if (request.mode === "append_context") {
         await this.requireClient().injectItems({
           threadId: request.target.session.opaqueId,
-          items: [JSON.parse(JSON.stringify(this.responseItem(request.envelope))) as JsonValue],
+          items: [jsonValue(JSON.stringify(this.responseItem(request.envelope)))],
         });
         return {
           outcome: "accepted",
@@ -343,11 +340,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         },
       });
     }
-    if (method === "item/completed") {
-      const event = params as ItemCompletedNotification,
-        execution = this.executions.get(event.turnId),
-        item = event.item as ThreadItem;
-      if (execution && item?.type === "agentMessage") {
+    if (method === "item/completed" && isItemCompleted(params)) {
+      const event = params,
+        execution = this.executions.get(event.turnId);
+      if (
+        execution &&
+        event.item.type === "agentMessage" &&
+        "text" in event.item &&
+        typeof event.item.text === "string"
+      ) {
+        const item = event.item;
         execution.finalParts = [{ kind: "text", text: item.text, mediaType: "text/markdown" }];
         this.emit({
           type: "execution.output",
@@ -357,8 +359,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         });
       }
     }
-    if (method === "turn/completed") {
-      const event = params as TurnCompletedNotification,
+    if (method === "turn/completed" && isTurnCompleted(params)) {
+      const event = params,
         execution = this.executions.get(event.turn.id);
       if (execution) {
         const outcome =
@@ -377,6 +379,52 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       }
     }
   }
+}
+
+function jsonValue(json: string): JsonValue {
+  const value: unknown = JSON.parse(json);
+  if (!isJsonValue(value)) throw new Error("runtime envelope is not JSON");
+  return value;
+}
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || ["boolean", "number", "string"].includes(typeof value)) return true;
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return (
+    typeof value === "object" &&
+    Object.values(value).every((item) => item === undefined || isJsonValue(item))
+  );
+}
+function isItemCompleted(
+  value: unknown,
+): value is { turnId: string; item: { type: "agentMessage"; text: string } | { type: string } } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "turnId" in value &&
+    typeof value.turnId === "string" &&
+    "item" in value &&
+    typeof value.item === "object" &&
+    value.item !== null &&
+    "type" in value.item &&
+    typeof value.item.type === "string" &&
+    (value.item.type !== "agentMessage" ||
+      ("text" in value.item && typeof value.item.text === "string"))
+  );
+}
+function isTurnCompleted(
+  value: unknown,
+): value is { turn: { id: string; status: "completed" | "interrupted" | string } } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "turn" in value &&
+    typeof value.turn === "object" &&
+    value.turn !== null &&
+    "id" in value.turn &&
+    typeof value.turn.id === "string" &&
+    "status" in value.turn &&
+    typeof value.turn.status === "string"
+  );
 }
 
 function errorMessage(error: unknown) {

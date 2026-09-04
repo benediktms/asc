@@ -67,15 +67,18 @@ describe("durable acceptance", () => {
     store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Working);
     store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done");
     const notification = store.db
-      .query(
+      .query<
+        {
+          kind: string;
+          target_agent_id: string;
+          pinned_binding_id: string;
+          state: string;
+        },
+        []
+      >(
         "SELECT kind,target_agent_id,pinned_binding_id,state FROM delivery_intents WHERE kind='task-event-notification'",
       )
-      .get() as {
-      kind: string;
-      target_agent_id: string;
-      pinned_binding_id: string;
-      state: string;
-    };
+      .get()!;
     expect(notification).toEqual({
       kind: "task-event-notification",
       target_agent_id: sender.id,
@@ -110,6 +113,42 @@ describe("durable acceptance", () => {
       store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done")
         .status?.state,
     ).toBe(3);
+    store.close();
+  });
+  test("rejects executor callbacks from a rebound session after delivery was pinned", () => {
+    const store = fixture(),
+      target = store.createAgent("rebound-worker"),
+      first = store.bind(target.id, "old-thread"),
+      requester = store.authenticate(readFileSync(store.config.token, "utf8"))!,
+      accepted = store.accept(
+        target.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "request-4",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      );
+    store.db
+      .query("UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?")
+      .run(first.id, first.epoch, accepted.deliveryId);
+    const rebound = store.bind(target.id, "new-thread");
+    expect(
+      store.db
+        .query<{ pinned_binding_id: string; pinned_binding_epoch: number }, [string]>(
+          "SELECT pinned_binding_id,pinned_binding_epoch FROM delivery_intents WHERE id=?",
+        )
+        .get(accepted.deliveryId),
+    ).toEqual({ pinned_binding_id: first.id, pinned_binding_epoch: first.epoch });
+    expect(() =>
+      store.setTaskState(
+        accepted.task.id,
+        rebound.principalId,
+        TaskState.Completed,
+        "wrong session",
+      ),
+    ).toThrow("TASK_NOT_ASSIGNED");
     store.close();
   });
 });

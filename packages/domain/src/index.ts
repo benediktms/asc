@@ -63,7 +63,10 @@ const prefixes = [
 ] as const;
 export type IdPrefix = (typeof prefixes)[number];
 
-export function id(prefix: IdPrefix, now = Date.now()): string {
+export function id<Prefix extends IdPrefix>(
+  prefix: Prefix,
+  now = Date.now(),
+): `${Prefix}_${string}` {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   const timestamp = BigInt(now);
   for (let index = 0; index < 6; index++)
