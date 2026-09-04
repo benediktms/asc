@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import type {
   AgentRow,
   BindingRow,
+  DeliveryIntentRow,
   StoredArtifact,
   StoredPart,
   Store,
@@ -36,6 +37,7 @@ const partSchema = z.discriminatedUnion("kind", [
   }),
   paramsSchema = z.looseObject({
     agent: z.string().optional(),
+    availability: z.array(z.string()).optional(),
     allowNonAtomicWake: z.boolean().optional(),
     artifacts: z.array(artifactSchema).optional(),
     bindingId: z.string().optional(),
@@ -51,6 +53,9 @@ const partSchema = z.discriminatedUnion("kind", [
       .optional(),
     question: z.string().optional(),
     reason: z.string().optional(),
+    state: z.array(z.string()).optional(),
+    states: z.array(z.string()).optional(),
+    status: z.array(z.string()).optional(),
     resolution: z
       .enum(["accepted", "not-accepted-and-retry", "not-accepted-and-cancel"])
       .optional(),
@@ -59,6 +64,8 @@ const partSchema = z.discriminatedUnion("kind", [
     session: z.union([z.string(), z.object({ opaqueId: z.string() })]).optional(),
     slug: z.string().optional(),
     summary: z.string().optional(),
+    targetAgent: z.string().optional(),
+    text: z.string().optional(),
     parts: z.array(partSchema).optional(),
     protocolVersion: z.unknown(),
     limit: z.number().int().positive().optional(),
@@ -202,22 +209,34 @@ export function controlHandler(
           if (!agent) throw new Error("AGENT_NOT_FOUND");
           return ok(rpc.id, { agent: agentDto(store, agent) });
         }
-        case "agents.list":
-          const agentOffset = store.cursorOffset(p?.cursor);
-          const agentLimit = Math.min(p?.limit ?? 50, 100),
-            agents = store.agents().slice(agentOffset, agentOffset + agentLimit),
-            lastAgent = agents.at(-1);
+        case "agents.list": {
+          const agentLimit = Math.min(p.limit ?? 50, 100),
+            text = p.text?.toLowerCase(),
+            candidates = store
+              .agents()
+              .map((agent) => ({ agent, dto: agentDto(store, agent) }))
+              .filter(
+                ({ agent, dto }) =>
+                  (p.enabled === undefined || Boolean(agent.enabled) === p.enabled) &&
+                  (!p.availability?.length || p.availability.includes(dto.availability)) &&
+                  (!text ||
+                    [agent.slug, agent.display_name, agent.description].some((value) =>
+                      value.toLowerCase().includes(text),
+                    )),
+              ),
+            page = boundedLocalPage(
+              store,
+              candidates,
+              agentLimit,
+              p.cursor,
+              ({ agent }) => ({ sortKey: agent.slug, id: agent.id }),
+              "ascending",
+            );
           return ok(rpc.id, {
-            items: agents.map((agent) => agentDto(store, agent)),
-            nextCursor:
-              agents.length === agentLimit && lastAgent
-                ? store.encodeCursor({
-                    offset: agentOffset + agentLimit,
-                    sortKey: lastAgent.slug,
-                    id: lastAgent.id,
-                  })
-                : undefined,
+            items: page.items.map(({ dto }) => dto),
+            nextCursor: page.nextCursor,
           });
+        }
         case "bindings.bind":
           admin(principal.kind);
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
@@ -275,14 +294,31 @@ export function controlHandler(
           if (!binding) throw new Error("BINDING_NOT_FOUND");
           return ok(rpc.id, { binding: bindingDto(binding, store) });
         }
-        case "bindings.list":
+        case "bindings.list": {
+          const agentFilter = p.agent ? store.agent(p.agent)?.id : undefined,
+            page = boundedLocalPage(
+              store,
+              store.db
+                .query<BindingRow, []>("SELECT * FROM runtime_bindings")
+                .all()
+                .filter(
+                  (binding) =>
+                    (!p.agent || binding.agent_id === agentFilter) &&
+                    (!p.status?.length || p.status.includes(binding.status)),
+                ),
+              Math.min(p.limit ?? 50, 100),
+              p.cursor,
+              (binding) => ({
+                sortKey: timestampKey(binding.created_at_ms),
+                id: binding.id,
+              }),
+              "descending",
+            );
           return ok(rpc.id, {
-            items: store.db
-              .query<BindingRow, []>("SELECT * FROM runtime_bindings ORDER BY created_at_ms DESC")
-              .all()
-              .map((binding) => bindingDto(binding, store)),
-            nextCursor: undefined,
+            items: page.items.map((binding) => bindingDto(binding, store)),
+            nextCursor: page.nextCursor,
           });
+        }
         case "bindings.revoke":
           admin(principal.kind);
           const revoked = store.revokeBinding(required(p.bindingId, "bindingId"), p.reason)!;
@@ -358,7 +394,19 @@ export function controlHandler(
         case "inbox.list": {
           const a = store.attest(p.threadId);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          return ok(rpc.id, { items: store.inbox(a.agentId) });
+          const states = p.states ?? ["submitted", "working", "input-required", "auth-required"],
+            page = boundedLocalPage(
+              store,
+              store.inbox(a.agentId).filter((row) => states.includes(row.state)),
+              Math.min(p.limit ?? 20, 100),
+              p.cursor,
+              (row) => ({ sortKey: timestampKey(row.updated_at_ms), id: row.id }),
+              "descending",
+            );
+          return ok(rpc.id, {
+            items: page.items.map((row) => row.task),
+            nextCursor: page.nextCursor,
+          });
         }
         case "inbox.get": {
           const a = store.attest(p.threadId);
@@ -438,13 +486,32 @@ export function controlHandler(
             ),
           );
         }
-        case "deliveries.list":
+        case "deliveries.list": {
+          const targetAgent = p.targetAgent ? store.agent(p.targetAgent)?.id : undefined,
+            page = boundedLocalPage(
+              store,
+              store.db
+                .query<DeliveryIntentRow, []>("SELECT * FROM delivery_intents")
+                .all()
+                .filter(
+                  (delivery) =>
+                    (!p.state?.length || p.state.includes(delivery.state)) &&
+                    (!p.targetAgent || delivery.target_agent_id === targetAgent) &&
+                    (!p.taskId || delivery.task_id === p.taskId),
+                ),
+              Math.min(p.limit ?? 50, 100),
+              p.cursor,
+              (delivery) => ({
+                sortKey: timestampKey(delivery.created_at_ms),
+                id: delivery.id,
+              }),
+              "descending",
+            );
           return ok(rpc.id, {
-            items: store.db
-              .query("SELECT * FROM delivery_intents ORDER BY created_at_ms DESC LIMIT 100")
-              .all(),
-            nextCursor: undefined,
+            items: page.items,
+            nextCursor: page.nextCursor,
           });
+        }
         case "deliveries.get": {
           const item = store.db
             .query("SELECT * FROM delivery_intents WHERE id=?")
@@ -536,6 +603,43 @@ export async function controlCall(
 
 function admin(kind: string) {
   if (kind !== "local-user") throw new Error("NOT_AUTHORIZED");
+}
+function boundedLocalPage<T>(
+  store: Store,
+  items: T[],
+  limit: number,
+  encodedCursor: string | undefined,
+  key: (item: T) => { sortKey: string; id: string },
+  direction: "ascending" | "descending",
+) {
+  const cursor = encodedCursor ? listCursor(store.decodeCursor(encodedCursor)) : undefined,
+    compare = (left: T, right: T) => comparePageKeys(key(left), key(right), direction),
+    ordered = items.toSorted(compare),
+    remaining = cursor
+      ? ordered.filter((item) => comparePageKeys(key(item), cursor, direction) > 0)
+      : ordered,
+    page = remaining.slice(0, limit),
+    last = page.at(-1);
+  return {
+    items: page,
+    nextCursor: remaining.length > limit && last ? store.encodeCursor(key(last)) : undefined,
+  };
+}
+function listCursor(value: unknown) {
+  if (!isRecord(value) || typeof value.sortKey !== "string" || typeof value.id !== "string")
+    throw new Error("VALIDATION_FAILED: invalid cursor");
+  return { sortKey: value.sortKey, id: value.id };
+}
+function comparePageKeys(
+  left: { sortKey: string; id: string },
+  right: { sortKey: string; id: string },
+  direction: "ascending" | "descending",
+) {
+  const order = left.sortKey.localeCompare(right.sortKey) || left.id.localeCompare(right.id);
+  return direction === "ascending" ? order : -order;
+}
+function timestampKey(value: number) {
+  return String(value).padStart(16, "0");
 }
 function authorize(principal: { kind: string; scopes: string[] }, method: string) {
   if (principal.scopes.includes("*")) return;

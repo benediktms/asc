@@ -141,6 +141,7 @@ export interface DeliveryIntentRow {
   deadline_ms: number | null;
   pinned_binding_id: BindingId | null;
   pinned_binding_epoch: number | null;
+  created_at_ms: number;
 }
 interface TaskRow {
   id: `tsk_${string}`;
@@ -643,11 +644,19 @@ export class Store {
   }
   inbox(agentId: string) {
     return this.db
-      .query<{ a2a_snapshot_json: string }, [string]>(
-        "SELECT a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? AND state NOT IN ('completed','failed','canceled','rejected') ORDER BY updated_at_ms DESC LIMIT 100",
+      .query<
+        { id: string; state: TaskState; updated_at_ms: number; a2a_snapshot_json: string },
+        [string]
+      >(
+        "SELECT id,state,updated_at_ms,a2a_snapshot_json FROM a2a_tasks WHERE target_agent_id=? ORDER BY updated_at_ms DESC,id DESC",
       )
       .all(agentId)
-      .map((row) => JSON.parse(row.a2a_snapshot_json));
+      .map((row) => ({
+        id: row.id,
+        state: row.state,
+        updated_at_ms: row.updated_at_ms,
+        task: parseTask(row.a2a_snapshot_json),
+      }));
   }
   inboxTask(agentId: string, taskId: string) {
     const row = this.db

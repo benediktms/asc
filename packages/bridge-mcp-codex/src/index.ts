@@ -335,9 +335,14 @@ export async function runMcp(port = 7432) {
     "acs_inbox_list",
     {
       description: "List non-terminal tasks assigned to this logical agent",
-      inputSchema: { limit: z.number().int().min(1).max(100).optional() },
+      inputSchema: {
+        states: z.array(z.string()).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+        cursor: z.string().optional(),
+      },
     },
-    async (_args, extra) => execute(() => call("inbox.list", { threadId: threadId(extra) })),
+    async (args, extra) =>
+      execute(() => call("inbox.list", { ...args, threadId: threadId(extra) })),
   );
   await server.connect(new StdioServerTransport());
 }
