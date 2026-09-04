@@ -4,7 +4,11 @@ import { handleA2A } from "../../../packages/protocol-a2a/src/index";
 import { controlCall, controlHandler } from "../../../packages/protocol-control/src/index";
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
 import { initFiles, paths, Store } from "../../../packages/storage-sqlite/src/index";
-import { CodexRuntimeAdapter } from "../../../packages/runtime-codex/src/index";
+import {
+  codexVersion,
+  CodexRuntimeAdapter,
+  TESTED_CODEX_VERSION,
+} from "../../../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../../../packages/runtime-codex/src/app-server-client";
 import { DeliveryScheduler } from "../../../packages/application/src/scheduler";
 import { loadConfig, parseListen, writeDefaultConfig } from "../../../packages/config/src/index";
@@ -216,7 +220,10 @@ function print(value: unknown) {
 }
 async function doctor() {
   const codex = Bun.spawnSync([settings.codex.binary, "--version"]);
-  const socket =
+  const installedCodex = codex.success ? codex.stdout.toString().trim() : undefined,
+    installedCodexVersion = installedCodex ? codexVersion(installedCodex) : undefined,
+    compatible = installedCodexVersion === TESTED_CODEX_VERSION,
+    socket =
       process.env.ACS_CODEX_SOCKET ??
       `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`,
     client = new CodexAppServerClient(socket);
@@ -231,7 +238,11 @@ async function doctor() {
     client.close();
   }
   print({
-    codex: codex.success ? codex.stdout.toString().trim() : "unavailable",
+    codex: {
+      installed: installedCodex ?? "unavailable",
+      testedVersion: TESTED_CODEX_VERSION,
+      compatibility: compatible ? "tested" : "untested",
+    },
     phaseZero: {
       a2aOnBun: "locally testable",
       standaloneExecutable: "locally testable",
@@ -240,7 +251,7 @@ async function doctor() {
       safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",
       approvalOwnership: "unproven",
     },
-    mutatingDeliveryEnabled: sharedAppServer.startsWith("ready"),
+    mutatingDeliveryEnabled: compatible && sharedAppServer.startsWith("ready"),
   });
 }
 function usage() {
