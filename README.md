@@ -44,4 +44,6 @@ an explicit per-binding `--allow-non-atomic-wake` policy. Generic
 acceptance-unknown reconciliation is automatic, with operator resolution when
 the Codex adapter cannot prove authoritative history. Two-build MCP metadata,
 approval ownership, and real-Codex reconciliation remain release gates and are
-reported honestly rather than inferred from emulator tests.
+reported honestly rather than inferred from emulator tests. On Codex `0.153.2`,
+`requestUserInput` fans out to every subscribed client, so ACS observes but never
+answers those requests; a unique local approval owner cannot yet be proven.

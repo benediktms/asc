@@ -250,7 +250,7 @@ async function doctor() {
       mcpAttestation: "requires real two-build evidence",
       sharedAppServer,
       safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",
-      approvalOwnership: "unproven",
+      approvalOwnership: "unsafe: local-input requests fan out to all subscribers",
     },
     mutatingDeliveryEnabled:
       runningCodexVersion === TESTED_CODEX_VERSION && sharedAppServer.startsWith("ready"),
