@@ -45,6 +45,7 @@ export class CodexAppServerClient {
   constructor(
     readonly socketPath: string,
     readonly timeoutMs = 10_000,
+    readonly connectTimeoutMs = 1_000,
   ) {}
 
   async start() {
@@ -142,8 +143,13 @@ export class CodexAppServerClient {
     this.connectPromise = new Promise<void>((resolve, reject) => {
       const key = randomBytes(16).toString("base64");
       const expected = createHash("sha1")
-        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-        .digest("base64");
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest("base64"),
+        timer = setTimeout(() => {
+          this.connectPromise = undefined;
+          reject(new Error("app-server connection timeout"));
+          this.socket?.end();
+        }, this.connectTimeoutMs);
       Bun.connect({
         unix: this.socketPath,
         socket: {
@@ -167,28 +173,36 @@ export class CodexAppServerClient {
                   "i",
                 ).test(headers)
               ) {
+                clearTimeout(timer);
                 reject(
                   new Error(`app-server websocket upgrade failed: ${headers.split("\r\n")[0]}`),
                 );
                 return;
               }
               this.upgraded = true;
+              clearTimeout(timer);
               resolve();
             }
             this.readFrames();
           },
           close: () => {
+            clearTimeout(timer);
+            reject(new Error("app-server connection closed"));
             this.upgraded = false;
             this.connectPromise = undefined;
             this.failPending(new Error("app-server connection closed"));
             this.onClose?.();
           },
           error: (_socket, error) => {
+            clearTimeout(timer);
             reject(error);
             this.failPending(error);
           },
         },
-      }).catch(reject);
+      }).catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
     });
     return this.connectPromise;
   }

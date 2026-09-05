@@ -64,6 +64,21 @@ describe("Codex app-server transport", () => {
     client.close();
     server.stop();
   });
+
+  test("times out when the app-server never upgrades", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acs-codex-timeout-"));
+    roots.push(root);
+    const path = join(root, "app.sock"),
+      server = Bun.listen({
+        unix: path,
+        socket: { open() {}, data() {}, close() {}, error() {} },
+      }),
+      client = new CodexAppServerClient(path, 10_000, 25);
+    await expect(client.start()).rejects.toThrow("app-server connection timeout");
+    await Bun.sleep(50);
+    client.close();
+    server.stop();
+  });
 });
 
 function byte(buffer: Uint8Array, index: number) {
