@@ -388,9 +388,10 @@ async function daemonStatus() {
         version: record.version,
         startedAt: record.startedAt,
         executable: record.executable,
+        health: "ok",
       });
     } catch {
-      print({ status: "degraded", pid: record.pid, version: record.version });
+      print({ status: "running", health: "degraded", pid: record.pid, version: record.version });
     }
   });
 }
