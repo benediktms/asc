@@ -130,6 +130,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.wake();
   }
   async probe(): Promise<RuntimeProbeResult> {
+    this.assertRunning();
     try {
       if (!this.client) throw new Error("adapter not started");
       await this.client.listThreads({ limit: 1, useStateDbOnly: true });
@@ -177,6 +178,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
   }
   async listSessions(query: RuntimeSessionQuery): Promise<RuntimeSessionPage> {
+    this.assertRunning();
     const client = this.requireClient(),
       loaded = await client.loadedThreads(),
       page = await client.listThreads({
@@ -220,6 +222,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return { sessions, nextCursor: page.nextCursor ?? undefined };
   }
   async inspectSession(session: RuntimeSessionRef): Promise<RuntimeSessionSnapshot> {
+    this.assertRunning();
     return telemetry.trace("runtime.inspect", async () => {
       try {
         return this.snapshot(
@@ -264,6 +267,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
   }
   async deliver(request: RuntimeDeliveryRequest): Promise<RuntimeDeliveryResult> {
+    this.assertRunning();
     if (!this.supports(request.envelope))
       return { outcome: "rejected", reason: "unsupported-content", retryable: false };
     if (request.deadline && Date.parse(request.deadline) <= Date.now())
@@ -358,6 +362,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
   }
   async reconcile(request: RuntimeReconcileRequest): Promise<RuntimeReconcileResult> {
+    this.assertRunning();
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)
       return {
         outcome: "inconclusive",
@@ -398,6 +403,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
   }
   async cancel(request: RuntimeCancelRequest): Promise<RuntimeCancelResult> {
+    this.assertRunning();
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (!this.executions.has(request.execution.opaqueId))
@@ -446,6 +452,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return (envelope.message?.parts ?? envelope.event?.parts ?? []).every(
       (part) => part.kind === "text" || part.kind === "uri" || part.kind === "data",
     );
+  }
+  private assertRunning() {
+    if (this.stopped) throw new Error("runtime adapter stopped");
   }
   private requireClient() {
     if (!this.client || this.stopped) throw new Error("adapter not started");

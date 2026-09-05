@@ -36,6 +36,8 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       const fixture = await create(),
         { adapter, context, methods } = fixture;
       await adapter.start(context);
+      await adapter.start(context);
+      expect(methods.filter((method) => method === "initialize")).toHaveLength(1);
       const iterator = adapter.observe(new AbortController().signal)[Symbol.asyncIterator]();
       expect((await iterator.next()).value).toEqual({
         type: "adapter.connection",
@@ -182,6 +184,9 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
 
       await adapter.stop({ reason: "shutdown" });
       expect((await iterator.next()).done).toBe(true);
+      const mutationsBeforeStoppedCall = mutations(methods);
+      await expect(adapter.deliver(delivery())).rejects.toThrow("runtime adapter stopped");
+      expect(mutations(methods)).toEqual(mutationsBeforeStoppedCall);
       fixture.close();
     }, 30_000);
 
