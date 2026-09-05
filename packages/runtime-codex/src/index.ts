@@ -279,16 +279,18 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
-    if (snapshot.availability === "dormant" && request.mode === "wake_when_idle")
-      return { outcome: "deferred", reason: "dormant" };
-    if (snapshot.availability !== "idle" && request.mode === "wake_when_idle")
-      return {
-        outcome: "deferred",
-        reason:
-          snapshot.availability === "busy" || snapshot.availability === "awaiting-local-input"
-            ? "busy"
-            : "policy",
-      };
+    if (request.mode === "wake_when_idle") {
+      if (snapshot.availability === "dormant") {
+        if (!request.autoResumeDormantThread) return { outcome: "deferred", reason: "dormant" };
+      } else if (snapshot.availability !== "idle")
+        return {
+          outcome: "deferred",
+          reason:
+            snapshot.availability === "busy" || snapshot.availability === "awaiting-local-input"
+              ? "busy"
+              : "policy",
+        };
+    }
     const fence = await this.requireContext().assertBindingFence(
       request.target.bindingId,
       request.target.bindingEpoch,

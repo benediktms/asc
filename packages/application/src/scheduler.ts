@@ -413,6 +413,7 @@ export class DeliveryScheduler {
       envelope,
       payloadHash: intent.payload_hash,
       deadline: intent.deadline_ms ? new Date(intent.deadline_ms).toISOString() : undefined,
+      autoResumeDormantThread: Boolean(policy.autoResumeDormantThread),
       markRequestFlushed: () => {
         this.store.db
           .query(

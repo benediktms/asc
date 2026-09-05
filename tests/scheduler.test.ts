@@ -56,7 +56,9 @@ describe("delivery scheduler", () => {
     const store = fixture(),
       agent = store.createAgent("backend"),
       principal = authenticated(store);
-    store.bind(agent.id, "thread-1");
+    store.bind(agent.id, "thread-1", {
+      deliveryPolicy: { autoResumeDormantThread: true },
+    });
     const accepted = store.accept(
       agent.id,
       principal.id,
@@ -64,11 +66,15 @@ describe("delivery scheduler", () => {
       { mode: "append_context" },
     );
     const adapter = new FakeRuntimeAdapter();
-    adapter.deliver = async () => ({
-      outcome: "accepted",
-      acceptedAt: new Date().toISOString(),
-      evidence: { scheme: "fake", value: "ok" },
-    });
+    let autoResumeDormantThread: boolean | undefined;
+    adapter.deliver = async (request) => {
+      autoResumeDormantThread = request.autoResumeDormantThread;
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "ok" },
+      };
+    };
     const scheduler = new DeliveryScheduler(store, adapter, "test");
     await scheduler.start();
     await Bun.sleep(400);
@@ -79,6 +85,7 @@ describe("delivery scheduler", () => {
         )
         .get(accepted.deliveryId),
     ).toEqual({ state: "accepted", attempt_count: 1 });
+    expect(autoResumeDormantThread).toBe(true);
     await scheduler.stop();
     store.close();
   });

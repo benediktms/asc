@@ -216,6 +216,30 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       await adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
+
+    test("resumes a dormant thread only when policy permits", async () => {
+      const fixture = await create(),
+        { adapter, context, methods } = fixture;
+      await adapter.start(context);
+      fixture.setStatus("notLoaded");
+      let flushes = 0;
+      expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
+        outcome: "deferred",
+        reason: "dormant",
+      });
+      expect(mutations(methods)).toEqual([]);
+      expect(
+        await adapter.deliver({
+          ...delivery("wake_when_idle"),
+          autoResumeDormantThread: true,
+          markRequestFlushed: () => flushes++,
+        }),
+      ).toMatchObject({ outcome: "accepted", execution: { opaqueId: "turn-1" } });
+      expect(mutations(methods)).toEqual(["turn/start"]);
+      expect(flushes).toBe(1);
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
   });
 }
 

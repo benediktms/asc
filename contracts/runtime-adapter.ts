@@ -216,6 +216,7 @@ export interface RuntimeDeliveryRequest {
   readonly envelope: RuntimeDeliveryEnvelopeV1;
   readonly payloadHash: string;
   readonly deadline?: string;
+  readonly autoResumeDormantThread?: boolean;
   readonly markRequestFlushed?: () => void;
   readonly traceContext?: {
     readonly traceparent?: string;
