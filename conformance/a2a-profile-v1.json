@@ -1,0 +1,136 @@
+{
+  "profile": "asc-a2a-v1",
+  "protocolVersion": "1.0",
+  "tckRevision": "263b9cfaf16a554bdfb166a7ba5b67716e946349",
+  "reviewedAt": "2026-09-05",
+  "expectedFailures": [
+    {
+      "requirement": "DM-ART-001",
+      "level": "MUST",
+      "classification": "intentional-optional-behavior",
+      "spec": {
+        "section": "4.1.7",
+        "url": "https://a2a-protocol.org/latest/specification/#417-artifact"
+      },
+      "decision": "The Artifact data model is supported and validated when an artifact exists, but ASC does not ask its deterministic Codex adapter to synthesize the four model-selected artifact shapes used by this TCK test. A2A does not require every response to contain an artifact.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tests/compatibility/core_operations/test_artifacts.py"
+      ],
+      "review": {
+        "condition": "Remove when the TCK conditions artifact-shape scenarios on advertised behavior, or when ASC deliberately adds those artifact-producing behaviors."
+      }
+    },
+    {
+      "requirement": "DM-MSG-001",
+      "level": "MUST",
+      "classification": "intentional-optional-behavior",
+      "spec": {
+        "section": "4.1.4",
+        "url": "https://a2a-protocol.org/latest/specification/#414-message"
+      },
+      "decision": "ASC validates Message objects but always chooses the permitted Task branch of SendMessageResponse. The TCK scenario requires the optional direct-Message response branch and therefore does not test the conditional Message shape invariant in isolation.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tests/compatibility/core_operations/test_artifacts.py"
+      ],
+      "review": {
+        "condition": "Remove when the TCK validates Message structure only after a SUT chooses that response branch, or when ASC adds direct Message responses."
+      }
+    },
+    {
+      "requirement": "CORE-SEND-003",
+      "level": "MUST",
+      "classification": "tck-defect",
+      "spec": {
+        "section": "3.1.1",
+        "url": "https://a2a-protocol.org/latest/specification/#311-send-message"
+      },
+      "decision": "ASC returns ContentTypeNotSupportedError as required. At the pinned revision the registry entry omits expected_error, so the generic requirement runner treats the required error response as a failure.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tck/requirements/core_operations.py"
+      ],
+      "review": {
+        "condition": "Remove on the first pinned TCK revision whose CORE-SEND-003 registry entry declares ContentTypeNotSupportedError."
+      }
+    },
+    {
+      "requirement": "CORE-EXECUTION-MODE-001",
+      "level": "MUST",
+      "classification": "test-fixture-idempotency-collision",
+      "spec": {
+        "section": "3.2.2",
+        "url": "https://a2a-protocol.org/latest/specification/#322-sendmessageconfiguration"
+      },
+      "decision": "ASC implements blocking-by-default behavior. The pinned parametrized runner reuses the same complete-task messageId for a request body that differs from an earlier requirement, and ASC correctly rejects that conflicting reuse rather than weakening idempotency.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tck/requirements/core_operations.py"
+      ],
+      "review": {
+        "condition": "Remove when each distinct TCK request receives a distinct messageId or each requirement runs against isolated SUT state."
+      }
+    },
+    {
+      "requirement": "CORE-EXECUTION-MODE-002",
+      "level": "MUST",
+      "classification": "test-fixture-idempotency-collision",
+      "spec": {
+        "section": "3.2.2",
+        "url": "https://a2a-protocol.org/latest/specification/#322-sendmessageconfiguration"
+      },
+      "decision": "ASC returns immediately when returnImmediately is true. The pinned parametrized runner reuses the same complete-task messageId for a request body that differs from an earlier requirement, and ASC correctly rejects that conflicting reuse.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tck/requirements/core_operations.py"
+      ],
+      "review": {
+        "condition": "Remove when each distinct TCK request receives a distinct messageId or each requirement runs against isolated SUT state."
+      }
+    },
+    {
+      "requirement": "CORE-MULTI-001a",
+      "level": "MUST",
+      "classification": "test-fixture-idempotency-collision",
+      "spec": {
+        "section": "3.4.1",
+        "url": "https://a2a-protocol.org/latest/specification/#341-context-identifier-semantics"
+      },
+      "decision": "ASC generates and returns contextId when it creates a context. The pinned parametrized runner reuses complete-task with a different request body, so strict idempotency rejects the request before the response invariant can be observed.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tck/requirements/core_operations.py"
+      ],
+      "review": {
+        "condition": "Remove when each distinct TCK request receives a distinct messageId or each requirement runs against isolated SUT state."
+      }
+    },
+    {
+      "requirement": "CORE-MULTI-002a",
+      "level": "MUST",
+      "classification": "permitted-profile-choice",
+      "spec": {
+        "section": "3.4.1",
+        "url": "https://a2a-protocol.org/latest/specification/#341-context-identifier-semantics"
+      },
+      "decision": "ASC accepts and preserves client-provided contextId values, so the conditional requirement for agents that cannot accept a value is inapplicable. The pinned request also collides with the shared complete-task messageId before that policy can be observed.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tck/requirements/core_operations.py"
+      ],
+      "review": {
+        "condition": "Remove when the TCK makes this conditional case capability- or behavior-aware; reclassify if ASC ever restricts accepted contextId values."
+      }
+    },
+    {
+      "requirement": "CORE-MULTI-003",
+      "level": "MUST",
+      "classification": "test-fixture-idempotency-collision",
+      "spec": {
+        "section": "3.4.2",
+        "url": "https://a2a-protocol.org/latest/specification/#342-task-identifier-semantics"
+      },
+      "decision": "ASC generates a unique taskId for every newly accepted request. The pinned parametrized runner reuses complete-task with different content, so the mandatory idempotency conflict prevents creation of another task.",
+      "evidence": [
+        "https://github.com/a2aproject/a2a-tck/blob/263b9cfaf16a554bdfb166a7ba5b67716e946349/tck/requirements/core_operations.py"
+      ],
+      "review": {
+        "condition": "Remove when each distinct TCK request receives a distinct messageId or each requirement runs against isolated SUT state."
+      }
+    }
+  ]
+}

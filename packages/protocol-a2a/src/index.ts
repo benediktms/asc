@@ -1,5 +1,6 @@
 import {
   AgentCard,
+  Message,
   type Part,
   Role,
   TaskState,
@@ -141,6 +142,26 @@ class Handler implements A2ARequestHandler {
     return this.getAgentCard();
   }
   async sendMessage(params: SendMessageRequest, _context: ServerCallContext): Promise<Task> {
+    const accepted = await this.acceptMessage(params),
+      historyLength = params.configuration?.historyLength;
+    if (params.configuration?.returnImmediately === true || halted(accepted.status?.state))
+      return trimHistory(accepted, historyLength);
+    const subscription = await this.application.subscribeTask(this.query(accepted.id));
+    try {
+      const current = Task.fromJSON(subscription.currentTask);
+      if (halted(current.status?.state)) return trimHistory(current, historyLength);
+      for await (const event of subscriptionEvents(subscription)) {
+        const task = Task.fromJSON(event.a2aEvent);
+        if (halted(task.status?.state)) return trimHistory(task, historyLength);
+      }
+      throw new Error("ACS_STORAGE_UNAVAILABLE: task subscription ended before a response state");
+    } catch (error) {
+      throw applicationError(error);
+    } finally {
+      await subscription.close();
+    }
+  }
+  private async acceptMessage(params: SendMessageRequest): Promise<Task> {
     try {
       const message = params.message;
       if (!message) throw new Error("VALIDATION_FAILED: message is required");
@@ -193,9 +214,9 @@ class Handler implements A2ARequestHandler {
   }
   async *sendMessageStream(
     params: SendMessageRequest,
-    context: ServerCallContext,
+    _context: ServerCallContext,
   ): AsyncGenerator<StreamResponse> {
-    const accepted = await this.sendMessage(params, context),
+    const accepted = await this.acceptMessage(params),
       subscription = await this.application.subscribeTask(this.query(accepted.id));
     yield { payload: { $case: "task", value: Task.fromJSON(subscription.currentTask) } };
     yield* this.updates(subscription);
@@ -411,6 +432,25 @@ function terminal(state?: TaskState) {
       TaskState.TASK_STATE_REJECTED,
     ].includes(state)
   );
+}
+
+function halted(state?: TaskState) {
+  return (
+    terminal(state) ||
+    state === TaskState.TASK_STATE_INPUT_REQUIRED ||
+    state === TaskState.TASK_STATE_AUTH_REQUIRED
+  );
+}
+
+function trimHistory(task: Task, historyLength?: number) {
+  if (historyLength === undefined) return task;
+  const history = task.history ?? [],
+    json = Task.toJSON(task);
+  if (!isRecord(json)) throw new Error("ACS_STORAGE_UNAVAILABLE: invalid task snapshot");
+  return Task.fromJSON({
+    ...json,
+    history: historyLength === 0 ? [] : history.slice(-historyLength).map(Message.toJSON),
+  });
 }
 
 function taskState(state: TaskState | undefined) {

@@ -39,8 +39,9 @@ A2A_TCK_DIR=/path/to/a2a-tck bun run test:a2a-tck
 ```
 
 The runner verifies the exact revision in
-`conformance/a2a-tck-revision.txt` and rejects any failure outside the reviewed
-requirement-level allowlist.
+`conformance/a2a-profile-v1.json` and rejects both new failures and stale
+exceptions. See the normative [ASC A2A v1 profile](docs/a2a-profile.md) for the
+supported protocol surface, extension boundary, and exception-review policy.
 
 ## Current conformance boundary
 

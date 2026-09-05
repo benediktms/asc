@@ -1,16 +1,23 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../packages/storage-sqlite/src/index";
+import { loadA2AProfile } from "./a2a-profile";
 
 const tck = process.env.A2A_TCK_DIR;
 if (!tck || !existsSync(join(tck, "run_tck.py")))
   throw new Error("Set A2A_TCK_DIR to an a2a-tck checkout");
-const expectedRevision = readFileSync(
-    new URL("../conformance/a2a-tck-revision.txt", import.meta.url),
-    "utf8",
-  ).trim(),
+const profile = loadA2AProfile(),
+  expectedRevision = profile.tckRevision,
   actualRevision = run(["git", "rev-parse", "HEAD"], tck).stdout.trim();
 if (actualRevision !== expectedRevision)
   throw new Error(`A2A TCK revision mismatch: expected ${expectedRevision}, got ${actualRevision}`);
@@ -155,9 +162,8 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function verifyExpectedFailures(tckPath: string, sutUrl: string) {
-  const report = record(
-      JSON.parse(readFileSync(join(tckPath, "reports/compatibility.json"), "utf8")),
-    ),
+  const sourceReport = join(tckPath, "reports/compatibility.json"),
+    report = record(JSON.parse(readFileSync(sourceReport, "utf8"))),
     summary = record(report.summary),
     requirements = record(report.per_requirement);
   if (summary.sut_url !== sutUrl) throw new Error("A2A TCK report is stale");
@@ -165,26 +171,64 @@ function verifyExpectedFailures(tckPath: string, sutUrl: string) {
       .filter(([, result]) => record(result).status === "FAIL")
       .map(([requirement]) => requirement)
       .toSorted(),
-    allowlistValue: unknown = JSON.parse(
-      readFileSync(
-        new URL("../conformance/a2a-tck-expected-failures.json", import.meta.url),
-        "utf8",
-      ),
-    );
-  if (!Array.isArray(allowlistValue)) throw new Error("Invalid A2A TCK expected-failure list");
-  const expected = allowlistValue
-    .map((item) => {
-      const entry = record(item);
-      if (typeof entry.requirement !== "string" || typeof entry.rationale !== "string")
-        throw new Error("Invalid A2A TCK expected-failure entry");
-      return entry.requirement;
-    })
-    .toSorted();
+    expected = profile.expectedFailures.map((entry) => entry.requirement).toSorted();
+  writeConformanceArtifact(sourceReport, summary, actual, expected);
   if (JSON.stringify(actual) !== JSON.stringify(expected))
     throw new Error(
       `A2A TCK failures changed\nexpected: ${expected.join(", ")}\nactual: ${actual.join(", ")}`,
     );
   console.log(`A2A TCK passed with ${actual.length} reviewed expected-failure groups`);
+}
+
+function writeConformanceArtifact(
+  sourceReport: string,
+  summary: Record<string, unknown>,
+  actual: string[],
+  expected: string[],
+) {
+  const output = process.env.A2A_TCK_REPORT_DIR ?? join(process.cwd(), "artifacts/a2a-tck");
+  mkdirSync(output, { recursive: true });
+  copyFileSync(sourceReport, join(output, "compatibility.json"));
+  const unexpected = actual.filter((requirement) => !expected.includes(requirement)),
+    stale = expected.filter((requirement) => !actual.includes(requirement)),
+    status = unexpected.length || stale.length ? "FAIL" : "PASS",
+    markdown = [
+      "# ASC A2A conformance",
+      "",
+      `- Profile: \`${profile.profile}\``,
+      `- Protocol: A2A \`${profile.protocolVersion}\``,
+      `- TCK revision: \`${profile.tckRevision}\``,
+      `- Result: **${status}**`,
+      `- Reviewed expected failures: ${expected.length}`,
+      `- Unexpected failures: ${unexpected.length}`,
+      `- Stale exceptions: ${stale.length}`,
+      "",
+      ...(unexpected.length ? ["## Unexpected failures", "", ...unexpected.map(listItem), ""] : []),
+      ...(stale.length ? ["## Stale exceptions", "", ...stale.map(listItem), ""] : []),
+    ].join("\n");
+  writeFileSync(join(output, "summary.md"), markdown);
+  writeFileSync(
+    join(output, "summary.json"),
+    `${JSON.stringify(
+      {
+        profile: profile.profile,
+        protocolVersion: profile.protocolVersion,
+        tckRevision: profile.tckRevision,
+        result: status,
+        expectedFailures: expected,
+        actualFailures: actual,
+        unexpectedFailures: unexpected,
+        staleExceptions: stale,
+        tckSummary: summary,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+function listItem(value: string) {
+  return `- \`${value}\``;
 }
 
 function startCodexEmulator(path: string) {
