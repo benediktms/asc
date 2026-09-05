@@ -6,6 +6,8 @@ import { controlCall, controlHandler } from "../../../packages/protocol-control/
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
 import { initFiles, Store } from "../../../packages/storage-sqlite/src/index";
 import {
+  CODEX_SERVER_REQUEST_METHODS,
+  CODEX_SERVER_REQUEST_POLICY_VERSION,
   CodexCallerAttestor,
   CodexRuntimeAdapter,
   SUPPORTED_CODEX_VERSIONS,
@@ -393,6 +395,12 @@ async function doctor() {
       deliveryReconciliation: "durable wake marker proven; absence remains operator-owned",
       approvalOwnership:
         "verified: user approvals remain TUI-owned; ACS never answers local-input requests",
+      serverRequestPolicy: {
+        version: CODEX_SERVER_REQUEST_POLICY_VERSION,
+        classifiedMethods: CODEX_SERVER_REQUEST_METHODS.length,
+        default: "unsupported-fail-closed",
+        answersServerRequests: false,
+      },
     },
     mutatingDeliveryEnabled: Boolean(
       runningCodexVersion &&

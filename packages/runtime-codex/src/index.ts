@@ -40,8 +40,18 @@ import {
   responseItem,
   supportsCodexVersion,
 } from "./protocol-codec";
+import {
+  CODEX_SERVER_REQUEST_METHODS,
+  CODEX_SERVER_REQUEST_POLICY_VERSION,
+  codexServerRequestPolicy,
+} from "./server-request-policy";
 
 export { SUPPORTED_CODEX_VERSIONS, TESTED_CODEX_VERSION } from "./protocol-codec";
+export {
+  CODEX_SERVER_REQUEST_METHODS,
+  CODEX_SERVER_REQUEST_POLICY_VERSION,
+  codexServerRequestPolicy,
+} from "./server-request-policy";
 
 export function codexVersion(value: string): string | undefined {
   return value.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.at(0);
@@ -120,6 +130,17 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private runtimeVersion?: string;
   private events: RuntimeEvent[] = [];
   private waiters: Array<() => void> = [];
+  private pendingServerRequests = new Map<
+    string,
+    {
+      readonly threadId?: string;
+      readonly turnId?: string;
+      readonly method: string;
+      readonly action: ReturnType<typeof codexServerRequestPolicy>["action"];
+      readonly kind: ReturnType<typeof codexServerRequestPolicy>["kind"];
+    }
+  >();
+  private serverRequestDiagnostics = new Map<string, RuntimeProbeResult["diagnostics"][number]>();
   private executions = new Map<
     string,
     {
@@ -153,6 +174,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       if (this.client !== client) return;
       this.client = undefined;
       this.runtimeVersion = undefined;
+      this.pendingServerRequests.clear();
       if (!this.stopped) this.emit({ type: "adapter.connection", state: "offline" });
     };
     try {
@@ -170,6 +192,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.client?.close();
     this.client = undefined;
     this.runtimeVersion = undefined;
+    this.pendingServerRequests.clear();
     this.wake();
   }
   async probe(signal?: AbortSignal): Promise<RuntimeProbeResult> {
@@ -206,6 +229,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
             message:
               "Codex queue input cannot preserve named tool-output provenance; wake requires explicit non-atomic policy.",
           },
+          {
+            severity: "info",
+            code: "CODEX_SERVER_REQUEST_OWNERSHIP",
+            message: `${CODEX_SERVER_REQUEST_POLICY_VERSION}: ${CODEX_SERVER_REQUEST_METHODS.length} methods classified; ASC answers none`,
+          },
+          ...this.serverRequestDiagnostics.values(),
         ],
       };
     } catch (error) {
@@ -378,6 +407,21 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           execution.session.opaqueId === request.target.session.opaqueId
         )
           return { outcome: "deferred", reason: "busy" };
+    if (request.mode === "wake_when_idle") {
+      const pending = [...this.pendingServerRequests.values()].find(
+        (item) => item.threadId === request.target.session.opaqueId,
+      );
+      if (pending) {
+        this.requireContext().logger.info("codex.delivery.blocked_by_server_request", {
+          bindingId: request.target.bindingId,
+          method: pending.method,
+          action: pending.action,
+          kind: pending.kind,
+          policyVersion: CODEX_SERVER_REQUEST_POLICY_VERSION,
+        });
+        return { outcome: "deferred", reason: "busy" };
+      }
+    }
     const snapshot = await this.inspectSession(request.target.session, signal);
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
     if (!supportsCodexVersion(this.runtimeVersion))
@@ -584,6 +628,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     for (const waiter of this.waiters.splice(0)) waiter();
   }
   private handleNotification(method: string, params: unknown) {
+    if (method === "serverRequest/resolved") {
+      const requestId = serverRequestId(params);
+      if (requestId !== undefined) this.pendingServerRequests.delete(requestId);
+    }
     if (method === "thread/status/changed" && isThreadStatusChanged(params)) {
       const session = {
         installationId: this.requireContext().installationId,
@@ -650,25 +698,58 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         });
         this.executions.delete(event.turn.id);
       }
+      for (const [requestId, pending] of this.pendingServerRequests)
+        if (pending.turnId === event.turn.id) this.pendingServerRequests.delete(requestId);
     }
   }
   private handleRequest(requestId: string, method: string, params: unknown) {
-    if (!isRuntimeInputRequest(params)) return;
-    const execution = this.executions.get(params.turnId);
+    const policy = codexServerRequestPolicy(method),
+      known = CODEX_SERVER_REQUEST_METHODS.includes(method),
+      context = serverRequestContext(params),
+      diagnosticMethod = safeDiagnosticMethod(method),
+      diagnosticLabel = JSON.stringify(diagnosticMethod),
+      blocking = method === "item/tool/requestUserInput" ? context.blocking : true,
+      diagnostic = {
+        severity: known ? ("warning" as const) : ("error" as const),
+        code: known ? "CODEX_SERVER_REQUEST_LOCAL_OWNER" : "CODEX_SERVER_REQUEST_UNKNOWN",
+        message: known
+          ? `${diagnosticLabel} is ${policy.action}; ASC did not answer`
+          : `Unknown Codex server request ${diagnosticLabel} was left unanswered`,
+        remediation: "Use the local Codex client to resolve the request; do not retry through ASC.",
+      };
+    if (!known) {
+      if (this.serverRequestDiagnostics.size >= 32) {
+        const oldest = this.serverRequestDiagnostics.keys().next().value;
+        if (oldest) this.serverRequestDiagnostics.delete(oldest);
+      }
+      this.serverRequestDiagnostics.set(`${diagnostic.code}:${diagnosticMethod}`, diagnostic);
+    }
+    this.requireContext().logger[known ? "info" : "warn"]("codex.server_request.observed", {
+      method: diagnosticMethod,
+      action: policy.action,
+      kind: policy.kind,
+      policyVersion: CODEX_SERVER_REQUEST_POLICY_VERSION,
+      answered: false,
+    });
+    if (policy.blocksExecution && context.threadId && blocking)
+      this.pendingServerRequests.set(requestId, {
+        threadId: context.threadId,
+        turnId: context.turnId,
+        method: diagnosticMethod,
+        action: policy.action,
+        kind: policy.kind,
+      });
+    if (!context.turnId) return;
+    const execution = this.executions.get(context.turnId);
     if (!execution) return;
     this.emit({
       type: "execution.awaiting-local-input",
-      execution: { opaqueId: params.turnId, session: execution.session },
+      execution: { opaqueId: context.turnId, session: execution.session },
       request: {
         opaqueId: requestId,
-        kind:
-          method === "item/tool/requestUserInput"
-            ? "question"
-            : method.endsWith("/requestApproval")
-              ? "approval"
-              : "unknown",
-        blocking: params.isBlocking !== false,
-        summary: "Local runtime input required",
+        kind: policy.kind,
+        blocking,
+        summary: localInputSummary(policy.kind),
       },
     });
   }
@@ -772,14 +853,43 @@ function isTurnStarted(value: unknown): value is { threadId: string; turn: { id:
   );
 }
 
-function isRuntimeInputRequest(value: unknown): value is { turnId: string; isBlocking?: boolean } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "turnId" in value &&
-    typeof value.turnId === "string" &&
-    (!("isBlocking" in value) || typeof value.isBlocking === "boolean")
-  );
+function serverRequestContext(value: unknown): {
+  readonly threadId?: string;
+  readonly turnId?: string;
+  readonly blocking: boolean;
+} {
+  if (!isRecord(value)) return { blocking: true };
+  return {
+    threadId: typeof value.threadId === "string" ? value.threadId : undefined,
+    turnId: typeof value.turnId === "string" ? value.turnId : undefined,
+    blocking: typeof value.isBlocking === "boolean" ? value.isBlocking : true,
+  };
+}
+
+function serverRequestId(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  return typeof value.requestId === "string" || typeof value.requestId === "number"
+    ? String(value.requestId)
+    : undefined;
+}
+
+function safeDiagnosticMethod(method: string) {
+  return method.replace(/[^\x20-\x7e]/g, "?").slice(0, 160);
+}
+
+function localInputSummary(kind: ReturnType<typeof codexServerRequestPolicy>["kind"]): string {
+  switch (kind) {
+    case "approval":
+      return "Local Codex approval required";
+    case "question":
+      return "Local Codex user input required";
+    case "elicitation":
+      return "Local MCP elicitation response required";
+    case "authentication":
+      return "Local Codex authentication required";
+    default:
+      return "Unsupported Codex request requires local resolution";
+  }
 }
 
 function appServerFailure(error: unknown): CodexAppServerFailureDto {

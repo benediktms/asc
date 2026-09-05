@@ -345,7 +345,7 @@ export interface RuntimeCorrelation {
 
 export interface LocalInputRequest {
   readonly opaqueId: string;
-  readonly kind: "approval" | "question" | "authentication" | "unknown";
+  readonly kind: "approval" | "question" | "elicitation" | "authentication" | "unknown";
   readonly blocking: boolean;
   readonly summary?: string;
   readonly expiresAt?: string;

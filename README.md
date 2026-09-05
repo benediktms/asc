@@ -63,6 +63,13 @@ client protocol, pass delivery probes, and preserve host-owned MCP thread
 metadata for normal and resumed threads. A real Codex `0.153.2` TUI and ACS
 client concurrently discovered the same thread and delivered lifecycle
 notifications through one Unix-socket app-server; reconnect behavior is covered
-by the adapter conformance suite. User-routed command approvals remain exclusive
-to the TUI. `requestUserInput` fans out to every subscribed client, but ACS never
-answers it, so a missing local owner fails closed.
+by the adapter conformance suite. Every server-request method in the pinned
+schema has an explicit ownership policy. User-routed command approvals remain
+exclusive to the TUI. `requestUserInput` fans out to every subscribed client,
+but ACS only projects its non-sensitive category and blocking state. It never
+answers Codex approvals, questions, authentication requests, MCP elicitations,
+or unknown requests, so a missing local owner fails closed.
+
+`acs_task_request_input` is different: it is an A2A task-state transition made
+by the assigned peer agent through the authenticated ACS protocol. It does not
+answer, proxy, or grant authority to any Codex-local server request.

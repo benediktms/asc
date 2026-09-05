@@ -314,6 +314,12 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     runningVersion: "0.153.2",
     compatibility: "tested",
   });
+  expect(record(diagnosis.phaseZero).serverRequestPolicy).toEqual({
+    version: "codex-server-request-ownership-v1",
+    classifiedMethods: 11,
+    default: "unsupported-fail-closed",
+    answersServerRequests: false,
+  });
 
   const streamingTask = record(
       record(
