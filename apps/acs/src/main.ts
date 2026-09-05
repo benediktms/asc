@@ -77,12 +77,16 @@ async function main() {
     return;
   }
   if (args[0] === "daemon" && args[1] === "run") return daemon();
-  if (args[0] === "daemon" && args[1] === "start") return daemonStart();
+  if (args[0] === "daemon" && args[1] === "start") {
+    await daemonStart();
+    process.exit(0);
+  }
   if (args[0] === "daemon" && args[1] === "status") return daemonStatus();
   if (args[0] === "daemon" && args[1] === "stop") return daemonStop();
   if (args[0] === "daemon" && args[1] === "restart") {
     await daemonStop();
-    return daemonStart();
+    await daemonStart();
+    process.exit(0);
   }
   if (args[0] === "mcp" && args[1] === "codex") return runMcp(port);
   if (args[0] === "codex" && args[1] === "doctor") return doctor();
