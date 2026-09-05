@@ -32,7 +32,12 @@ export class CodexAppServerClient {
   private nextId = 1;
   private pending = new Map<
     RpcId,
-    { resolve(value: unknown): void; reject(error: Error): void; timer: Timer }
+    {
+      resolve(value: unknown): void;
+      reject(error: Error): void;
+      timer: Timer;
+      cleanup?: () => void;
+    }
   >();
   private bytes = Buffer.alloc(0);
   private upgraded = false;
@@ -66,34 +71,38 @@ export class CodexAppServerClient {
     return { userAgent: stringField(initialized, "userAgent") };
   }
 
-  async loadedThreads(cursor: string | null = null) {
-    const response = record(await this.request("thread/loaded/list", { cursor, limit: 100 }));
+  async loadedThreads(cursor: string | null = null, signal?: AbortSignal) {
+    const response = record(
+      await this.request("thread/loaded/list", { cursor, limit: 100 }, undefined, signal),
+    );
     return {
       data: stringArray(response.data),
       nextCursor: nullableString(response.nextCursor),
     };
   }
-  async listThreads(params: ThreadListParams = {}) {
-    const response = record(await this.request("thread/list", params));
+  async listThreads(params: ThreadListParams = {}, signal?: AbortSignal) {
+    const response = record(await this.request("thread/list", params, undefined, signal));
     if (!Array.isArray(response.data)) throw new Error("invalid app-server thread list");
     return {
       data: response.data.map(decodeThread),
       nextCursor: nullableString(response.nextCursor),
     };
   }
-  async readThread(params: ThreadReadParams) {
-    const response = record(await this.request("thread/read", params));
+  async readThread(params: ThreadReadParams, signal?: AbortSignal) {
+    const response = record(await this.request("thread/read", params, undefined, signal));
     return { thread: decodeThread(response.thread) };
   }
-  async findDeliveryMarker(threadId: string, deliveryId: string) {
-    const response = record(await this.request("thread/read", { threadId, includeTurns: true }));
+  async findDeliveryMarker(threadId: string, deliveryId: string, signal?: AbortSignal) {
+    const response = record(
+      await this.request("thread/read", { threadId, includeTurns: true }, undefined, signal),
+    );
     return findDeliveryMarker(response.thread, deliveryId);
   }
   async startThread(params: ThreadStartParams) {
     return record(await this.request("thread/start", params));
   }
-  async resumeThread(threadId: string): Promise<void> {
-    await this.request("thread/resume", { threadId, excludeTurns: true });
+  async resumeThread(threadId: string, signal?: AbortSignal): Promise<void> {
+    await this.request("thread/resume", { threadId, excludeTurns: true }, undefined, signal);
   }
   async deleteThread(threadId: string): Promise<void> {
     await this.request("thread/delete", { threadId });
@@ -101,33 +110,57 @@ export class CodexAppServerClient {
   async injectItems(
     params: ThreadInjectItemsParams,
     markRequestFlushed?: () => void,
+    signal?: AbortSignal,
   ): Promise<void> {
-    await this.request("thread/inject_items", params, markRequestFlushed);
+    await this.request("thread/inject_items", params, markRequestFlushed, signal);
   }
-  async startTurn(params: TurnStartParams, markRequestFlushed?: () => void) {
-    const response = record(await this.request("turn/start", params, markRequestFlushed)),
+  async startTurn(params: TurnStartParams, markRequestFlushed?: () => void, signal?: AbortSignal) {
+    const response = record(await this.request("turn/start", params, markRequestFlushed, signal)),
       turn = record(response.turn);
     return { turn: { id: stringField(turn, "id") } };
   }
-  async interruptTurn(threadId: string, turnId: string): Promise<void> {
-    await this.request("turn/interrupt", { threadId, turnId });
+  async interruptTurn(threadId: string, turnId: string, signal?: AbortSignal): Promise<void> {
+    await this.request("turn/interrupt", { threadId, turnId }, () => {}, signal);
   }
 
   async request(
     method: string,
     params: unknown,
     markRequestFlushed?: () => void,
+    signal?: AbortSignal,
   ): Promise<unknown> {
+    signal?.throwIfAborted();
     if (!this.upgraded) throw new Error("app-server client is not connected");
     if (this.pending.size >= this.maxInFlightRequests)
       throw new Error("app-server overloaded: maximum in-flight requests reached");
     const id = this.nextId++;
     const promise = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        pending?.cleanup?.();
         this.pending.delete(id);
         reject(new Error(`app-server timeout: ${method}`));
       }, this.timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      const abort = () => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        pending.cleanup?.();
+        this.pending.delete(id);
+        reject(
+          markRequestFlushed
+            ? new Error("app-server request aborted after write")
+            : abortError(signal),
+        );
+      };
+      this.pending.set(id, {
+        resolve,
+        reject,
+        timer,
+        cleanup: signal ? () => signal.removeEventListener("abort", abort) : undefined,
+      });
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
     });
     try {
       markRequestFlushed?.();
@@ -135,6 +168,7 @@ export class CodexAppServerClient {
     } catch (error) {
       const pending = this.pending.get(id);
       if (pending) clearTimeout(pending.timer);
+      pending?.cleanup?.();
       this.pending.delete(id);
       throw error;
     }
@@ -303,6 +337,7 @@ export class CodexAppServerClient {
       if (!pending) return;
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
+      pending.cleanup?.();
       if (message.error)
         pending.reject(
           Object.assign(new Error(message.error.message), {
@@ -320,10 +355,17 @@ export class CodexAppServerClient {
   private failPending(error: Error) {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      pending.cleanup?.();
       pending.reject(error);
     }
     this.pending.clear();
   }
+}
+
+function abortError(signal: AbortSignal | undefined) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Aborted", "AbortError");
 }
 
 function record(value: unknown): Record<string, unknown> {

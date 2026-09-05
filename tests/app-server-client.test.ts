@@ -22,7 +22,8 @@ describe("Codex app-server transport", () => {
     const root = mkdtempSync(join(tmpdir(), "acs-codex-"));
     roots.push(root);
     const path = join(root, "app.sock");
-    let received = "";
+    let received = "",
+      respond = true;
     const server = Bun.listen({
       unix: path,
       socket: {
@@ -51,6 +52,7 @@ describe("Codex app-server transport", () => {
           received = Buffer.from(
             payload.map((value, index) => value ^ byte(mask, index % 4)),
           ).toString();
+          if (!respond) return;
           const request = JSON.parse(received),
             body = Buffer.from(
               JSON.stringify({
@@ -68,6 +70,17 @@ describe("Codex app-server transport", () => {
     const initialized = await client.start();
     expect(received).not.toContain("jsonrpc");
     expect(initialized.userAgent).toBe("fake");
+    respond = false;
+    const abort = new AbortController(),
+      pending = client.request("thread/list", {}, undefined, abort.signal);
+    abort.abort();
+    await expect(pending).rejects.toThrow(/operation was aborted/i);
+    let flushed = 0;
+    const writeAbort = new AbortController(),
+      write = client.request("thread/inject_items", {}, () => flushed++, writeAbort.signal);
+    writeAbort.abort();
+    await expect(write).rejects.toThrow("app-server request aborted after write");
+    expect(flushed).toBe(1);
     client.close();
     server.stop();
   });

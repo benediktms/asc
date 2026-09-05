@@ -20,7 +20,7 @@ type Fixture = {
   adapter: RuntimeAdapter;
   context: RuntimeAdapterContext;
   methods: string[];
-  failNext(method: string, failure: "overload" | "disconnect"): void;
+  failNext(method: string, failure: "overload" | "disconnect" | "hang"): void;
   disconnect(): void;
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
@@ -245,6 +245,37 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       await adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
+
+    test("honors aborts without hiding an ambiguous write", async () => {
+      const fixture = await create(),
+        { adapter, context, methods } = fixture;
+      await adapter.start(context);
+
+      fixture.failNext("thread/read", "hang");
+      const readAbort = new AbortController(),
+        read = adapter.inspectSession(delivery().target.session, readAbort.signal);
+      readAbort.abort();
+      await expect(read).rejects.toThrow(/operation was aborted/i);
+
+      fixture.failNext("thread/inject_items", "hang");
+      let flushes = 0;
+      const writeAbort = new AbortController(),
+        write = adapter.deliver(
+          { ...delivery(), markRequestFlushed: () => flushes++ },
+          writeAbort.signal,
+        );
+      for (let index = 0; index < 100 && !methods.includes("thread/inject_items"); index++)
+        await Bun.sleep(1);
+      expect(methods).toContain("thread/inject_items");
+      writeAbort.abort();
+      expect(await write).toMatchObject({
+        outcome: "acceptance-unknown",
+        ambiguity: "connection-reset",
+      });
+      expect(flushes).toBe(1);
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
   });
 }
 
@@ -274,7 +305,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
   const path = join(root, "codex.sock"),
     methods: string[] = [],
     buffers = new WeakMap<object, Buffer>(),
-    failures = new Map<string, "overload" | "disconnect">();
+    failures = new Map<string, "overload" | "disconnect" | "hang">();
   let fence = true,
     historyDelivery: string | undefined,
     status = "idle";
@@ -316,6 +347,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
           methods.push(method);
           const failure = failures.get(method);
           failures.delete(method);
+          if (failure === "hang") continue;
           if (failure === "disconnect") {
             socket.end();
             return;

@@ -129,11 +129,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.runtimeVersion = undefined;
     this.wake();
   }
-  async probe(): Promise<RuntimeProbeResult> {
+  async probe(signal?: AbortSignal): Promise<RuntimeProbeResult> {
     this.assertRunning();
+    signal?.throwIfAborted();
     try {
       if (!this.client) throw new Error("adapter not started");
-      await this.client.listThreads({ limit: 1, useStateDbOnly: true });
+      await this.client.listThreads({ limit: 1, useStateDbOnly: true }, signal);
       if (this.runtimeVersion !== TESTED_CODEX_VERSION)
         return {
           state: "incompatible",
@@ -163,6 +164,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         ],
       };
     } catch (error) {
+      if (signal?.aborted) throw error;
       return {
         state: "unavailable",
         observedAt: new Date().toISOString(),
@@ -177,25 +179,35 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     }
   }
-  async listSessions(query: RuntimeSessionQuery): Promise<RuntimeSessionPage> {
+  async listSessions(
+    query: RuntimeSessionQuery,
+    signal?: AbortSignal,
+  ): Promise<RuntimeSessionPage> {
     this.assertRunning();
+    signal?.throwIfAborted();
     const client = this.requireClient(),
-      loaded = await client.loadedThreads(),
-      page = await client.listThreads({
-        cursor: query.cursor,
-        limit: Math.min(query.limit ?? 50, 100),
-        searchTerm: query.text,
-        useStateDbOnly: true,
-      }),
+      loaded = await client.loadedThreads(null, signal),
+      page = await client.listThreads(
+        {
+          cursor: query.cursor,
+          limit: Math.min(query.limit ?? 50, 100),
+          searchTerm: query.text,
+          useStateDbOnly: true,
+        },
+        signal,
+      ),
       stored = new Set(page.data.map((thread) => thread.id)),
       loadedSnapshots = await Promise.all(
         loaded.data
           .filter((threadId) => !stored.has(threadId))
           .map((threadId) =>
-            this.inspectSession({
-              installationId: this.requireContext().installationId,
-              opaqueId: threadId,
-            }),
+            this.inspectSession(
+              {
+                installationId: this.requireContext().installationId,
+                opaqueId: threadId,
+              },
+              signal,
+            ),
           ),
       );
     let sessions = [
@@ -221,16 +233,23 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       );
     return { sessions, nextCursor: page.nextCursor ?? undefined };
   }
-  async inspectSession(session: RuntimeSessionRef): Promise<RuntimeSessionSnapshot> {
+  async inspectSession(
+    session: RuntimeSessionRef,
+    signal?: AbortSignal,
+  ): Promise<RuntimeSessionSnapshot> {
     this.assertRunning();
+    signal?.throwIfAborted();
     return telemetry.trace("runtime.inspect", async () => {
       try {
         return this.snapshot(
           (
-            await this.requireClient().readThread({
-              threadId: session.opaqueId,
-              includeTurns: false,
-            })
+            await this.requireClient().readThread(
+              {
+                threadId: session.opaqueId,
+                includeTurns: false,
+              },
+              signal,
+            )
           ).thread,
         );
       } catch (error: unknown) {
@@ -266,8 +285,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       });
     }
   }
-  async deliver(request: RuntimeDeliveryRequest): Promise<RuntimeDeliveryResult> {
+  async deliver(
+    request: RuntimeDeliveryRequest,
+    signal?: AbortSignal,
+  ): Promise<RuntimeDeliveryResult> {
     this.assertRunning();
+    signal?.throwIfAborted();
     if (!this.supports(request.envelope))
       return { outcome: "rejected", reason: "unsupported-content", retryable: false };
     if (request.deadline && Date.parse(request.deadline) <= Date.now())
@@ -279,7 +302,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     if (request.mode === "join_active")
       return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
-    const snapshot = await this.inspectSession(request.target.session);
+    const snapshot = await this.inspectSession(request.target.session, signal);
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
@@ -308,6 +331,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
             items: [jsonValue(JSON.stringify(this.responseItem(request.envelope)))],
           },
           request.markRequestFlushed,
+          signal,
         );
         return {
           outcome: "accepted",
@@ -315,7 +339,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           evidence: { scheme: "codex.thread-inject-items.v1", value: request.deliveryId },
         };
       }
-      await this.requireClient().resumeThread(request.target.session.opaqueId);
+      await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
       const response = await this.requireClient().startTurn(
         {
           threadId: request.target.session.opaqueId,
@@ -328,6 +352,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           },
         },
         request.markRequestFlushed,
+        signal,
       );
       this.executions.set(response.turn.id, {
         deliveryId: request.deliveryId,
@@ -343,7 +368,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     } catch (error: unknown) {
       const message = errorMessage(error);
-      if (/timeout|connection closed|reset/i.test(message))
+      if (signal?.aborted && !/aborted after write/i.test(message)) throw error;
+      if (/timeout|connection closed|reset|aborted after write/i.test(message))
         return {
           outcome: "acceptance-unknown",
           ambiguity: "connection-reset",
@@ -361,8 +387,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     }
   }
-  async reconcile(request: RuntimeReconcileRequest): Promise<RuntimeReconcileResult> {
+  async reconcile(
+    request: RuntimeReconcileRequest,
+    signal?: AbortSignal,
+  ): Promise<RuntimeReconcileResult> {
     this.assertRunning();
+    signal?.throwIfAborted();
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)
       return {
         outcome: "inconclusive",
@@ -379,6 +409,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       const marker = await this.requireClient().findDeliveryMarker(
         request.target.session.opaqueId,
         request.deliveryId,
+        signal,
       );
       return marker
         ? {
@@ -395,6 +426,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
             operatorActionRequired: true,
           };
     } catch (error: unknown) {
+      if (signal?.aborted) throw error;
       return {
         outcome: "inconclusive",
         reason: errorMessage(error),
@@ -402,8 +434,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     }
   }
-  async cancel(request: RuntimeCancelRequest): Promise<RuntimeCancelResult> {
+  async cancel(request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
     this.assertRunning();
+    signal?.throwIfAborted();
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (!this.executions.has(request.execution.opaqueId))
@@ -417,6 +450,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       await this.requireClient().interruptTurn(
         request.execution.session.opaqueId,
         request.execution.opaqueId,
+        signal,
       );
       return { outcome: "accepted", acceptedAt: new Date().toISOString() };
     } catch (error: unknown) {
