@@ -372,7 +372,15 @@ describe("durable acceptance", () => {
     store.db
       .query("UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?")
       .run(first.id, first.epoch, accepted.deliveryId);
-    const rebound = store.bind(target.id, "new-thread");
+    expect(() => store.bind(target.id, "new-thread")).toThrow("BINDING_CONFLICT");
+    const rebound = store.bind(target.id, "new-thread", { revokeExisting: true });
+    expect(
+      store.db
+        .query<{ disabled_at_ms: number | null }, [string]>(
+          "SELECT disabled_at_ms FROM principals WHERE id=?",
+        )
+        .get(first.principalId)?.disabled_at_ms,
+    ).toBeNumber();
     expect(
       store.db
         .query<{ pinned_binding_id: string; pinned_binding_epoch: number }, [string]>(

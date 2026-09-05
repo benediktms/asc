@@ -36,7 +36,11 @@ describe("control protocol", () => {
       };
     };
     const handler = controlHandler(store, new Date().toISOString(), () => {}, adapter),
-      token = readFileSync(paths.token, "utf8");
+      token = readFileSync(paths.token, "utf8"),
+      installation = required(
+        store.db.query<{ id: string }, []>("SELECT id FROM runtime_installations LIMIT 1").get(),
+        "installation",
+      );
     const call = async (method: string, params: unknown, version = "1", bearer = token) =>
       handler(
         new Request("http://localhost", {
@@ -50,9 +54,33 @@ describe("control protocol", () => {
         }),
       );
     expect((await call("agents.create", { slug: "backend" })).status).toBe(200);
-    expect((await call("bindings.bind", { agent: "backend", session: "thread-1" })).status).toBe(
-      200,
-    );
+    expect(
+      await (
+        await call("bindings.bind", {
+          agent: "backend",
+          installationId: installation.id,
+          session: { installationId: installation.id, opaqueId: "thread-1" },
+          continuityPolicy: "strict",
+          deliveryPolicy: { wakeStrategy: "disabled", interruptOnCancel: false },
+        })
+      ).json(),
+    ).toMatchObject({
+      result: {
+        binding: {
+          continuityPolicy: "strict",
+          deliveryPolicy: { wakeStrategy: "disabled", interruptOnCancel: false },
+        },
+      },
+    });
+    expect(
+      await (
+        await call("bindings.bind", {
+          agent: "backend",
+          installationId: "ins_wrong",
+          session: "thread-2",
+        })
+      ).json(),
+    ).toMatchObject({ error: { data: { code: "BINDING_CONFLICT" } } });
     expect(inspected).toEqual(["thread-1"]);
     expect((await call("agents.list", {}, "2")).status).toBe(426);
     expect(
@@ -115,7 +143,7 @@ describe("control protocol", () => {
     expect(slugs((await call("agents.list", { skill: "data" })).items)).toEqual(["delta"]);
 
     store.bind(beta.id, "beta-old");
-    const betaBinding = store.bind(beta.id, "beta-current"),
+    const betaBinding = store.bind(beta.id, "beta-current", { revokeExisting: true }),
       activeBindings = await call("bindings.list", { agent: "beta", status: ["active"] });
     expect(activeBindings.items.map((item) => item.id)).toEqual([betaBinding.id]);
 

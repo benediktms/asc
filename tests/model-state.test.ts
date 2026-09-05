@@ -106,7 +106,7 @@ describe("reference state models", () => {
         activeId = null;
       } else {
         expectedEpoch++;
-        activeId = store.bind(agent.id, `model-thread-${step}`).id;
+        activeId = store.bind(agent.id, `model-thread-${step}`, { revokeExisting: true }).id;
       }
       const rows = store.db
           .query<{ id: string; epoch: number; status: string }, [string]>(

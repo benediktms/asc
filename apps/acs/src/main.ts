@@ -86,8 +86,18 @@ async function main() {
     return print(
       await call("bindings.bind", {
         agent: required(args[2], "agent"),
-        session: { installationId: "local", opaqueId: required(option("--session"), "--session") },
-        allowNonAtomicWake: args.includes("--allow-non-atomic-wake"),
+        session: required(option("--session"), "--session"),
+        continuityPolicy: option("--continuity") ?? "follow-pending",
+        deliveryPolicy: {
+          wakeStrategy:
+            args.includes("--allow-non-atomic-wake") || settings.codex.allowNonAtomicWake
+              ? "non-atomic-idle-check"
+              : "atomic-only",
+          allowActiveTurnSteering: settings.codex.allowActiveTurnSteering,
+          autoResumeDormantThread: settings.codex.autoResumeDormantThreads,
+          interruptOnCancel: true,
+        },
+        revokeExisting: args.includes("--revoke-existing"),
       }),
     );
   if (args[0] === "bindings" && args[1] === "list") return print(await call("bindings.list"));
@@ -259,7 +269,7 @@ async function doctor() {
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|update|delete <agent>\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--allow-non-atomic-wake]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --as <resolution>\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|update|delete <agent>\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --as <resolution>\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 

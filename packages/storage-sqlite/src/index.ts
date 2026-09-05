@@ -514,29 +514,65 @@ export class Store {
       .query<AgentRow, []>("SELECT * FROM agents WHERE deleted_at_ms IS NULL ORDER BY slug")
       .all();
   }
-  bind(agentValue: string, sessionId: string, allowNonAtomicWake = false) {
+  bind(
+    agentValue: string,
+    sessionId: string,
+    options: {
+      continuityPolicy?: "follow-pending" | "strict";
+      deliveryPolicy?: Partial<{
+        wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
+        allowActiveTurnSteering: boolean;
+        autoResumeDormantThread: boolean;
+        interruptOnCancel: boolean;
+      }>;
+      revokeExisting?: boolean;
+    } = {},
+  ) {
     const agent = this.agent(agentValue);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
     const installation = must(
-      this.db
-        .query<{ id: RuntimeInstallationId }, []>(
-          "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-        )
-        .get(),
-      "STORAGE_CORRUPT: runtime installation missing",
-    );
-    const now = Date.now(),
-      bindingId = id("bnd"),
-      epoch =
-        (must(
-          this.db
-            .query<{ value: number | null }, [`agt_${string}`]>(
-              "SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?",
-            )
-            .get(agent.id),
-          "STORAGE_CORRUPT: binding epoch query failed",
-        ).value ?? 0) + 1;
+        this.db
+          .query<{ id: RuntimeInstallationId }, []>(
+            "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+          )
+          .get(),
+        "STORAGE_CORRUPT: runtime installation missing",
+      ),
+      policy = {
+        wakeStrategy: options.deliveryPolicy?.wakeStrategy ?? "atomic-only",
+        allowActiveTurnSteering: options.deliveryPolicy?.allowActiveTurnSteering ?? false,
+        autoResumeDormantThread: options.deliveryPolicy?.autoResumeDormantThread ?? false,
+        interruptOnCancel: options.deliveryPolicy?.interruptOnCancel ?? true,
+      };
     return this.write(() => {
+      const active = this.db
+        .query<{ id: BindingId }, [`agt_${string}`]>(
+          "SELECT id FROM runtime_bindings WHERE agent_id=? AND status='active'",
+        )
+        .get(agent.id);
+      if (active && !options.revokeExisting) throw new Error("BINDING_CONFLICT");
+      const sessionOwner = this.db
+        .query<{ agent_id: `agt_${string}` }, [RuntimeInstallationId, string]>(
+          "SELECT agent_id FROM runtime_bindings WHERE installation_id=? AND session_opaque_id=? AND status='active'",
+        )
+        .get(installation.id, sessionId);
+      if (sessionOwner && sessionOwner.agent_id !== agent.id) throw new Error("BINDING_CONFLICT");
+      const now = Date.now(),
+        bindingId = id("bnd"),
+        epoch =
+          (must(
+            this.db
+              .query<{ value: number | null }, [`agt_${string}`]>(
+                "SELECT max(epoch) value FROM runtime_bindings WHERE agent_id=?",
+              )
+              .get(agent.id),
+            "STORAGE_CORRUPT: binding epoch query failed",
+          ).value ?? 0) + 1;
+      this.db
+        .query(
+          "UPDATE principals SET disabled_at_ms=? WHERE binding_id IN (SELECT id FROM runtime_bindings WHERE agent_id=? AND status='active') AND disabled_at_ms IS NULL",
+        )
+        .run(now, agent.id);
       this.db
         .query(
           "UPDATE runtime_bindings SET status='revoked',revoked_at_ms=?,revocation_reason='rebound' WHERE agent_id=? AND status='active'",
@@ -544,7 +580,7 @@ export class Store {
         .run(now, agent.id);
       this.db
         .query(
-          "INSERT INTO runtime_bindings(id,agent_id,installation_id,session_opaque_id,epoch,status,continuity_policy,delivery_policy_json,created_at_ms,activated_at_ms) VALUES(?,?,?,?,?,'active','follow-pending',?,?,?)",
+          "INSERT INTO runtime_bindings(id,agent_id,installation_id,session_opaque_id,epoch,status,continuity_policy,delivery_policy_json,created_at_ms,activated_at_ms) VALUES(?,?,?,?,?,'active',?,?,?,?)",
         )
         .run(
           bindingId,
@@ -552,12 +588,8 @@ export class Store {
           installation.id,
           sessionId,
           epoch,
-          JSON.stringify({
-            wakeStrategy: allowNonAtomicWake ? "non-atomic-idle-check" : "atomic-only",
-            allowActiveTurnSteering: false,
-            autoResumeDormantThread: false,
-            interruptOnCancel: true,
-          }),
+          options.continuityPolicy ?? "follow-pending",
+          JSON.stringify(policy),
           now,
           now,
         );

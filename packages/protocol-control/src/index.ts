@@ -39,7 +39,6 @@ const partSchema = z.discriminatedUnion("kind", [
   paramsSchema = z.looseObject({
     agent: z.string().optional(),
     availability: z.array(z.string()).optional(),
-    allowNonAtomicWake: z.boolean().optional(),
     artifacts: z.array(artifactSchema).optional(),
     bindingId: z.string().optional(),
     claimCode: z.string().optional(),
@@ -47,13 +46,23 @@ const partSchema = z.discriminatedUnion("kind", [
     cursor: z.string().optional(),
     deliveryId: z.string().optional(),
     description: z.string().optional(),
+    deliveryPolicy: z
+      .object({
+        wakeStrategy: z.enum(["atomic-only", "non-atomic-idle-check", "disabled"]).optional(),
+        allowActiveTurnSteering: z.boolean().optional(),
+        autoResumeDormantThread: z.boolean().optional(),
+        interruptOnCancel: z.boolean().optional(),
+      })
+      .optional(),
     displayName: z.string().optional(),
     enabled: z.boolean().optional(),
     evidence: z
       .looseObject({ metadata: z.looseObject({ threadId: z.unknown() }).optional() })
       .optional(),
+    installationId: z.string().optional(),
     question: z.string().optional(),
     reason: z.string().optional(),
+    revokeExisting: z.boolean().optional(),
     state: z.array(z.string()).optional(),
     states: z.array(z.string()).optional(),
     status: z.array(z.string()).optional(),
@@ -62,10 +71,16 @@ const partSchema = z.discriminatedUnion("kind", [
       .optional(),
     retryable: z.boolean().optional(),
     blocking: z.boolean().optional(),
-    session: z.union([z.string(), z.object({ opaqueId: z.string() })]).optional(),
+    session: z
+      .union([
+        z.string(),
+        z.object({ installationId: z.string().optional(), opaqueId: z.string() }),
+      ])
+      .optional(),
     skill: z.string().optional(),
     slug: z.string().optional(),
     summary: z.string().optional(),
+    continuityPolicy: z.enum(["follow-pending", "strict"]).optional(),
     targetAgent: z.string().optional(),
     text: z.string().optional(),
     parts: z.array(partSchema).optional(),
@@ -247,7 +262,10 @@ export function controlHandler(
           admin(principal.kind);
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const session = required(p.session, "session"),
-            sessionId = typeof session === "string" ? session : session.opaqueId;
+            sessionId = typeof session === "string" ? session : session.opaqueId,
+            requestedInstallation =
+              p.installationId ??
+              (typeof session === "string" ? undefined : session.installationId);
           const bindInstallation = required(
             store.db
               .query<{ id: RuntimeInstallationId }, []>(
@@ -256,6 +274,8 @@ export function controlHandler(
               .get(),
             "runtime installation",
           );
+          if (requestedInstallation && requestedInstallation !== bindInstallation.id)
+            throw new Error("BINDING_CONFLICT: runtime installation mismatch");
           if (
             (
               await adapter.inspectSession({
@@ -265,11 +285,11 @@ export function controlHandler(
             ).availability === "offline"
           )
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
-          const createdBinding = store.bind(
-            required(p.agent, "agent"),
-            sessionId,
-            Boolean(p.allowNonAtomicWake),
-          );
+          const createdBinding = store.bind(required(p.agent, "agent"), sessionId, {
+            continuityPolicy: p.continuityPolicy,
+            deliveryPolicy: p.deliveryPolicy,
+            revokeExisting: p.revokeExisting,
+          });
           audit("binding.bind", "binding", createdBinding.id);
           return ok(rpc.id, { binding: bindingDto(createdBinding, store) });
         case "bindings.claim": {
