@@ -124,6 +124,9 @@ export function loadConfig(path = configPath()): AcsConfig {
     listen = process.env.ACS_A2A_PORT
       ? `127.0.0.1:${positive(Number(process.env.ACS_A2A_PORT), "ACS_A2A_PORT")}`
       : configuredListen,
+    controlSocket = socketPath(
+      process.env.ACS_CONTROL_SOCKET ?? auto(string(daemon.control_socket, "auto"), runtime),
+    ),
     defaultMode = string(delivery.default_mode, "wake_when_idle"),
     durability = string(storage.durability, "balanced");
   parseListen(listen);
@@ -136,8 +139,7 @@ export function loadConfig(path = configPath()): AcsConfig {
   return {
     daemon: {
       a2aListen: listen,
-      controlSocket:
-        process.env.ACS_CONTROL_SOCKET ?? auto(string(daemon.control_socket, "auto"), runtime),
+      controlSocket,
       logLevel: process.env.ACS_LOG_LEVEL ?? string(daemon.log_level, "info"),
       logFormat: string(daemon.log_format, "pretty"),
     },
@@ -246,6 +248,12 @@ function boolean(value: unknown, fallback: boolean) {
 function positive(value: number, name: string) {
   if (!Number.isInteger(value) || value <= 0 || value > 1_000_000_000)
     throw new Error(`VALIDATION_FAILED: invalid ${name}`);
+  return value;
+}
+function socketPath(value: string) {
+  const maxBytes = process.platform === "linux" ? 107 : 103;
+  if (Buffer.byteLength(value) > maxBytes)
+    throw new Error(`VALIDATION_FAILED: daemon.control_socket exceeds ${maxBytes} bytes`);
   return value;
 }
 function auto(value: string, fallback: string) {

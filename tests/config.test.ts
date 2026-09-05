@@ -28,5 +28,7 @@ describe("configuration", () => {
     expect(() => loadConfig(path)).toThrow("unknown daemon.unknown");
     writeFileSync(path, '[daemon]\na2a_listen = "0.0.0.0:9000"\n');
     expect(() => loadConfig(path)).toThrow("loopback");
+    writeFileSync(path, `[daemon]\ncontrol_socket = "/${"x".repeat(200)}"\n`);
+    expect(() => loadConfig(path)).toThrow("daemon.control_socket exceeds");
   });
 });
