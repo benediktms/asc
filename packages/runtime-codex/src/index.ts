@@ -39,7 +39,6 @@ import {
   CODEX_COMPATIBILITY_PROFILES,
   profileCapabilities,
   selectCodexCompatibility,
-  TESTED_CODEX_VERSION,
   type CodexCompatibilitySelection,
 } from "./compatibility";
 import { createCodexProtocolCodec, jsonValue } from "./protocol-codec";
@@ -50,8 +49,13 @@ export {
   selectCodexCompatibility,
   SUPPORTED_CODEX_VERSIONS,
   TESTED_CODEX_VERSION,
+  validateCodexCompatibilityManifest,
 } from "./compatibility";
-export type { CodexCompatibilityProfile, CodexCompatibilitySelection } from "./compatibility";
+export type {
+  CodexCompatibilityManifest,
+  CodexCompatibilityProfile,
+  CodexCompatibilitySelection,
+} from "./compatibility";
 export type { CodexProtocolCodec } from "./protocol-codec";
 
 export function codexVersion(value: string): string | undefined {
@@ -64,8 +68,7 @@ export class CodexCallerAttestor implements RuntimeCallerAttestor {
   readonly schemes = [this.scheme];
   constructor(
     private installationId: RuntimeInstallationId,
-    private compatibility: () => CodexCompatibilitySelection = () =>
-      selectCodexCompatibility(TESTED_CODEX_VERSION),
+    private compatibility: () => CodexCompatibilitySelection,
   ) {}
   async attest(evidence: HostInvocationEvidence): Promise<CallerAttestationResult> {
     if (evidence.harnessId !== this.harnessId)

@@ -62,6 +62,7 @@ try {
   for (const file of [
     "ClientRequest.json",
     "ServerNotification.json",
+    "ServerRequest.json",
     "v1/InitializeParams.json",
     "v1/InitializeResponse.json",
     "v2/ThreadInjectItemsParams.json",

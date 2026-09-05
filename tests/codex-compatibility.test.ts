@@ -4,7 +4,9 @@ import {
   CODEX_PROTOCOL_FINGERPRINT,
   CodexCallerAttestor,
   selectCodexCompatibility,
+  validateCodexCompatibilityManifest,
 } from "../packages/runtime-codex/src/index";
+import manifest from "../packages/runtime-codex/profiles/compatibility-manifest.json" with { type: "json" };
 import { createCodexProtocolCodec } from "../packages/runtime-codex/src/protocol-codec";
 
 const callerEvidence = (metadata?: Readonly<Record<string, unknown>>) => ({
@@ -24,7 +26,11 @@ describe("Codex compatibility profiles", () => {
   });
 
   test("does not authorize an unreviewed build with the same schema", () => {
-    expect(selectCodexCompatibility("0.154.0")).toMatchObject({
+    expect(selectCodexCompatibility("0.154.0")).toEqual({
+      state: "incompatible",
+      reason: "unknown-schema",
+    });
+    expect(selectCodexCompatibility("0.154.0", CODEX_PROTOCOL_FINGERPRINT)).toMatchObject({
       state: "candidate-compatible",
       reason: "unreviewed-version",
     });
@@ -47,8 +53,33 @@ describe("Codex compatibility profiles", () => {
     expect(codec.normalizeStatus({ type: "future-state" })).toBe("unknown");
     expect(codec.parseHistoryMarker('{"deliveryId":"int_1"}', "int_1")).toBe(true);
     expect(codec.parseHistoryMarker("not-json", "int_1")).toBe(false);
-    expect(codec.validateRequest("thread/read", { threadId: "thread-1" })).toBe(true);
-    expect(codec.validateRequest("thread/read", null)).toBe(false);
+  });
+
+  test("rejects missing capability and version evidence", () => {
+    const missingCatalog = {
+      ...structuredClone(manifest),
+      evidence: Object.fromEntries(
+        Object.entries(manifest.evidence).filter(([id]) => id !== "real-model-root"),
+      ),
+    };
+    expect(validateCodexCompatibilityManifest(missingCatalog)).toEqual(
+      expect.arrayContaining([expect.stringContaining("missing evidence real-model-root")]),
+    );
+    const missingCapabilityEvidence = structuredClone(manifest);
+    const capabilityProfile = missingCapabilityEvidence.profiles[0],
+      appendContext = capabilityProfile?.capabilities.appendContext;
+    if (!appendContext) throw new Error("missing test capability");
+    appendContext.evidence = [];
+    expect(validateCodexCompatibilityManifest(missingCapabilityEvidence)).toContain(
+      "codex-app-server-v1.appendContext has no evidence",
+    );
+    const missingVersion = structuredClone(manifest);
+    const profile = missingVersion.profiles[0];
+    if (!profile) throw new Error("missing test profile");
+    profile.versionEvidence["0.153.2"] = [];
+    expect(validateCodexCompatibilityManifest(missingVersion)).toContain(
+      "codex-app-server-v1 version 0.153.2 has no version evidence",
+    );
   });
 });
 

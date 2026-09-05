@@ -36,7 +36,7 @@
       "generation": {
         "command": "codex app-server generate-ts --experimental --out <dir> && codex app-server generate-json-schema --experimental --out <dir>",
         "generatorVersion": "0.153.2",
-        "schemaDigest": "sha256:5fa8cef8f14df1c9c5fe72d04a37424a435cd0a190728f3268dc6a692e7c09fa",
+        "schemaDigest": "sha256:76b8ecefaf27a32b4e26c1b7e5865d9aeec48dfbbe8251b024672e6fe2b5e597",
         "sourcePackage": "@openai/codex@0.153.2",
         "sourcePackageDigest": "sha512-IRocJlE+jCZGYHwIJWBja2nDswTSZY4sNddQgU5xiR/mVWxo5WcO8pqcajXJea1XDoNK9CaVzizVhUxDhFkU6g=="
       },

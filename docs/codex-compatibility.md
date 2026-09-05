@@ -1,7 +1,8 @@
 # Codex compatibility profiles
 
 ASC authorizes Codex mutations by an exact, checked-in compatibility profile. A
-profile binds reviewed versions to generated app-server artifacts, their schema
+profile binds reviewed versions to generated app-server artifacts, their full
+client-request, server-notification, and server-request schema
 digest, the source package integrity, independent capability evidence, and one
 caller-attestation decoder. Matching a schema is useful upgrade evidence, but it
 does not authorize mutation for an unreviewed version.
@@ -17,7 +18,8 @@ and interactive TUI observations refer to the opt-in probes in
 
 1. Install an exact `@openai/codex` version and retain its lockfile integrity.
 2. Generate artifacts with `bun run generate:codex` into a new profile directory.
-3. Compare old and new generated schemas with
+3. Compare old and new generated schemas, including the full server-request
+   parameter and response shapes, with
    `bun run codex:diff -- <old-generated> <new-generated>`.
 4. Create or update a manifest profile with the generation command, exact
    version, schema digest, package integrity, and capability evidence.

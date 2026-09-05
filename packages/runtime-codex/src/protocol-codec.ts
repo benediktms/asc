@@ -15,8 +15,6 @@ import { CODEX_PROTOCOL_FINGERPRINT, type CodexCompatibilityProfile } from "./co
 export interface CodexProtocolCodec {
   readonly profileId: string;
   readonly schemaDigest: string;
-  validateRequest(method: string, params: unknown): boolean;
-  validateResponse(method: string, result: unknown): boolean;
   normalizeStatus(status: { readonly type: string }): RuntimeAvailability;
   renderDeliveryEnvelope(envelope: RuntimeDeliveryEnvelopeV1): CodexFunctionCallOutputDto;
   parseHistoryMarker(value: unknown, deliveryId: string): boolean;
@@ -27,10 +25,6 @@ export function createCodexProtocolCodec(profile: CodexCompatibilityProfile): Co
   return {
     profileId: profile.profileId,
     schemaDigest: CODEX_PROTOCOL_FINGERPRINT,
-    validateRequest: (method, params) =>
-      typeof method === "string" && method.length > 0 && isRecord(params),
-    validateResponse: (method, result) =>
-      typeof method === "string" && method.length > 0 && isRecord(result),
     normalizeStatus,
     renderDeliveryEnvelope: responseItem,
     parseHistoryMarker(value, deliveryId) {
