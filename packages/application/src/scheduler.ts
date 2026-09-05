@@ -561,6 +561,10 @@ export class DeliveryScheduler {
     }
   }
   private project(event: RuntimeEvent) {
+    if (event.type === "session.observed") {
+      this.store.observeSession(event.session, event.snapshot.availability);
+      return;
+    }
     if (event.type === "execution.started") {
       const now = Date.now();
       this.store.db

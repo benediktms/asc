@@ -72,6 +72,9 @@ describe("control protocol", () => {
         },
       },
     });
+    expect(await (await call("agents.get", { agent: "backend" })).json()).toMatchObject({
+      result: { agent: { availability: "idle" } },
+    });
     expect(
       await (
         await call("bindings.bind", {

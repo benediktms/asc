@@ -286,7 +286,9 @@ describe("delivery scheduler", () => {
     const store = fixture(),
       agent = store.createAgent("local-input-target"),
       requester = authenticated(store);
-    store.bind(agent.id, "thread-local-input");
+    const binding = store.bind(agent.id, "thread-local-input"),
+      bindingRow = store.binding(binding.id);
+    if (!bindingRow) throw new Error("missing binding");
     const accepted = store.accept(
         agent.id,
         requester.id,
@@ -313,6 +315,22 @@ describe("delivery scheduler", () => {
     };
     adapter.observe = async function* (signal) {
       yield { type: "adapter.connection", state: "online" };
+      yield {
+        type: "session.observed",
+        session: {
+          installationId: bindingRow.installation_id,
+          opaqueId: bindingRow.session_opaque_id,
+        },
+        snapshot: {
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: bindingRow.session_opaque_id,
+          },
+          availability: "idle",
+          observedAt: new Date().toISOString(),
+          attributes: {},
+        },
+      };
       await acceptedByRuntime;
       await Bun.sleep(50);
       yield {
@@ -336,11 +354,15 @@ describe("delivery scheduler", () => {
     await Bun.sleep(400);
     expect(
       store.db
-        .query<{ execution_state: string; task_state: string }, [string]>(
-          "SELECT e.state execution_state,t.state task_state FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id WHERE i.id=?",
+        .query<{ availability: string; execution_state: string; task_state: string }, [string]>(
+          "SELECT b.last_observed_availability availability,e.state execution_state,t.state task_state FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE i.id=?",
         )
         .get(accepted.deliveryId),
-    ).toEqual({ execution_state: "awaiting-local-input", task_state: "working" });
+    ).toEqual({
+      availability: "idle",
+      execution_state: "awaiting-local-input",
+      task_state: "working",
+    });
     await scheduler.stop();
     store.close();
   });

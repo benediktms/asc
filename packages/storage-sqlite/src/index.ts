@@ -8,7 +8,9 @@ import type {
   BindingId,
   DeliveryId,
   JsonValue,
+  RuntimeAvailability,
   RuntimeInstallationId,
+  RuntimeSessionRef,
 } from "../../../contracts/runtime-adapter";
 import { loadConfig } from "../../config/src/index";
 import { telemetry } from "../../observability/src/index";
@@ -617,6 +619,14 @@ export class Store {
     return this.db
       .query<BindingRow, [string]>("SELECT * FROM runtime_bindings WHERE id=?")
       .get(bindingId);
+  }
+  observeSession(session: RuntimeSessionRef, availability: RuntimeAvailability) {
+    const now = Date.now();
+    this.db
+      .query(
+        "UPDATE runtime_bindings SET last_observed_availability=?,last_observed_at_ms=? WHERE installation_id=? AND session_opaque_id=? AND status='active'",
+      )
+      .run(availability, now, session.installationId, session.opaqueId);
   }
   revokeBinding(bindingId: string, reason = "revoked") {
     const binding = this.binding(bindingId);

@@ -281,20 +281,18 @@ export function controlHandler(
           );
           if (requestedInstallation && requestedInstallation !== bindInstallation.id)
             throw new Error("BINDING_CONFLICT: runtime installation mismatch");
-          if (
-            (
-              await adapter.inspectSession({
-                installationId: bindInstallation.id,
-                opaqueId: sessionId,
-              })
-            ).availability === "offline"
-          )
+          const bindSnapshot = await adapter.inspectSession({
+            installationId: bindInstallation.id,
+            opaqueId: sessionId,
+          });
+          if (bindSnapshot.availability === "offline")
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
           const createdBinding = store.bind(required(p.agent, "agent"), sessionId, {
             continuityPolicy: p.continuityPolicy,
             deliveryPolicy: p.deliveryPolicy,
             revokeExisting: p.revokeExisting,
           });
+          store.observeSession(bindSnapshot.session, bindSnapshot.availability);
           audit("binding.bind", "binding", createdBinding.id);
           return ok(rpc.id, { binding: bindingDto(createdBinding, store) });
         case "bindings.claim": {
@@ -309,16 +307,14 @@ export function controlHandler(
               .get(),
             "runtime installation",
           );
-          if (
-            (
-              await adapter.inspectSession({
-                installationId: claimInstallation.id,
-                opaqueId: threadId,
-              })
-            ).availability === "offline"
-          )
+          const claimSnapshot = await adapter.inspectSession({
+            installationId: claimInstallation.id,
+            opaqueId: threadId,
+          });
+          if (claimSnapshot.availability === "offline")
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
           const binding = store.claim(required(p.claimCode, "claimCode"), threadId);
+          store.observeSession(claimSnapshot.session, claimSnapshot.availability);
           audit("binding.claim", "binding", binding.id);
           const agent = store.agent(binding.agentId);
           return ok(rpc.id, {
@@ -390,9 +386,13 @@ export function controlHandler(
         case "runtimes.probe":
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           return ok(rpc.id, { probe: await adapter.probe() });
-        case "runtimes.sessions.list":
+        case "runtimes.sessions.list": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
-          return ok(rpc.id, await adapter.listSessions({ limit: 100 }));
+          const page = await adapter.listSessions({ limit: 100 });
+          for (const snapshot of page.sessions)
+            store.observeSession(snapshot.session, snapshot.availability);
+          return ok(rpc.id, page);
+        }
         case "runtimes.sessions.inspect": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const inspectSessionInput = required(p.session, "session"),
@@ -408,12 +408,12 @@ export function controlHandler(
               .get(),
             "runtime installation",
           );
-          return ok(rpc.id, {
-            session: await adapter.inspectSession({
-              installationId: inspectInstallation.id,
-              opaqueId,
-            }),
+          const snapshot = await adapter.inspectSession({
+            installationId: inspectInstallation.id,
+            opaqueId,
           });
+          store.observeSession(snapshot.session, snapshot.availability);
+          return ok(rpc.id, { session: snapshot });
         }
         case "bridge.attestCaller": {
           const a = store.attest(p.evidence?.metadata?.threadId);
