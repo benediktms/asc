@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { controlCall } from "../../protocol-control/src/index";
 import { paths } from "../../storage-sqlite/src/index";
@@ -88,6 +89,25 @@ const threadId = (extra: unknown) => {
     return undefined;
   return typeof metadata.threadId === "string" ? metadata.threadId : undefined;
 };
+
+export function mcpMessageIdentity(
+  hostRequestId: unknown,
+  callerThreadId: string,
+  clientRequestId?: string,
+) {
+  if (typeof hostRequestId === "string" || typeof hostRequestId === "number")
+    return { messageId: String(hostRequestId) };
+  if (clientRequestId)
+    return {
+      messageId: `mcp_${createHash("sha256")
+        .update(`${callerThreadId}\0${clientRequestId}`)
+        .digest("base64url")}`,
+    };
+  return {
+    messageId: crypto.randomUUID(),
+    warning: "Host-level retry may duplicate this request because no stable call ID was available.",
+  };
+}
 
 export async function runMcp(port = 7432) {
   const config = paths(),
@@ -188,11 +208,12 @@ export async function runMcp(port = 7432) {
       execute(async () => {
         const tid = threadId(extra);
         if (!tid) throw new Error("UNATTESTED_CALLER");
-        const auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
+        const identity = mcpMessageIdentity(extra.requestId, tid, args.clientRequestId),
+          auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
           agent = await typedCall("agents.get", { agent: args.to }, agentResultSchema);
         const rpc = await a2a(port, agent.agent.slug, auth.token, "SendMessage", {
           message: {
-            messageId: args.clientRequestId ?? String(extra.requestId),
+            messageId: identity.messageId,
             contextId: args.contextId,
             taskId: args.taskId,
             role: "ROLE_USER",
@@ -208,7 +229,7 @@ export async function runMcp(port = 7432) {
             },
           },
         });
-        return rpc;
+        return withWarning(rpc, identity.warning);
       }),
   );
   server.registerTool(
@@ -248,21 +269,23 @@ export async function runMcp(port = 7432) {
       execute(async () => {
         const tid = threadId(extra);
         if (!tid) throw new Error("UNATTESTED_CALLER");
-        const auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
+        const identity = mcpMessageIdentity(extra.requestId, tid, args.clientRequestId),
+          auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
           target = await typedCall(
             "bridge.taskTarget",
             { threadId: tid, taskId: args.taskId },
             targetSchema,
           );
-        return await a2a(port, target.slug, auth.token, "SendMessage", {
+        const rpc = await a2a(port, target.slug, auth.token, "SendMessage", {
           message: {
-            messageId: args.clientRequestId ?? String(extra.requestId),
+            messageId: identity.messageId,
             taskId: args.taskId,
             role: "ROLE_USER",
             parts: parts(args.text, args.attachments),
           },
           configuration: { returnImmediately: true },
         });
+        return withWarning(rpc, identity.warning);
       }),
   );
   server.registerTool(
@@ -341,6 +364,12 @@ export async function runMcp(port = 7432) {
       execute(() => call("inbox.list", { ...args, threadId: threadId(extra) })),
   );
   await server.connect(new StdioServerTransport());
+}
+
+function withWarning(value: unknown, warning?: string) {
+  if (!warning) return value;
+  if (!isRecord(value)) throw new Error("Invalid A2A task response");
+  return { ...value, warning };
 }
 
 function parts(text: string, attachments: Attachment[] = []) {
