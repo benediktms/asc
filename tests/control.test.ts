@@ -26,6 +26,11 @@ describe("control protocol", () => {
     const store = new Store(paths),
       inspected: string[] = [],
       adapter = new FakeRuntimeAdapter();
+    let sessionQuery: unknown;
+    adapter.listSessions = async (query) => {
+      sessionQuery = query;
+      return { sessions: [], nextCursor: "next" };
+    };
     adapter.inspectSession = async (session) => {
       inspected.push(session.opaqueId);
       return {
@@ -78,6 +83,26 @@ describe("control protocol", () => {
     expect(await (await call("runtimes.probe", {})).json()).toMatchObject({
       result: { probe: { state: "ready" } },
     });
+    expect(
+      await (
+        await call("runtimes.sessions.list", {
+          installationId: installation.id,
+          availability: ["idle"],
+          text: "worker",
+          limit: 7,
+          cursor: "cursor",
+        })
+      ).json(),
+    ).toMatchObject({ result: { sessions: [], nextCursor: "next" } });
+    expect(sessionQuery).toEqual({
+      availability: ["idle"],
+      cursor: "cursor",
+      limit: 7,
+      text: "worker",
+    });
+    expect(
+      await (await call("runtimes.sessions.list", { installationId: "ins_wrong" })).json(),
+    ).toMatchObject({ error: { data: { code: "RUNTIME_UNAVAILABLE" } } });
     expect(await (await call("runtimes.list", {})).json()).toMatchObject({
       result: { runtimes: [{ state: "online" }] },
     });

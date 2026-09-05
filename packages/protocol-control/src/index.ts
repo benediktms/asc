@@ -38,7 +38,19 @@ const partSchema = z.discriminatedUnion("kind", [
   }),
   paramsSchema = z.looseObject({
     agent: z.string().optional(),
-    availability: z.array(z.string()).optional(),
+    availability: z
+      .array(
+        z.enum([
+          "unknown",
+          "offline",
+          "dormant",
+          "idle",
+          "busy",
+          "awaiting-local-input",
+          "degraded",
+        ]),
+      )
+      .optional(),
     artifacts: z.array(artifactSchema).optional(),
     bindingId: z.string().optional(),
     claimCode: z.string().optional(),
@@ -237,13 +249,14 @@ export function controlHandler(
         case "agents.list": {
           const agentLimit = Math.min(p.limit ?? 50, 100),
             text = p.text?.toLowerCase(),
+            requestedAvailability = p.availability ? new Set<string>(p.availability) : undefined,
             candidates = store
               .agents()
               .map((agent) => ({ agent, dto: agentDto(store, agent) }))
               .filter(
                 ({ agent, dto }) =>
                   (p.enabled === undefined || Boolean(agent.enabled) === p.enabled) &&
-                  (!p.availability?.length || p.availability.includes(dto.availability)) &&
+                  (!requestedAvailability?.size || requestedAvailability.has(dto.availability)) &&
                   (!p.skill || agentHasSkill(agent.skills_json, p.skill)) &&
                   (!text ||
                     [agent.slug, agent.display_name, agent.description].some((value) =>
@@ -396,20 +409,19 @@ export function controlHandler(
         case "runtimes.probe": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const probe = await adapter.probe(),
-            installation = required(
-              store.db
-                .query<{ id: RuntimeInstallationId }, []>(
-                  "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-                )
-                .get(),
-              "runtime installation",
-            );
+            installation = runtimeInstallation(store, p.installationId);
           store.observeRuntime(installation.id, probe);
           return ok(rpc.id, { probe });
         }
         case "runtimes.sessions.list": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
-          const page = await adapter.listSessions({ limit: 100 });
+          runtimeInstallation(store, p.installationId);
+          const page = await adapter.listSessions({
+            cursor: p.cursor,
+            limit: p.limit,
+            availability: p.availability,
+            text: p.text,
+          });
           for (const snapshot of page.sessions)
             store.observeSession(snapshot.session, snapshot.availability);
           return ok(rpc.id, page);
@@ -420,15 +432,13 @@ export function controlHandler(
             opaqueId =
               typeof inspectSessionInput === "string"
                 ? inspectSessionInput
-                : inspectSessionInput.opaqueId;
-          const inspectInstallation = required(
-            store.db
-              .query<{ id: RuntimeInstallationId }, []>(
-                "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-              )
-              .get(),
-            "runtime installation",
-          );
+                : inspectSessionInput.opaqueId,
+            inspectRequestedInstallation =
+              p.installationId ??
+              (typeof inspectSessionInput === "string"
+                ? undefined
+                : inspectSessionInput.installationId),
+            inspectInstallation = runtimeInstallation(store, inspectRequestedInstallation);
           const snapshot = await adapter.inspectSession({
             installationId: inspectInstallation.id,
             opaqueId,
@@ -674,6 +684,15 @@ export async function controlCall(
 
 function admin(kind: string) {
   if (kind !== "local-user") throw new Error("NOT_AUTHORIZED");
+}
+function runtimeInstallation(store: Store, requestedId?: string) {
+  const installation = store.db
+    .query<{ id: RuntimeInstallationId }, [string | null, string | null]>(
+      "SELECT id FROM runtime_installations WHERE harness_id='codex' AND (? IS NULL OR id=?) LIMIT 1",
+    )
+    .get(requestedId ?? null, requestedId ?? null);
+  if (!installation) throw new Error("RUNTIME_UNAVAILABLE");
+  return installation;
 }
 function boundedLocalPage<T>(
   store: Store,
