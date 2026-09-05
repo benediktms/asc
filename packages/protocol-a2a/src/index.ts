@@ -355,8 +355,9 @@ async function handleA2ARoute(
   const slug = match.at(1);
   if (!slug) return new Response("Not found", { status: 404 });
   const agent = store.agent(slug);
-  if (!agent || !agent.enabled) return new Response("Not found", { status: 404 });
+  if (!agent) return new Response("Not found", { status: 404 });
   if (request.method === "GET" && url.pathname.endsWith("agent-card.json")) {
+    if (!agent.enabled) return new Response("Not found", { status: 404 });
     const json = AgentCard.toJSON(card(agent, port));
     if (!isRecord(json)) throw new Error("Agent Card serialization failed");
     return Response.json({

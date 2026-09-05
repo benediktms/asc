@@ -176,6 +176,18 @@ describe("A2A JSON-RPC", () => {
       7432,
     );
     expect(record(await unsupportedVersion.json()).error).toMatchObject({ code: -32009 });
+    store.updateAgent(agent.id, { enabled: false });
+    expect(
+      (
+        await call("SendMessage", {
+          message: {
+            messageId: "disabled-agent",
+            role: "ROLE_USER",
+            parts: [{ text: "work" }],
+          },
+        })
+      ).error?.data?.code,
+    ).toBe("ACS_AGENT_DISABLED");
     expect(store.agent(agent.id)?.slug).toBe("backend");
     store.close();
   });

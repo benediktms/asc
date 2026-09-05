@@ -141,6 +141,17 @@ describe("durable acceptance", () => {
     });
     store.close();
   });
+  test("rejects acceptance for a disabled target", () => {
+    const store = fixture(),
+      agent = store.createAgent("disabled-target"),
+      principal = authenticated(store);
+    store.updateAgent(agent.id, { enabled: false });
+    expect(() => store.accept(agent.id, principal.id, requestMessage("disabled"), {})).toThrow(
+      "ACS_AGENT_DISABLED",
+    );
+    expect(store.db.query("SELECT count(*) count FROM a2a_tasks").get()).toEqual({ count: 0 });
+    store.close();
+  });
   test("enforces configured message part limits", () => {
     const store = fixture({ maxParts: 1, maxTextPartBytes: 4 }),
       agent = store.createAgent("bounded-message"),

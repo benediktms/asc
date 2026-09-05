@@ -940,6 +940,9 @@ export class Store {
     message: StoredMessage,
     options: DeliveryOptions,
   ): { task: StoredTask; deliveryId: string; duplicate: boolean } {
+    const target = this.agent(agentId);
+    if (!target) throw new Error("AGENT_NOT_FOUND");
+    if (!target.enabled) throw new Error("ACS_AGENT_DISABLED");
     if (!message.messageId || !message.parts.length)
       throw new Error("VALIDATION_FAILED: messageId and parts are required");
     if (message.parts.length > this.limits.maxParts) throw new Error("ACS_MESSAGE_TOO_LARGE");
