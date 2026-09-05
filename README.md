@@ -42,6 +42,11 @@ The runner verifies the exact revision in
 `conformance/a2a-tck-revision.txt` and rejects any failure outside the reviewed
 requirement-level allowlist.
 
+The research-only dynamic spawning design is documented in
+[`docs/runtime-spawn.md`](docs/runtime-spawn.md). Its proposed contract and
+prototype are not wired into the production daemon; run the proof with
+`bun test tests/runtime-spawn-spike.test.ts`.
+
 ## Current conformance boundary
 
 Implemented: standalone Bun binary, SQLite migration and restart, authenticated
