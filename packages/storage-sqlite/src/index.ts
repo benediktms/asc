@@ -568,7 +568,14 @@ export class Store {
           "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE target_agent_id=? AND state='deferred' AND state_reason IN ('offline','dormant','busy','policy','manual-wake-required')",
         )
         .run(now, now, agent.id);
-      return { id: bindingId, agentId: agent.id, sessionId, epoch, principalId };
+      return {
+        id: bindingId,
+        agentId: agent.id,
+        sessionId,
+        epoch,
+        principalId,
+        rebound: active !== null,
+      };
     });
   }
   binding(bindingId: string) {
@@ -640,7 +647,8 @@ export class Store {
   }
   claim(code: string, sessionId: string, options: BindingOptions = {}): ClaimBindingResult {
     return this.write(() => {
-      const candidates = this.db
+      const verifier = this.hashToken(code),
+        matches = this.db
           .query<
             {
               id: `clm_${string}`;
@@ -650,15 +658,11 @@ export class Store {
               consumed_at_ms: number | null;
               consumed_by_binding_id: BindingId | null;
             },
-            []
+            [Uint8Array]
           >(
-            "SELECT id,agent_id,code_hash,expires_at_ms,consumed_at_ms,consumed_by_binding_id FROM binding_claims",
+            "SELECT id,agent_id,code_hash,expires_at_ms,consumed_at_ms,consumed_by_binding_id FROM binding_claims WHERE code_hash=? LIMIT 2",
           )
-          .all(),
-        verifier = this.hashToken(code),
-        matches = new Array<(typeof candidates)[number]>();
-      for (const candidate of candidates)
-        if (timingSafeEqual(verifier, Buffer.from(candidate.code_hash))) matches.push(candidate);
+          .all(verifier);
       if (matches.length > 1) throw new Error("CLAIM_AMBIGUOUS");
       const row = matches.at(0);
       if (!row) throw new Error("CLAIM_INVALID");
@@ -711,7 +715,6 @@ export class Store {
       return {
         ...binding,
         idempotent: false,
-        rebound: binding.epoch > 1,
       };
     });
   }

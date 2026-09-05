@@ -152,6 +152,7 @@ export interface BindingHandle {
   sessionId: string;
   epoch: number;
   principalId: `prn_${string}`;
+  rebound: boolean;
 }
 
 export interface BindingOptions {
@@ -168,7 +169,6 @@ export interface BindingOptions {
 
 export interface ClaimBindingResult extends BindingHandle {
   idempotent: boolean;
-  rebound: boolean;
 }
 
 export interface DeliveryOptions {

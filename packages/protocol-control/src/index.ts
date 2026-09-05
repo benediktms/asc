@@ -365,7 +365,7 @@ export function controlHandler(
           });
           store.observeSession(bindSnapshot.session, bindSnapshot.availability);
           audit("binding.bind", "binding", createdBinding.id);
-          if (createdBinding.epoch > 1)
+          if (createdBinding.rebound)
             audit("binding.rebind", "binding", createdBinding.id, {
               epoch: createdBinding.epoch,
             });

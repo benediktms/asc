@@ -289,8 +289,8 @@ export interface ControlMethodMap {
   "bindings.bind": {
     readonly params: {
       readonly agent: string;
-      readonly installationId: string;
-      readonly session: RuntimeSessionRef;
+      readonly installationId?: string;
+      readonly session: RuntimeSessionRef | string;
       readonly continuityPolicy?: "follow-pending" | "strict";
       readonly deliveryPolicy?: Partial<RuntimeBindingDto["deliveryPolicy"]>;
       readonly revokeExisting?: boolean;

@@ -413,6 +413,7 @@ describe("durable acceptance", () => {
     expect(claim.claimCode).toMatch(/^[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{26}$/);
     expect(binding.agentId).toBe(agent.id);
     expect(binding.idempotent).toBe(false);
+    expect(binding.rebound).toBe(false);
     expect(store.claim(claim.claimCode, "claimed-thread", { installationId: "ins_other" })).toEqual(
       { ...binding, idempotent: true },
     );
@@ -472,6 +473,19 @@ describe("durable acceptance", () => {
     expect(rebound).toMatchObject({ epoch: oldBinding.epoch + 1, rebound: true });
     expect(store.binding(oldBinding.id)?.status).toBe(BindingState.Revoked);
     expect(() => store.claim(oldClaim.claimCode, "old-thread")).toThrow("STALE_BINDING");
+    store.close();
+  });
+  test("distinguishes replacing an active binding from binding after revocation", () => {
+    const store = fixture(),
+      agent = store.createAgent("rebind-classification"),
+      first = store.bind(agent.id, "first-thread");
+    expect(first.rebound).toBe(false);
+    const replacement = store.bind(agent.id, "replacement-thread", { revokeExisting: true });
+    expect(replacement.rebound).toBe(true);
+    store.revokeBinding(replacement.id);
+    const afterRevocation = store.bind(agent.id, "after-revocation-thread");
+    expect(afterRevocation.epoch).toBe(3);
+    expect(afterRevocation.rebound).toBe(false);
     store.close();
   });
   test("reports observed active runtime sessions by state", () => {
