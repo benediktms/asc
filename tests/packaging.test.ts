@@ -134,15 +134,18 @@ async function readUntil(stream: ReadableStream<Uint8Array>, needle: string) {
   const reader = stream.getReader(),
     decoder = new TextDecoder();
   let output = "";
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const next = await Promise.race([
-      reader.read(),
-      Bun.sleep(100).then(() => ({ done: false, value: undefined })),
-    ]);
-    if (next.value) output += decoder.decode(next.value, { stream: true });
-    if (output.includes(needle) || next.done) return output;
-  }
-  throw new Error(`MCP did not initialize: ${output}`);
+  return await Promise.race([
+    (async () => {
+      for (;;) {
+        const next = await reader.read();
+        if (next.value) output += decoder.decode(next.value, { stream: true });
+        if (output.includes(needle) || next.done) return output;
+      }
+    })(),
+    Bun.sleep(10_000).then(() => {
+      throw new Error(`MCP did not initialize: ${output}`);
+    }),
+  ]);
 }
 
 function record(value: unknown): Record<string, unknown> {
