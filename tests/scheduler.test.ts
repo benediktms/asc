@@ -511,6 +511,69 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("wakes an offline delivery when its bound session becomes ready", async () => {
+    const store = fixture(),
+      agent = store.createAgent("status-wake-target"),
+      requester = authenticated(store),
+      binding = store.bind(agent.id, "status-wake-thread"),
+      bindingRow = store.binding(binding.id);
+    if (!bindingRow) throw new Error("missing binding");
+    const accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "status-wake",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      firstDelivery = Promise.withResolvers<void>(),
+      adapter = new FakeRuntimeAdapter();
+    let deliveries = 0;
+    adapter.deliver = async () => {
+      if (++deliveries === 1) {
+        firstDelivery.resolve();
+        return { outcome: "deferred", reason: "offline", retryAfterMs: 30_000 };
+      }
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "status-wake" },
+      };
+    };
+    adapter.observe = async function* (signal) {
+      yield { type: "adapter.connection", state: "online" };
+      await firstDelivery.promise;
+      await Bun.sleep(25);
+      yield {
+        type: "session.observed",
+        session: {
+          installationId: bindingRow.installation_id,
+          opaqueId: bindingRow.session_opaque_id,
+        },
+        snapshot: {
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: bindingRow.session_opaque_id,
+          },
+          availability: "idle",
+          observedAt: new Date().toISOString(),
+          attributes: {},
+        },
+      };
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "status-wake");
+    await scheduler.start();
+    await Bun.sleep(700);
+    expect(deliveries).toBe(2);
+    expect(deliveryState(store, accepted.deliveryId)?.state).toBe("accepted");
+    await scheduler.stop();
+    store.close();
+  });
 });
 
 function authenticated(store: Store) {

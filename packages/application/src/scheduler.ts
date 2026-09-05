@@ -14,6 +14,7 @@ import type {
   RuntimeDeliveryEnvelopeV1,
   RuntimeDeliveryRequest,
   RuntimeEvent,
+  RuntimeAvailability,
   RuntimeInstallationId,
   RuntimeExecutionId,
   NeutralPart,
@@ -235,7 +236,7 @@ export class DeliveryScheduler {
         installationId,
         opaqueId: row.session_opaque_id,
       });
-      this.store.observeSession(snapshot.session, snapshot.availability);
+      this.observeSession(snapshot.session, snapshot.availability);
     }
   }
   private scheduleReconnect() {
@@ -597,7 +598,7 @@ export class DeliveryScheduler {
   }
   private project(event: RuntimeEvent) {
     if (event.type === "session.observed") {
-      this.store.observeSession(event.session, event.snapshot.availability);
+      this.observeSession(event.session, event.snapshot.availability);
       return;
     }
     if (event.type === "execution.started") {
@@ -664,6 +665,19 @@ export class DeliveryScheduler {
       event.outcome === "completed" ? TaskState.Completed : TaskState.Failed,
       summary || event.outcome,
     );
+  }
+  private observeSession(
+    session: { installationId: RuntimeInstallationId; opaqueId: string },
+    availability: RuntimeAvailability,
+  ) {
+    this.store.observeSession(session, availability);
+    if (availability === "offline" || availability === "dormant") return;
+    const now = Date.now();
+    this.store.db
+      .query(
+        "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE state='deferred' AND state_reason IN ('offline','dormant') AND target_agent_id IN (SELECT agent_id FROM runtime_bindings WHERE installation_id=? AND session_opaque_id=? AND status='active')",
+      )
+      .run(now, now, session.installationId, session.opaqueId);
   }
 }
 
