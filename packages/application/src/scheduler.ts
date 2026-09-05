@@ -496,9 +496,21 @@ export class DeliveryScheduler {
     telemetry.increment("acs_delivery_attempts_total", {
       adapter: this.adapter.descriptor.adapterId,
     });
+    const renew = setInterval(
+      () => {
+        const now = Date.now();
+        this.store.db
+          .query(
+            "UPDATE delivery_intents SET lease_expires_at_ms=?,updated_at_ms=? WHERE id=? AND state='attempting' AND lease_owner=?",
+          )
+          .run(now + this.options.leaseMs, now, request.deliveryId, this.instanceId);
+      },
+      Math.max(25, Math.floor(this.options.leaseMs / 2)),
+    );
     try {
       return await telemetry.trace("runtime.deliver", () => this.adapter.deliver(request));
     } finally {
+      clearInterval(renew);
       telemetry.observe("acs_delivery_latency_ms", performance.now() - started, {
         adapter: this.adapter.descriptor.adapterId,
       });

@@ -116,6 +116,59 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("renews the attempt lease during a runtime call", async () => {
+    const store = fixture(),
+      agent = store.createAgent("lease-renewal"),
+      requester = authenticated(store);
+    store.bind(agent.id, "lease-renewal-thread");
+    const accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "lease-renewal",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    let release: (() => void) | undefined, markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      }),
+      blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    adapter.deliver = async () => {
+      markStarted?.();
+      await blocked;
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "renewed" },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "lease-renewal", {
+      concurrency: 1,
+      leaseMs: 60,
+      retryBaseMs: 10,
+      retryCapMs: 100,
+      reconnectMs: 10,
+    });
+    await scheduler.start();
+    await started;
+    await Bun.sleep(80);
+    expect(
+      store.db
+        .query<{ lease_expires_at_ms: number }, [string]>(
+          "SELECT lease_expires_at_ms FROM delivery_intents WHERE id=?",
+        )
+        .get(accepted.deliveryId)?.lease_expires_at_ms,
+    ).toBeGreaterThan(Date.now());
+    release?.();
+    await scheduler.stop();
+    store.close();
+  });
   test("follows eligible rebinds and terminates unsafe delivery conditions", async () => {
     const store = fixture(),
       requester = authenticated(store),
