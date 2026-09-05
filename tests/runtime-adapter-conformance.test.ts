@@ -164,7 +164,7 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       fixture.close();
     }, 30_000);
 
-    test("maps a disconnect before delivery to offline without mutation", async () => {
+    test("reconnects after a disconnect without duplicating notifications", async () => {
       const fixture = await create(),
         { adapter, context, methods } = fixture;
       await adapter.start(context);
@@ -177,6 +177,21 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         reason: "offline",
       });
       expect(mutations(methods)).toEqual([]);
+
+      await adapter.start(context);
+      expect((await iterator.next()).value).toMatchObject({ state: "online" });
+      expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
+        outcome: "accepted",
+        execution: { opaqueId: "turn-1" },
+      });
+      fixture.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+      expect((await iterator.next()).value).toMatchObject({
+        type: "execution.completed",
+        execution: { opaqueId: "turn-1" },
+      });
+      expect(
+        await Promise.race([iterator.next().then(() => "event"), Bun.sleep(25).then(() => "none")]),
+      ).toBe("none");
       await adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
