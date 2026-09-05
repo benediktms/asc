@@ -471,6 +471,19 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         },
       });
     }
+    if (method === "turn/started" && isTurnStarted(params)) {
+      const execution = this.executions.get(params.turn.id);
+      if (execution)
+        this.emit({
+          type: "execution.started",
+          session: execution.session,
+          execution: { opaqueId: params.turn.id, session: execution.session },
+          correlation: {
+            deliveryId: execution.deliveryId,
+            payloadHash: execution.payloadHash,
+          },
+        });
+    }
     if (method === "item/completed" && isItemCompleted(params)) {
       const event = params,
         execution = this.executions.get(event.turnId);
@@ -575,6 +588,20 @@ function isTurnCompleted(
     typeof value.turn.id === "string" &&
     "status" in value.turn &&
     typeof value.turn.status === "string"
+  );
+}
+
+function isTurnStarted(value: unknown): value is { threadId: string; turn: { id: string } } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
+    "turn" in value &&
+    typeof value.turn === "object" &&
+    value.turn !== null &&
+    "id" in value.turn &&
+    typeof value.turn.id === "string"
   );
 }
 

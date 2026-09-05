@@ -561,6 +561,15 @@ export class DeliveryScheduler {
     }
   }
   private project(event: RuntimeEvent) {
+    if (event.type === "execution.started") {
+      const now = Date.now();
+      this.store.db
+        .query(
+          "UPDATE runtime_executions SET state='started',started_at_ms=?,updated_at_ms=? WHERE runtime_execution_opaque_id=? AND state='accepted'",
+        )
+        .run(now, now, event.execution.opaqueId);
+      return;
+    }
     if (event.type === "execution.awaiting-local-input") {
       this.store.db
         .query(

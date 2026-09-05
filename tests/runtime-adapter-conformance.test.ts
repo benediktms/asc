@@ -109,6 +109,20 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         outcome: "accepted",
         execution: { opaqueId: "turn-1" },
       });
+      const started = iterator.next();
+      fixture.notify("turn/started", {
+        threadId: "thread-1",
+        turn: { id: "turn-1", status: "inProgress" },
+      });
+      expect((await started).value).toEqual({
+        type: "execution.started",
+        session: { installationId: "ins_conformance", opaqueId: "thread-1" },
+        execution: {
+          opaqueId: "turn-1",
+          session: { installationId: "ins_conformance", opaqueId: "thread-1" },
+        },
+        correlation: { deliveryId: "int_conformance", payloadHash: "payload-hash" },
+      });
       const localInput = iterator.next();
       fixture.request("item/tool/requestUserInput", {
         threadId: "thread-1",
