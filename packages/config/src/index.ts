@@ -45,6 +45,15 @@ export interface Paths {
   secret: string;
 }
 
+export interface RuntimePaths extends Paths {
+  stateDirectory: string;
+  daemonRecord: string;
+  lifecycleLock: string;
+  logDirectory: string;
+  daemonLog: string;
+  installRecord: string;
+}
+
 const text = `[daemon]
 a2a_listen = "127.0.0.1:7432"
 control_socket = "auto"
@@ -246,7 +255,7 @@ export function loadConfig(path = configPath()): AcsConfig {
   };
 }
 
-export function paths(): Paths {
+export function paths(): RuntimePaths {
   const defaults = defaultLocations(),
     base = process.env.ACS_HOME ?? defaults.dataDirectory,
     config = loadConfig();
@@ -260,6 +269,12 @@ export function paths(): Paths {
     token: `${base}/control.token`,
     bridgeToken: `${base}/bridge.token`,
     secret: `${base}/secret.key`,
+    stateDirectory: `${base}/state`,
+    daemonRecord: `${base}/state/daemon.json`,
+    lifecycleLock: `${base}/state/lifecycle.lock`,
+    logDirectory: `${base}/logs`,
+    daemonLog: `${base}/logs/daemon.log`,
+    installRecord: `${base}/install.json`,
   };
 }
 export function parseListen(value: string) {

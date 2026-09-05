@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { chmodSync, existsSync, readFileSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { handleA2A } from "../../../packages/protocol-a2a/src/index";
 import { controlCall, controlHandler } from "../../../packages/protocol-control/src/index";
@@ -19,6 +20,22 @@ import {
   writeDefaultConfig,
 } from "../../../packages/config/src/index";
 import { pickSession, type SessionChoice } from "./session-picker";
+import {
+  VERSION,
+  awaitProcess,
+  createRecord,
+  daemonIdentity,
+  installSelf,
+  installedExecutable,
+  nativeProcesses,
+  readDaemonRecord,
+  removeStaleRuntime,
+  socketAccepts,
+  spawnDaemon,
+  uninstallSelf,
+  withLifecycleLock,
+  writeDaemonRecord,
+} from "./lifecycle";
 
 const args = Bun.argv.slice(2),
   config = paths(),
@@ -28,13 +45,49 @@ const args = Bun.argv.slice(2),
 
 async function main() {
   if (!args.length || args[0] === "--help" || args[0] === "help") return usage();
+  if (args[0] === "version" || args[0] === "--version") {
+    return print({
+      version: VERSION,
+      commit: process.env.ACS_BUILD_COMMIT ?? "unknown",
+      target: `${process.platform}-${process.arch}`,
+      bun: Bun.version,
+      codexProfiles: SUPPORTED_CODEX_VERSIONS,
+    });
+  }
+  if (args[0] === "install") {
+    if (process.execPath.endsWith("/bun") || process.execPath.endsWith("/bunx"))
+      throw new Error("INSTALL_REQUIRES_RELEASE: install must be run from a compiled ASC binary");
+    const prefix = resolvePath(option("--prefix") ?? `${process.env.HOME ?? ""}/.local`);
+    return withLifecycleLock(config.lifecycleLock, async () => {
+      const installed = installSelf(realpathSync(process.execPath), prefix, config.installRecord);
+      console.log(`Installed ASC ${VERSION} at ${installed.executable}`);
+    });
+  }
+  if (args[0] === "uninstall")
+    return withLifecycleLock(config.lifecycleLock, async () => {
+      const record = readDaemonRecord(config.daemonRecord);
+      if (record && daemonIdentity(record))
+        throw new Error("DAEMON_RUNNING: stop the daemon before uninstalling ASC");
+      print(uninstallSelf(config.installRecord));
+    });
   if (args[0] === "init") {
     writeDefaultConfig();
     initFiles(config);
     console.log(`Initialized ACS at ${config.data}`);
     return;
   }
-  if (args[0] === "daemon" && (args[1] === "run" || args[1] === "start")) return daemon();
+  if (args[0] === "daemon" && args[1] === "run") return daemon();
+  if (args[0] === "daemon" && args[1] === "start") {
+    await daemonStart();
+    process.exit(0);
+  }
+  if (args[0] === "daemon" && args[1] === "status") return daemonStatus();
+  if (args[0] === "daemon" && args[1] === "stop") return daemonStop();
+  if (args[0] === "daemon" && args[1] === "restart") {
+    await daemonStop();
+    await daemonStart();
+    process.exit(0);
+  }
   if (args[0] === "mcp" && args[1] === "codex") return runMcp(port);
   if (args[0] === "codex" && args[1] === "doctor") return doctor();
   if (args[0] === "codex" && args[1] === "install-mcp") {
@@ -44,7 +97,7 @@ async function main() {
       "add",
       "acs",
       "--",
-      process.execPath,
+      installedExecutable(config.installRecord),
       "mcp",
       "codex",
     ]);
@@ -142,6 +195,24 @@ async function main() {
 }
 
 async function daemon() {
+  const instanceId = option("--instance") ?? crypto.randomUUID(),
+    managed = process.env.ACS_MANAGED_DAEMON === "1";
+  if (managed) {
+    let record = readDaemonRecord(config.daemonRecord);
+    for (let attempt = 0; !record && attempt < 40; attempt++) {
+      await Bun.sleep(25);
+      record = readDaemonRecord(config.daemonRecord);
+    }
+    if (!record || record.pid !== process.pid || record.instanceId !== instanceId)
+      throw new Error("DAEMON_IDENTITY_FAILED: managed process record does not match");
+  } else {
+    await withLifecycleLock(config.lifecycleLock, async () => {
+      const existing = readDaemonRecord(config.daemonRecord);
+      if (existing && daemonIdentity(existing)) throw new Error("DAEMON_ALREADY_RUNNING");
+      await recoverStaleRuntime();
+      writeDaemonRecord(config.daemonRecord, createRecord(process.pid, instanceId));
+    });
+  }
   const store = new Store(config, {
       maxInlineContentBytes: settings.security.maxInlineContentBytes,
       maxParts: settings.security.maxParts,
@@ -153,7 +224,6 @@ async function daemon() {
       maxQueuedDeliveryIntents: settings.delivery.maxQueuedDeliveryIntents,
     }),
     startedAt = new Date().toISOString();
-  if (existsSync(config.runtime)) unlinkSync(config.runtime);
   let scheduler: DeliveryScheduler | undefined;
   const a2a = Bun.serve({
     hostname: listen.hostname,
@@ -228,6 +298,9 @@ async function daemon() {
         if (forceTimer) clearTimeout(forceTimer);
         store.close();
         if (existsSync(config.runtime)) unlinkSync(config.runtime);
+        const record = readDaemonRecord(config.daemonRecord);
+        if (record?.pid === process.pid && record.instanceId === instanceId)
+          unlinkSync(config.daemonRecord);
         finish?.();
       }
     })();
@@ -245,6 +318,157 @@ async function daemon() {
     control: "ready",
   });
   await stopped;
+}
+
+async function daemonStart() {
+  return withLifecycleLock(config.lifecycleLock, async () => {
+    const current = readDaemonRecord(config.daemonRecord);
+    if (current && daemonIdentity(current)) {
+      print({
+        status: "running",
+        pid: current.pid,
+        version: current.version,
+        alreadyRunning: true,
+      });
+      return;
+    }
+    await recoverStaleRuntime();
+    initFiles(config);
+    const child = spawnDaemon(config);
+    let record;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      try {
+        record = createRecord(child.pid, child.instanceId);
+        break;
+      } catch {
+        await Bun.sleep(25);
+      }
+    }
+    if (!record) throw new Error("DAEMON_START_FAILED: child exited before inspection");
+    writeDaemonRecord(config.daemonRecord, record);
+    try {
+      await waitForHealth(5000);
+    } catch (error) {
+      if (daemonIdentity(record)) nativeProcesses.signal(record.pid, "SIGTERM");
+      if (!(await awaitProcess(record.pid, 1000, () => daemonIdentity(record)))) {
+        if (daemonIdentity(record)) nativeProcesses.signal(record.pid, "SIGKILL");
+        await awaitProcess(record.pid, 1000, () => daemonIdentity(record));
+      }
+      if (daemonIdentity(record))
+        throw new Error("DAEMON_START_FAILED: child could not be terminated safely", {
+          cause: error,
+        });
+      removeStaleRuntime(config);
+      throw error;
+    }
+    print({ status: "running", pid: record.pid, version: record.version });
+  });
+}
+
+async function daemonStatus() {
+  return withLifecycleLock(config.lifecycleLock, async () => {
+    const record = readDaemonRecord(config.daemonRecord);
+    if (!record || !daemonIdentity(record)) {
+      if (await runtimeResponds()) {
+        print({
+          status: "untracked",
+          detail: "control socket is live but process identity is absent",
+        });
+        return;
+      }
+      removeStaleRuntime(config);
+      print({ status: "stopped" });
+      return;
+    }
+    try {
+      await health();
+      print({
+        status: "running",
+        pid: record.pid,
+        version: record.version,
+        startedAt: record.startedAt,
+        executable: record.executable,
+        health: "ok",
+      });
+    } catch {
+      print({ status: "running", health: "degraded", pid: record.pid, version: record.version });
+    }
+  });
+}
+
+async function daemonStop() {
+  return withLifecycleLock(config.lifecycleLock, async () => {
+    const record = readDaemonRecord(config.daemonRecord);
+    if (!record || !daemonIdentity(record)) {
+      if (await runtimeResponds())
+        throw new Error("DAEMON_UNTRACKED: refusing to stop a process without matching identity");
+      removeStaleRuntime(config);
+      print({ status: "stopped", alreadyStopped: true });
+      return;
+    }
+    try {
+      await lifecycleCall("system.shutdown");
+    } catch {
+      // The identity check below remains authoritative if the control plane is unavailable.
+    }
+    if (!(await awaitProcess(record.pid, 3000, () => daemonIdentity(record)))) {
+      if (daemonIdentity(record)) nativeProcesses.signal(record.pid, "SIGTERM");
+      if (!(await awaitProcess(record.pid, 2000, () => daemonIdentity(record)))) {
+        if (!daemonIdentity(record))
+          throw new Error("DAEMON_IDENTITY_CHANGED: refusing forced signal");
+        nativeProcesses.signal(record.pid, "SIGKILL");
+        await awaitProcess(record.pid, 1000, () => daemonIdentity(record));
+      }
+    }
+    if (daemonIdentity(record)) throw new Error("DAEMON_STOP_FAILED: process did not exit");
+    removeStaleRuntime(config);
+    print({ status: "stopped", pid: record.pid });
+  });
+}
+
+async function waitForHealth(timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await health();
+      return;
+    } catch (error) {
+      lastError = error;
+      await Bun.sleep(25);
+    }
+  }
+  throw new Error(
+    `DAEMON_START_FAILED: readiness timeout (${lastError instanceof Error ? lastError.message : "unavailable"})`,
+  );
+}
+
+async function health() {
+  await lifecycleCall("system.initialize", {
+    protocolVersion: "1.0",
+    client: { name: "acs-lifecycle", version: VERSION, instanceId: String(process.pid) },
+    capabilities: {},
+  });
+  return lifecycleCall("system.health");
+}
+
+function lifecycleCall(method: string, params: unknown = {}) {
+  return Promise.race([
+    controlCall(config.runtime, config.token, method, params),
+    Bun.sleep(750).then(() => {
+      throw new Error("RUNTIME_UNAVAILABLE: control request timed out");
+    }),
+  ]);
+}
+
+async function recoverStaleRuntime() {
+  if (await runtimeResponds())
+    throw new Error("DAEMON_UNTRACKED: a live control socket has no matching process record");
+  removeStaleRuntime(config);
+}
+
+async function runtimeResponds() {
+  return existsSync(config.runtime) && (await socketAccepts(config.runtime));
 }
 
 function sanitizedError(error: Error, instanceId: string) {
@@ -410,7 +634,7 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs codex bind <agent> [--session <codex-thread-id>] [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS ${VERSION}\n\n  acs version\n  acs install [--prefix ~/.local] [--non-interactive]\n  acs uninstall\n  acs init\n  acs daemon run|start|status|restart|stop\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs codex bind <agent> [--session <codex-thread-id>] [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 
