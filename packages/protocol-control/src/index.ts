@@ -128,7 +128,12 @@ export function controlHandler(
       return new Response("Unsupported control protocol version", { status: 426 });
     const token = request.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1],
       principal = token ? store.authenticate(token) : null;
-    if (!principal) return new Response("Unauthorized", { status: 401 });
+    if (!principal) {
+      store.audit(null, "security.reject", "control", undefined, {
+        reason: "unauthenticated",
+      });
+      return new Response("Unauthorized", { status: 401 });
+    }
     let rpc: Rpc;
     try {
       const value: unknown = await request.json();
@@ -578,6 +583,15 @@ export function controlHandler(
           throw new Error("METHOD_NOT_FOUND");
       }
     } catch (error) {
+      if (error instanceof Error && error.message === "NOT_AUTHORIZED")
+        store.audit(
+          principal.id,
+          "security.reject",
+          "control",
+          undefined,
+          { reason: "not-authorized", method: rpc.method },
+          String(rpc.id),
+        );
       return fail(rpc.id, error);
     }
   };

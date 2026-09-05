@@ -93,6 +93,14 @@ describe("control protocol", () => {
     const bridgeToken = readFileSync(paths.bridgeToken, "utf8"),
       denied = (await call("agents.create", { slug: "forbidden" }, "1", bridgeToken)).json();
     expect(await denied).toMatchObject({ error: { message: "NOT_AUTHORIZED" } });
+    expect((await call("agents.list", {}, "1", "invalid-token")).status).toBe(401);
+    expect(
+      store.db
+        .query<{ n: number }, []>(
+          "SELECT count(*) n FROM audit_events WHERE action='security.reject'",
+        )
+        .get()?.n,
+    ).toBe(2);
     store.close();
   });
   test("filters stable keyset pages for control-plane lists", async () => {

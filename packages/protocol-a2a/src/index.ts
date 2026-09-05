@@ -373,7 +373,10 @@ async function handleA2ARoute(
   if (length > maxRequestBytes) return new Response("Request too large", { status: 413 });
   const token = request.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1],
     principal = token ? store.authenticate(token) : null;
-  if (!principal) return new Response("Unauthorized", { status: 401 });
+  if (!principal) {
+    store.audit(null, "security.reject", "a2a", agent.id, { reason: "unauthenticated" });
+    return new Response("Unauthorized", { status: 401 });
+  }
   const body = await readBody(request, maxRequestBytes);
   if (body === null) return new Response("Request too large", { status: 413 });
   let payload: Record<string, unknown> | undefined;
@@ -408,8 +411,13 @@ async function handleA2ARoute(
       : method === "CancelTask"
         ? "a2a:cancel"
         : "a2a:read";
-  if (!principal.scopes.includes("*") && !principal.scopes.includes(requiredScope))
+  if (!principal.scopes.includes("*") && !principal.scopes.includes(requiredScope)) {
+    store.audit(principal.id, "security.reject", "a2a", agent.id, {
+      reason: "insufficient-scope",
+      method: typeof method === "string" ? method : "unknown",
+    });
     return new Response("Forbidden", { status: 403 });
+  }
   const context = new ServerCallContext({
     user: new PrincipalUser(principal.id),
     requestedVersion: requestedVersion ?? "1.0",

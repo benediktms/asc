@@ -155,6 +155,13 @@ describe("A2A JSON-RPC", () => {
       7432,
     );
     expect(forbidden.status).toBe(403);
+    expect(
+      store.db
+        .query<{ n: number }, []>(
+          "SELECT count(*) n FROM audit_events WHERE action='security.reject'",
+        )
+        .get()?.n,
+    ).toBe(1);
     const unsupportedVersion = await handleA2A(
       store,
       new Request("http://localhost/agents/backend/a2a", {
