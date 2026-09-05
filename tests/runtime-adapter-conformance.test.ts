@@ -10,10 +10,14 @@ import type {
   RuntimeReconcileRequest,
 } from "../contracts/runtime-adapter";
 import {
+  CODEX_SERVER_REQUEST_METHODS,
+  CODEX_SERVER_REQUEST_POLICY_VERSION,
   CodexRuntimeAdapter,
   SUPPORTED_CODEX_VERSIONS,
   TESTED_CODEX_VERSION,
+  codexServerRequestPolicy,
 } from "../packages/runtime-codex/src/index";
+import { CODEX_SERVER_REQUEST_POLICIES } from "../packages/runtime-codex/src/server-request-policy";
 import { responseItem } from "../packages/runtime-codex/src/protocol-codec";
 import { canonical } from "../packages/domain/src/index";
 
@@ -33,6 +37,8 @@ type Fixture = {
   adapter: RuntimeAdapter;
   context: RuntimeAdapterContext;
   methods: string[];
+  serverResponses: unknown[];
+  logs: Array<{ event: string; attributes?: unknown }>;
   failNext(method: string, failure: "overload" | "disconnect" | "hang"): void;
   disconnect(): void;
   request(method: string, params: unknown): void;
@@ -194,7 +200,7 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
           opaqueId: "server-request-1",
           kind: "question",
           blocking: true,
-          summary: "Local runtime input required",
+          summary: "Local Codex user input required",
         },
       });
       const output = iterator.next();
@@ -441,6 +447,174 @@ test("Codex runtime adapter enables mutations for every supported runtime", asyn
   }
 });
 
+test("Codex server-request ownership policy exhaustively covers the generated schema", () => {
+  expect(CODEX_SERVER_REQUEST_POLICY_VERSION).toBe("codex-server-request-ownership-v1");
+  expect(Object.keys(CODEX_SERVER_REQUEST_POLICIES).toSorted()).toEqual(
+    [...CODEX_SERVER_REQUEST_METHODS].toSorted(),
+  );
+  expect(
+    CODEX_SERVER_REQUEST_METHODS.map((method) => codexServerRequestPolicy(method).action),
+  ).not.toContain("safe-to-answer");
+  expect(codexServerRequestPolicy("future/sensitive/request")).toEqual({
+    action: "unsupported-fail-closed",
+    kind: "unknown",
+    blocksExecution: true,
+  });
+  expect(codexServerRequestPolicy("item/tool/requestUserInput")).toMatchObject({
+    action: "observe-only",
+    kind: "question",
+  });
+  expect(codexServerRequestPolicy("item/permissions/requestApproval")).toMatchObject({
+    action: "owned-by-local-client",
+    kind: "approval",
+  });
+  expect(codexServerRequestPolicy("mcpServer/elicitation/request")).toMatchObject({
+    action: "owned-by-local-client",
+    kind: "elicitation",
+  });
+  expect(codexServerRequestPolicy("account/chatgptAuthTokens/refresh")).toMatchObject({
+    action: "owned-by-local-client",
+    kind: "authentication",
+  });
+});
+
+test("Codex leaves local and unknown requests unanswered and reports redacted diagnostics", async () => {
+  const fixture = await codexFixture(),
+    { adapter, context, methods, serverResponses, logs } = fixture;
+  await adapter.start(context);
+  expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
+    outcome: "accepted",
+    execution: { opaqueId: "turn-1" },
+  });
+  const iterator = adapter.observe(new AbortController().signal)[Symbol.asyncIterator]();
+  expect((await iterator.next()).value).toMatchObject({ type: "adapter.connection" });
+
+  const approval = iterator.next();
+  fixture.request("item/commandExecution/requestApproval", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "item-approval",
+    reason: "TOP SECRET approval prompt",
+  });
+  expect((await approval).value).toMatchObject({
+    type: "execution.awaiting-local-input",
+    request: { kind: "approval", summary: "Local Codex approval required" },
+  });
+
+  fixture.request("future/sensitive/request", {
+    threadId: "thread-2",
+    turnId: "foreign-turn",
+    prompt: "TOP SECRET unknown prompt",
+  });
+  await Bun.sleep(10);
+  expect(serverResponses).toEqual([]);
+  expect(JSON.stringify(logs)).not.toContain("TOP SECRET");
+  expect(logs).toContainEqual({
+    event: "codex.server_request.observed",
+    attributes: expect.objectContaining({
+      method: "future/sensitive/request",
+      action: "unsupported-fail-closed",
+      answered: false,
+    }),
+  });
+  expect(
+    await adapter.deliver({
+      ...delivery("wake_when_idle"),
+      target: {
+        ...delivery().target,
+        session: { installationId: "ins_conformance", opaqueId: "thread-2" },
+      },
+    }),
+  ).toEqual({ outcome: "deferred", reason: "busy" });
+  expect(logs).toContainEqual({
+    event: "codex.delivery.blocked_by_server_request",
+    attributes: expect.objectContaining({
+      bindingId: "bnd_conformance",
+      method: "future/sensitive/request",
+      action: "unsupported-fail-closed",
+    }),
+  });
+  const probe = await adapter.probe();
+  expect(probe.diagnostics).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ code: "CODEX_SERVER_REQUEST_OWNERSHIP" }),
+      expect.objectContaining({ code: "CODEX_SERVER_REQUEST_UNKNOWN" }),
+    ]),
+  );
+  expect(JSON.stringify(probe.diagnostics)).not.toContain("TOP SECRET");
+  fixture.notify("serverRequest/resolved", {
+    threadId: "thread-2",
+    requestId: "server-request-1",
+  });
+  await Bun.sleep(10);
+  expect(
+    await adapter.deliver({
+      ...delivery("wake_when_idle"),
+      target: {
+        ...delivery().target,
+        session: { installationId: "ins_conformance", opaqueId: "thread-2" },
+      },
+    }),
+  ).toMatchObject({ outcome: "accepted" });
+  expect(methods.filter((method) => method.endsWith("requestApproval"))).toEqual([]);
+  await adapter.stop({ reason: "shutdown" });
+  fixture.close();
+});
+
+test("Codex distinguishes nonblocking input and globally blocks malformed unknown requests", async () => {
+  const fixture = await codexFixture(),
+    { adapter, context, serverResponses } = fixture;
+  await adapter.start(context);
+  expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
+    outcome: "accepted",
+    execution: { opaqueId: "turn-1" },
+  });
+  const controller = new AbortController(),
+    iterator = adapter.observe(controller.signal)[Symbol.asyncIterator]();
+  expect((await iterator.next()).value).toMatchObject({ type: "adapter.connection" });
+
+  fixture.request("item/tool/requestUserInput", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "item-nonblocking",
+    isBlocking: false,
+    questions: [],
+  });
+  const next = iterator.next();
+  expect(
+    await Promise.race([next.then(() => "event"), Bun.sleep(25).then(() => "none")]),
+  ).toBe("none");
+  controller.abort();
+  await next;
+
+  fixture.request("future/malformed/request", {});
+  await Bun.sleep(10);
+  expect(serverResponses).toEqual([]);
+  expect(
+    await adapter.deliver({
+      ...delivery("wake_when_idle"),
+      target: {
+        ...delivery().target,
+        session: { installationId: "ins_conformance", opaqueId: "unrelated-thread" },
+      },
+    }),
+  ).toEqual({ outcome: "deferred", reason: "busy" });
+
+  fixture.notify("serverRequest/resolved", { requestId: "server-request-1" });
+  await Bun.sleep(10);
+  expect(
+    await adapter.deliver({
+      ...delivery("wake_when_idle"),
+      target: {
+        ...delivery().target,
+        session: { installationId: "ins_conformance", opaqueId: "unrelated-thread" },
+      },
+    }),
+  ).toMatchObject({ outcome: "accepted" });
+  await adapter.stop({ reason: "shutdown" });
+  fixture.close();
+});
+
 test("Codex runtime adapter disables mutations for an untested runtime", async () => {
   const fixture = await codexFixture("codex-cli 99.0.0"),
     { adapter, context, methods } = fixture;
@@ -466,7 +640,9 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
   const path = join(root, "codex.sock"),
     methods: string[] = [],
     buffers = new WeakMap<object, Buffer>(),
-    failures = new Map<string, "overload" | "disconnect" | "hang">();
+    failures = new Map<string, "overload" | "disconnect" | "hang">(),
+    serverResponses: unknown[] = [],
+    logs: Array<{ event: string; attributes?: unknown }> = [];
   let fence = true,
     historyDelivery: string | undefined,
     loadedOnly = false,
@@ -506,8 +682,12 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
           const decoded = decodeClientFrame(pending);
           if (!decoded) break;
           pending = pending.subarray(decoded.consumed);
-          const request = record(JSON.parse(decoded.text)),
-            method = string(request.method);
+          const request = record(JSON.parse(decoded.text));
+          if (request.method === undefined) {
+            serverResponses.push(request);
+            continue;
+          }
+          const method = string(request.method);
           methods.push(method);
           const failure = failures.get(method);
           failures.delete(method);
@@ -555,11 +735,26 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     context: {
       installationId: "ins_conformance",
       instanceId: "conformance",
-      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      logger: {
+        debug(event, attributes) {
+          logs.push({ event, attributes });
+        },
+        info(event, attributes) {
+          logs.push({ event, attributes });
+        },
+        warn(event, attributes) {
+          logs.push({ event, attributes });
+        },
+        error(event, attributes) {
+          logs.push({ event, attributes });
+        },
+      },
       clock: { now: () => new Date().toISOString() },
       assertBindingFence: async () => (fence ? { valid: true } : { valid: false, reason: "stale" }),
     },
     methods,
+    serverResponses,
+    logs,
     failNext(method, failure) {
       failures.set(method, failure);
     },

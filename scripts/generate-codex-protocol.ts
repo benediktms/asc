@@ -84,6 +84,16 @@ try {
     mkdirSync(dirname(target), { recursive: true });
     cpSync(join(schema, file), target);
   }
+  const serverRequestSchema: {
+      oneOf: Array<{ properties?: { method?: { enum?: string[] } } }>;
+    } = JSON.parse(readFileSync(join(schema, "ServerRequest.json"), "utf8")),
+    serverRequestMethods = serverRequestSchema.oneOf.flatMap(
+      (request) => request.properties?.method?.enum ?? [],
+    );
+  writeFileSync(
+    join(output, "schema", "ServerRequestMethods.json"),
+    `${JSON.stringify(serverRequestMethods, null, 2)}\n`,
+  );
   const version = Bun.spawnSync([command, "--version"]);
   if (!version.success) throw new Error("could not read Codex version");
   writeFileSync(

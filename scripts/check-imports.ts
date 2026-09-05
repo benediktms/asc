@@ -1,7 +1,10 @@
 const allowed: Record<string, readonly string[]> = {
     "@a2a-js/": ["packages/protocol-a2a/"],
     "@modelcontextprotocol/": ["packages/bridge-mcp-codex/"],
-    "codex-protocol-generated": ["packages/runtime-codex/src/protocol-codec.ts"],
+    "codex-protocol-generated": [
+      "packages/runtime-codex/src/protocol-codec.ts",
+      "packages/runtime-codex/src/server-request-policy.ts",
+    ],
     "bun:": ["packages/storage-sqlite/", "packages/runtime-codex/", "apps/acs/"],
   },
   pureRoots = ["contracts/", "packages/domain/", "packages/ports/", "packages/application/"];
