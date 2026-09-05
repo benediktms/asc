@@ -180,6 +180,17 @@ describe("A2A JSON-RPC", () => {
         ?.state,
     ).toBe(5);
 
+    const binding = store.bind(agent.id, "sdk-client-thread"),
+      streamState = store.taskStreamState.bind(store);
+    let advancedDuringSubscription = false;
+    store.taskStreamState = (taskId, principalId, targetAgentId) => {
+      const state = streamState(taskId, principalId, targetAgentId);
+      if (state && !advancedDuringSubscription) {
+        advancedDuringSubscription = true;
+        store.setTaskState(taskId, binding.principalId, TaskState.Canceled);
+      }
+      return state;
+    };
     const streamedResponse = client.sendMessageStream(
         {
           tenant: "",
@@ -198,7 +209,6 @@ describe("A2A JSON-RPC", () => {
     if (initial.done || initial.value.payload?.$case !== "task")
       throw new Error("SDK stream did not return an initial task");
     const streamedTaskId = initial.value.payload.value.id;
-    await client.cancelTask({ tenant: "", id: streamedTaskId, metadata: undefined }, options);
     const terminal = await streamed.next();
     expect(terminal.value?.payload).toMatchObject({
       $case: "statusUpdate",
@@ -220,7 +230,6 @@ describe("A2A JSON-RPC", () => {
       options,
     );
     if (!("id" in resumable)) throw new Error("SDK client did not return a resumable task");
-    const binding = store.bind(agent.id, "sdk-client-thread");
     store.setTaskState(resumable.id, binding.principalId, TaskState.Working);
     const subscriptionResponse = client.resubscribeTask({ tenant: "", id: resumable.id }, options),
       subscription = subscriptionResponse[Symbol.asyncIterator](),

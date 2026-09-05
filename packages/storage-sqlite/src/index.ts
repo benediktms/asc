@@ -714,12 +714,18 @@ export class Store {
     return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
   }
   task(idValue: string, principalId: string, targetAgentId?: string): StoredTask | undefined {
+    return this.taskStreamState(idValue, principalId, targetAgentId)?.task;
+  }
+  taskStreamState(idValue: string, principalId: string, targetAgentId?: string) {
     const row = this.db
-      .query<TaskRow, [string, string, string | null, string | null, string]>(
-        "SELECT t.* FROM a2a_tasks t LEFT JOIN principals p ON p.id=? WHERE t.id=? AND (? IS NULL OR t.target_agent_id=?) AND (t.requester_principal_id=? OR p.agent_id=t.target_agent_id)",
+      .query<
+        { a2a_snapshot_json: string; sequence: number },
+        [string, string, string | null, string | null, string]
+      >(
+        "SELECT t.a2a_snapshot_json,t.next_event_sequence-1 sequence FROM a2a_tasks t LEFT JOIN principals p ON p.id=? WHERE t.id=? AND (? IS NULL OR t.target_agent_id=?) AND (t.requester_principal_id=? OR p.agent_id=t.target_agent_id)",
       )
       .get(principalId, idValue, targetAgentId ?? null, targetAgentId ?? null, principalId);
-    return row ? JSON.parse(row.a2a_snapshot_json) : undefined;
+    return row ? { task: parseTask(row.a2a_snapshot_json), sequence: row.sequence } : undefined;
   }
   listTasks(
     agentId: string,

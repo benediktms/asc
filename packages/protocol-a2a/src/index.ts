@@ -157,9 +157,11 @@ class Handler implements A2ARequestHandler {
     params: SendMessageRequest,
     context: ServerCallContext,
   ): AsyncGenerator<StreamResponse> {
-    const task = await this.sendMessage(params, context);
-    yield { payload: { $case: "task", value: task } };
-    yield* this.updates(task, principalName(context));
+    const accepted = await this.sendMessage(params, context),
+      principal = principalName(context),
+      state = this.streamState(accepted.id, principal);
+    yield { payload: { $case: "task", value: state.task } };
+    yield* this.updates(state.task, principal, state.sequence);
   }
   async getTask(params: GetTaskRequest, context: ServerCallContext) {
     const task = this.store.task(params.id, principalName(context), this.agent.id);
@@ -200,9 +202,10 @@ class Handler implements A2ARequestHandler {
     params: SubscribeToTaskRequest,
     context: ServerCallContext,
   ): AsyncGenerator<StreamResponse> {
-    const task = await this.getTask({ tenant: params.tenant, id: params.id }, context);
-    yield { payload: { $case: "task", value: task } };
-    yield* this.updates(task, principalName(context));
+    const principal = principalName(context),
+      state = this.streamState(params.id, principal);
+    yield { payload: { $case: "task", value: state.task } };
+    yield* this.updates(state.task, principal, state.sequence);
   }
   async createTaskPushNotificationConfig(
     _params: TaskPushNotificationConfig,
@@ -221,8 +224,16 @@ class Handler implements A2ARequestHandler {
   async deleteTaskPushNotificationConfig(): Promise<void> {
     throw new JsonRpcPushNotificationNotSupportedError();
   }
-  private async *updates(task: Task, principalId: string): AsyncGenerator<StreamResponse> {
-    let sequence = this.store.eventSequence(task.id);
+  private streamState(taskId: string, principalId: string) {
+    const state = this.store.taskStreamState(taskId, principalId, this.agent.id);
+    if (!state) throw new JsonRpcTaskNotFoundError();
+    return { task: asTask(state.task), sequence: state.sequence };
+  }
+  private async *updates(
+    task: Task,
+    principalId: string,
+    sequence: number,
+  ): AsyncGenerator<StreamResponse> {
     while (!terminal(task.status?.state)) {
       await new Promise((resolve) => setTimeout(resolve, 250));
       const events = this.store.eventsAfter(task.id, sequence);
