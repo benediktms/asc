@@ -951,9 +951,14 @@ export class DeliveryScheduler {
         .get(execution.task_id);
       if (
         !taskState ||
-        [TaskState.Completed, TaskState.Failed, TaskState.Canceled, TaskState.Rejected].includes(
-          taskState.state,
-        )
+        [
+          TaskState.InputRequired,
+          TaskState.AuthRequired,
+          TaskState.Completed,
+          TaskState.Failed,
+          TaskState.Canceled,
+          TaskState.Rejected,
+        ].includes(taskState.state)
       )
         return;
       const principal = required(

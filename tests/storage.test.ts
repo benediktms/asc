@@ -130,6 +130,30 @@ describe("durable acceptance", () => {
     expect(store.db.query("SELECT count(*) n FROM delivery_intents").get()).toEqual({ n: 1 });
     store.close();
   });
+  test("pins the active binding epoch in the durable acceptance transaction", () => {
+    const store = fixture(),
+      agent = store.createAgent("acceptance-fence"),
+      binding = store.bind(agent.id, "thread-at-acceptance"),
+      principal = authenticated(store),
+      accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "acceptance-fence",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        {},
+      );
+    expect(
+      store.db
+        .query<{ pinned_binding_id: string | null; pinned_binding_epoch: number | null }, [string]>(
+          "SELECT pinned_binding_id,pinned_binding_epoch FROM delivery_intents WHERE id=?",
+        )
+        .get(accepted.deliveryId),
+    ).toEqual({ pinned_binding_id: binding.id, pinned_binding_epoch: binding.epoch });
+    store.close();
+  });
   test("checks idempotency after acquiring the acceptance write lock", () => {
     const store = fixture(),
       agent = store.createAgent("idempotency-race"),
@@ -547,7 +571,6 @@ describe("durable acceptance", () => {
       Message.fromJSON({
         messageId: "request-2-continuation",
         taskId: accepted.task.id,
-        contextId: accepted.task.contextId,
         role: Role.ROLE_USER,
         parts: [{ text: "continued" }],
       }),
@@ -639,8 +662,21 @@ describe("durable acceptance", () => {
     store.db
       .query("UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?")
       .run(first.id, first.epoch, accepted.deliveryId);
+    store.setTaskState(accepted.task.id, first.principalId, TaskState.Working);
+    store.setTaskState(accepted.task.id, first.principalId, TaskState.InputRequired, "continue");
     expect(() => store.bind(target.id, "new-thread")).toThrow("BINDING_CONFLICT");
     const rebound = store.bind(target.id, "new-thread", { revokeExisting: true });
+    const continuation = store.accept(
+      target.id,
+      requester.id,
+      Message.fromJSON({
+        messageId: "request-4-continuation",
+        taskId: accepted.task.id,
+        role: Role.ROLE_USER,
+        parts: [{ text: "continue" }],
+      }),
+      { mode: "append_context" },
+    );
     expect(
       store.db
         .query<{ disabled_at_ms: number | null }, [string]>(
@@ -655,6 +691,13 @@ describe("durable acceptance", () => {
         )
         .get(accepted.deliveryId),
     ).toEqual({ pinned_binding_id: first.id, pinned_binding_epoch: first.epoch });
+    expect(
+      store.db
+        .query<{ pinned_binding_id: string; pinned_binding_epoch: number }, [string]>(
+          "SELECT pinned_binding_id,pinned_binding_epoch FROM delivery_intents WHERE id=?",
+        )
+        .get(continuation.deliveryId),
+    ).toEqual({ pinned_binding_id: rebound.id, pinned_binding_epoch: rebound.epoch });
     expect(() =>
       store.setTaskState(
         accepted.task.id,

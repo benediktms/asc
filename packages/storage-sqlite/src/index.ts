@@ -1081,7 +1081,6 @@ export class Store {
       ).count;
       if (queued >= this.limits.maxQueuedDeliveryIntents) throw new Error("ACS_OVERLOADED");
       const now = Date.now(),
-        contextId = message.contextId || id("ctx"),
         taskId = message.taskId || id("tsk"),
         messageRowId = id("msg"),
         deliveryId = id("int");
@@ -1096,6 +1095,7 @@ export class Store {
       const continuation = message.taskId
         ? this.db.query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?").get(message.taskId)
         : null;
+      const contextId = message.contextId || continuation?.context_id || id("ctx");
       if (
         continuation &&
         (continuation.requester_principal_id !== principalId ||
@@ -1191,7 +1191,12 @@ export class Store {
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
       const mode = options.mode ?? this.limits.defaultMode,
-        priority = { low: 0, normal: 10, high: 20 }[options.priority ?? "normal"];
+        priority = { low: 0, normal: 10, high: 20 }[options.priority ?? "normal"],
+        acceptedBinding = this.db
+          .query<{ id: BindingId; epoch: number }, [string]>(
+            "SELECT id,epoch FROM runtime_bindings WHERE agent_id=? AND status='active'",
+          )
+          .get(agentId);
       const payload = {
         taskId,
         contextId,
@@ -1201,7 +1206,7 @@ export class Store {
       };
       this.db
         .query(
-          "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .run(
           deliveryId,
@@ -1209,6 +1214,8 @@ export class Store {
           taskId,
           messageRowId,
           agentId,
+          acceptedBinding?.id ?? null,
+          acceptedBinding?.epoch ?? null,
           mode,
           priority,
           DeliveryState.Pending,
@@ -1641,7 +1648,7 @@ export class Store {
   private assignedTask(taskId: string, principalId: string) {
     const row = this.db
       .query<TaskRow, [string, string]>(
-        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id JOIN runtime_bindings b ON b.id=p.binding_id AND b.status='active' WHERE t.id=? AND p.disabled_at_ms IS NULL AND (NOT EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.pinned_binding_id IS NOT NULL) OR EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.pinned_binding_id=b.id AND i.pinned_binding_epoch=b.epoch))",
+        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id JOIN runtime_bindings b ON b.id=p.binding_id AND b.status='active' WHERE t.id=? AND p.disabled_at_ms IS NULL AND (NOT EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.kind='a2a-message' AND i.pinned_binding_id IS NOT NULL) OR EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.kind='a2a-message' AND i.pinned_binding_id=b.id AND i.pinned_binding_epoch=b.epoch AND i.id=(SELECT first_intent.id FROM delivery_intents first_intent WHERE first_intent.task_id=t.id AND first_intent.kind='a2a-message' AND first_intent.pinned_binding_id IS NOT NULL ORDER BY first_intent.created_at_ms,first_intent.id LIMIT 1)))",
       )
       .get(principalId, taskId);
     if (!row) throw new Error("TASK_NOT_ASSIGNED");
