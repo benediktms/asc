@@ -17,7 +17,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { spawn } from "node:child_process";
 import { createConnection } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { RuntimePaths } from "../../../packages/config/src/index";
@@ -168,10 +167,11 @@ export function spawnDaemon(paths: RuntimePaths) {
   const descriptor = openSync(paths.daemonLog, "a", 0o600),
     instanceId = randomUUID(),
     command = selfCommand(["daemon", "run", "--instance", instanceId]),
-    child = spawn(command[0], command.slice(1), {
-      detached: true,
+    child = Bun.spawn(command, {
       env: { ...process.env, ACS_MANAGED_DAEMON: "1" },
-      stdio: ["ignore", descriptor, descriptor],
+      stdin: "ignore",
+      stdout: descriptor,
+      stderr: descriptor,
     });
   child.unref();
   closeSync(descriptor);
