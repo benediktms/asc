@@ -37,7 +37,7 @@ test("two Codex agents complete the canonical task workflow across every public 
   servers.push(emulator.server);
   const env = environment(root, socket, port);
   writeFileSync(join(root, "config.toml"), config(port));
-  command(env, "init");
+  runCommand(env, "init");
   let daemon = await startDaemon(env),
     correlationId = "not-yet-issued";
   try {
@@ -538,13 +538,17 @@ function createClaim(env: Record<string, string | undefined>, agent: string) {
 }
 
 function command(env: Record<string, string | undefined>, ...args: string[]) {
+  const output = runCommand(env, ...args).trim();
+  return output ? record(JSON.parse(output)) : {};
+}
+
+function runCommand(env: Record<string, string | undefined>, ...args: string[]) {
   const result = Bun.spawnSync([process.execPath, "apps/acs/src/main.ts", ...args], {
     cwd: join(import.meta.dir, ".."),
     env,
   });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
-  const output = result.stdout.toString().trim();
-  return output ? record(JSON.parse(output)) : {};
+  return result.stdout.toString();
 }
 
 function environment(root: string, socket: string, port: number) {

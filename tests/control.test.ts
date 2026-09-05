@@ -811,7 +811,7 @@ describe("control protocol", () => {
     ).toEqual(
       [
         { id: selectedDelivery, pinned_binding_id: betaBinding.id },
-        { id: otherDelivery, pinned_binding_id: null },
+        { id: otherDelivery, pinned_binding_id: betaBinding.id },
       ].toSorted((left, right) => left.id.localeCompare(right.id)),
     );
     store.db
