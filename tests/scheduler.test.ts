@@ -116,6 +116,82 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("follows eligible rebinds and terminates unsafe delivery conditions", async () => {
+    const store = fixture(),
+      requester = authenticated(store),
+      follow = store.createAgent("follow-rebind"),
+      strict = store.createAgent("strict-rebind"),
+      expired = store.createAgent("expired-target"),
+      disabled = store.createAgent("disabled-target"),
+      followOld = store.bind(follow.id, "follow-old"),
+      strictOld = store.bind(strict.id, "strict-old", { continuityPolicy: "strict" });
+    store.bind(expired.id, "expired-thread");
+    store.bind(disabled.id, "disabled-thread");
+    const followDelivery = store.accept(
+        follow.id,
+        requester.id,
+        Message.fromJSON({ messageId: "follow", role: "ROLE_USER", parts: [{ text: "work" }] }),
+        { mode: "append_context" },
+      ),
+      strictDelivery = store.accept(
+        strict.id,
+        requester.id,
+        Message.fromJSON({ messageId: "strict", role: "ROLE_USER", parts: [{ text: "work" }] }),
+        { mode: "append_context" },
+      ),
+      expiredDelivery = store.accept(
+        expired.id,
+        requester.id,
+        Message.fromJSON({ messageId: "expired", role: "ROLE_USER", parts: [{ text: "work" }] }),
+        { mode: "append_context", expiresAt: new Date(Date.now() - 1000).toISOString() },
+      ),
+      disabledDelivery = store.accept(
+        disabled.id,
+        requester.id,
+        Message.fromJSON({ messageId: "disabled", role: "ROLE_USER", parts: [{ text: "work" }] }),
+        { mode: "append_context" },
+      );
+    const pin = store.db.query(
+      "UPDATE delivery_intents SET state='deferred',pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?",
+    );
+    pin.run(followOld.id, followOld.epoch, followDelivery.deliveryId);
+    pin.run(strictOld.id, strictOld.epoch, strictDelivery.deliveryId);
+    store.bind(follow.id, "follow-new", { revokeExisting: true });
+    store.bind(strict.id, "strict-new", { revokeExisting: true });
+    store.updateAgent(disabled.id, { enabled: false });
+    const sessions: string[] = [],
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async (request) => {
+      sessions.push(request.target.session.opaqueId);
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "accepted" },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "continuity");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(sessions).toEqual(["follow-new"]);
+    expect(deliveryState(store, followDelivery.deliveryId)).toEqual({
+      state: "accepted",
+      state_reason: null,
+    });
+    expect(deliveryState(store, strictDelivery.deliveryId)).toEqual({
+      state: "failed-terminal",
+      state_reason: "strict-binding-revoked",
+    });
+    expect(deliveryState(store, expiredDelivery.deliveryId)).toEqual({
+      state: "failed-terminal",
+      state_reason: "deadline-expired",
+    });
+    expect(deliveryState(store, disabledDelivery.deliveryId)).toEqual({
+      state: "failed-terminal",
+      state_reason: "target-disabled",
+    });
+    await scheduler.stop();
+    store.close();
+  });
   test("interrupts only the correlated ACS execution on cancellation", async () => {
     const store = fixture(),
       agent = store.createAgent("cancel-target"),
@@ -266,4 +342,12 @@ function authenticated(store: Store) {
   const principal = store.authenticate(readFileSync(store.config.token, "utf8"));
   if (!principal) throw new Error("missing test principal");
   return principal;
+}
+
+function deliveryState(store: Store, deliveryId: string) {
+  return store.db
+    .query<{ state: string; state_reason: string | null }, [string]>(
+      "SELECT state,state_reason FROM delivery_intents WHERE id=?",
+    )
+    .get(deliveryId);
 }

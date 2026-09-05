@@ -270,8 +270,13 @@ export class DeliveryScheduler {
   private lease() {
     return telemetry.traceSync("delivery.lease", () =>
       this.store.write(() => {
-        const now = Date.now(),
-          rows = this.store.db
+        const now = Date.now();
+        this.store.db
+          .query(
+            "UPDATE delivery_intents SET state='failed-terminal',state_reason='deadline-expired',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE state IN ('pending','deferred') AND deadline_ms IS NOT NULL AND deadline_ms<=?",
+          )
+          .run(now, now);
+        const rows = this.store.db
             .query<DeliveryIntentRow, [number, number, number]>(
               "SELECT * FROM delivery_intents WHERE state IN ('pending','deferred') AND not_before_ms<=? AND (deadline_ms IS NULL OR deadline_ms>?) AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms<=?) ORDER BY priority DESC,not_before_ms,created_at_ms LIMIT 100",
             )
@@ -288,13 +293,21 @@ export class DeliveryScheduler {
     );
   }
   private async deliver(intent: DeliveryIntentRow) {
+    const target = this.store.agent(intent.target_agent_id);
+    if (!target?.enabled) return this.failTerminal(intent.id, "target-disabled");
     const now = Date.now(),
-      binding = intent.pinned_binding_id
+      pinned = intent.pinned_binding_id
         ? this.store.db
             .query<BindingRow, [BindingId, number | null]>(
-              "SELECT * FROM runtime_bindings WHERE id=? AND epoch=? AND status='active'",
+              "SELECT * FROM runtime_bindings WHERE id=? AND epoch=?",
             )
             .get(intent.pinned_binding_id, intent.pinned_binding_epoch)
+        : undefined;
+    if (pinned && pinned.status !== "active" && pinned.continuity_policy === "strict")
+      return this.failTerminal(intent.id, "strict-binding-revoked");
+    const binding =
+      pinned?.status === "active"
+        ? pinned
         : this.store.db
             .query<BindingRow, [`agt_${string}`]>(
               "SELECT * FROM runtime_bindings WHERE agent_id=? AND status='active'",
@@ -322,8 +335,7 @@ export class DeliveryScheduler {
         )
         .run(attempt, intent.id, number, "codex.app-server", binding.id, binding.epoch, now, now);
     });
-    const target = this.store.agent(intent.target_agent_id),
-      payload: DeliveryPayload = JSON.parse(intent.payload_json),
+    const payload: DeliveryPayload = JSON.parse(intent.payload_json),
       parties = required(
         this.store.db
           .query<PartiesRow, [`tsk_${string}`]>(
@@ -332,7 +344,6 @@ export class DeliveryScheduler {
           .get(intent.task_id),
         "delivery parties",
       );
-    if (!target) throw new Error("target agent missing");
     const notification = intent.kind === "task-event-notification";
     const envelope: RuntimeDeliveryEnvelopeV1 = {
       schema: "urn:agent-communications:runtime-envelope:v1",
@@ -472,6 +483,13 @@ export class DeliveryScheduler {
         "UPDATE delivery_intents SET state='deferred',state_reason=?,not_before_ms=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=?",
       )
       .run(reason, now + delay, now, intentId);
+  }
+  private failTerminal(intentId: string, reason: string) {
+    this.store.db
+      .query(
+        "UPDATE delivery_intents SET state='failed-terminal',state_reason=?,lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=?",
+      )
+      .run(reason, Date.now(), intentId);
   }
   private async runtimeDeliver(request: RuntimeDeliveryRequest) {
     const started = performance.now();
