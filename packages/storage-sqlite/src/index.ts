@@ -1191,7 +1191,12 @@ export class Store {
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
       const mode = options.mode ?? this.limits.defaultMode,
-        priority = { low: 0, normal: 10, high: 20 }[options.priority ?? "normal"];
+        priority = { low: 0, normal: 10, high: 20 }[options.priority ?? "normal"],
+        acceptedBinding = this.db
+          .query<{ id: BindingId; epoch: number }, [string]>(
+            "SELECT id,epoch FROM runtime_bindings WHERE agent_id=? AND status='active'",
+          )
+          .get(agentId);
       const payload = {
         taskId,
         contextId,
@@ -1201,7 +1206,7 @@ export class Store {
       };
       this.db
         .query(
-          "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .run(
           deliveryId,
@@ -1209,6 +1214,8 @@ export class Store {
           taskId,
           messageRowId,
           agentId,
+          acceptedBinding?.id ?? null,
+          acceptedBinding?.epoch ?? null,
           mode,
           priority,
           DeliveryState.Pending,

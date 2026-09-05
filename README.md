@@ -66,3 +66,9 @@ notifications through one Unix-socket app-server; reconnect behavior is covered
 by the adapter conformance suite. User-routed command approvals remain exclusive
 to the TUI. `requestUserInput` fans out to every subscribed client, but ACS never
 answers it, so a missing local owner fails closed.
+
+The canonical product proof is the
+[two-agent workflow](docs/two-agent-workflow.md). Its deterministic emulator test
+runs in normal CI across the MCP, control, A2A, scheduler, SQLite, and Codex
+adapter boundaries. With ASC and two real Codex threads running, use
+`bun run test:codex-e2e` for the guided provenance-preserving verification.

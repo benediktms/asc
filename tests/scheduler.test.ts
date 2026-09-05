@@ -1071,6 +1071,78 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("finishes a Codex turn without completing a task that explicitly requested input", async () => {
+    const store = fixture(),
+      agent = store.createAgent("input-cycle-target"),
+      requester = authenticated(store),
+      binding = store.bind(agent.id, "thread-input-cycle"),
+      bindingRow = store.binding(binding.id),
+      accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "input-cycle",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter(),
+      runtimeAccepted = Promise.withResolvers<void>(),
+      finishRuntime = Promise.withResolvers<void>();
+    if (!bindingRow) throw new Error("missing binding");
+    adapter.deliver = async () => {
+      runtimeAccepted.resolve();
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "input-cycle-turn", alreadyRunning: false },
+        evidence: { scheme: "fake", value: "input-cycle-turn" },
+      };
+    };
+    adapter.observe = async function* (signal) {
+      yield { type: "adapter.connection", state: "online" };
+      await finishRuntime.promise;
+      yield {
+        type: "execution.completed",
+        execution: {
+          opaqueId: "input-cycle-turn",
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: bindingRow.session_opaque_id,
+          },
+        },
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "Waiting for input" }],
+      };
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "input-cycle");
+    await scheduler.start();
+    await runtimeAccepted.promise;
+    await Bun.sleep(50);
+    const assignee = store.db
+      .query<{ id: `prn_${string}` }, [string]>("SELECT id FROM principals WHERE binding_id=?")
+      .get(binding.id);
+    if (!assignee) throw new Error("missing assignee principal");
+    store.setTaskState(
+      accepted.task.id,
+      assignee.id,
+      TaskState.InputRequired,
+      "Which consistency level?",
+    );
+    finishRuntime.resolve();
+    await Bun.sleep(100);
+    expect(
+      store.db
+        .query<{ state: string }, [string]>("SELECT state FROM a2a_tasks WHERE id=?")
+        .get(accepted.task.id)?.state,
+    ).toBe("input-required");
+    await scheduler.stop();
+    store.close();
+  });
   test("reconciles an ambiguous runtime write without redelivery", async () => {
     const store = fixture(),
       agent = store.createAgent("ambiguous-target"),

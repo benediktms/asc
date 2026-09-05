@@ -130,6 +130,30 @@ describe("durable acceptance", () => {
     expect(store.db.query("SELECT count(*) n FROM delivery_intents").get()).toEqual({ n: 1 });
     store.close();
   });
+  test("pins the active binding epoch in the durable acceptance transaction", () => {
+    const store = fixture(),
+      agent = store.createAgent("acceptance-fence"),
+      binding = store.bind(agent.id, "thread-at-acceptance"),
+      principal = authenticated(store),
+      accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "acceptance-fence",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        {},
+      );
+    expect(
+      store.db
+        .query<{ pinned_binding_id: string | null; pinned_binding_epoch: number | null }, [string]>(
+          "SELECT pinned_binding_id,pinned_binding_epoch FROM delivery_intents WHERE id=?",
+        )
+        .get(accepted.deliveryId),
+    ).toEqual({ pinned_binding_id: binding.id, pinned_binding_epoch: binding.epoch });
+    store.close();
+  });
   test("checks idempotency after acquiring the acceptance write lock", () => {
     const store = fixture(),
       agent = store.createAgent("idempotency-race"),
