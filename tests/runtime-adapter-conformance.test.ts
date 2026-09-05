@@ -154,6 +154,29 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
           summary: "Local runtime input required",
         },
       });
+      const output = iterator.next();
+      fixture.notify("item/completed", {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: { type: "reasoning", summary: ["private reasoning"] },
+      });
+      expect(
+        await Promise.race([output.then(() => "event"), Bun.sleep(25).then(() => "none")]),
+      ).toBe("none");
+      fixture.notify("item/completed", {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: { type: "agentMessage", text: "final answer" },
+      });
+      expect((await output).value).toEqual({
+        type: "execution.output",
+        execution: {
+          opaqueId: "turn-1",
+          session: { installationId: "ins_conformance", opaqueId: "thread-1" },
+        },
+        channel: "final-message",
+        parts: [{ kind: "text", text: "final answer", mediaType: "text/markdown" }],
+      });
       const completion = iterator.next();
       fixture.notify("turn/completed", {
         turn: { id: "foreign-turn", status: "completed" },
@@ -165,6 +188,7 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       expect((await completion).value).toMatchObject({
         type: "execution.completed",
         execution: { opaqueId: "turn-1" },
+        finalParts: [{ kind: "text", text: "final answer" }],
       });
 
       fixture.failNext("thread/inject_items", "overload");
