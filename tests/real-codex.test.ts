@@ -3,8 +3,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeReconcileRequest } from "../contracts/runtime-adapter";
+import { controlHandler } from "../packages/protocol-control/src/index";
 import { CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../packages/runtime-codex/src/app-server-client";
+import { Store } from "../packages/storage-sqlite/src/index";
 
 test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
   "discovers threads and reconciles a wake through an isolated real Codex app-server",
@@ -34,6 +36,44 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
       const page = await adapter.listSessions({ limit: 10 });
       expect(page.sessions).toHaveLength(2);
       expect(page.sessions.every((session) => session.availability === "idle")).toBe(true);
+      const store = new Store({
+          data: join(root, "acs.db"),
+          runtime: join(root, "control.sock"),
+          token: join(root, "control.token"),
+          bridgeToken: join(root, "bridge.token"),
+          secret: join(root, "secret.key"),
+        }),
+        control = controlHandler(store, new Date().toISOString(), () => {}, adapter),
+        token = readFileSync(join(root, "control.token"), "utf8"),
+        call = async (method: string, params: unknown) => {
+          const response = await control(
+              new Request("http://localhost", {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  "ACS-Control-Version": "1",
+                  "content-type": "application/json",
+                },
+                body: JSON.stringify({ jsonrpc: "2.0", id: method, method, params }),
+              }),
+            ),
+            rpc = record(await response.json());
+          if (rpc.error) throw new Error(JSON.stringify(rpc.error));
+          return record(rpc.result);
+        };
+      for (const [index, slug] of ["sender", "recipient"].entries()) {
+        const session = page.sessions.at(index);
+        if (!session) throw new Error(`missing Codex thread for ${slug}`);
+        await call("agents.create", { slug });
+        await call("bindings.bind", { agent: slug, session: session.session });
+        expect(
+          record(
+            await call("bridge.identity", {
+              evidence: { metadata: { threadId: session.session.opaqueId } },
+            }),
+          ).agent,
+        ).toMatchObject({ slug });
+      }
       const target = page.sessions.at(0);
       if (!target) throw new Error("missing discovered Codex thread");
       expect(
@@ -114,6 +154,7 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
         },
       });
       await adapter.stop({ reason: "shutdown" });
+      store.close();
       setup.close();
     } finally {
       child.kill();
