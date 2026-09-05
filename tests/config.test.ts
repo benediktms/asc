@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../packages/config/src/index";
+import { defaultLocations, loadConfig } from "../packages/config/src/index";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -10,6 +10,24 @@ afterEach(() => {
 });
 
 describe("configuration", () => {
+  test("uses XDG locations on Linux", () => {
+    expect(
+      defaultLocations(
+        {
+          HOME: "/home/agent",
+          XDG_CONFIG_HOME: "/config",
+          XDG_DATA_HOME: "/data",
+          XDG_RUNTIME_DIR: "/run/user/42",
+        },
+        "linux",
+        42,
+      ),
+    ).toEqual({
+      configDirectory: "/config/acs",
+      dataDirectory: "/data/acs",
+      runtimeSocket: "/run/user/42/acs/control.sock",
+    });
+  });
   test("loads typed TOML and rejects unknown or non-loopback settings", () => {
     const root = mkdtempSync(join(tmpdir(), "acs-config-"));
     roots.push(root);
@@ -30,5 +48,11 @@ describe("configuration", () => {
     expect(() => loadConfig(path)).toThrow("loopback");
     writeFileSync(path, `[daemon]\ncontrol_socket = "/${"x".repeat(200)}"\n`);
     expect(() => loadConfig(path)).toThrow("daemon.control_socket exceeds");
+    writeFileSync(path, '[runtimes.codex]\nconnection = "stdio"\n');
+    expect(() => loadConfig(path)).toThrow("invalid runtimes.codex.connection");
+    writeFileSync(path, '[daemon]\nlog_level = "verbose"\n');
+    expect(() => loadConfig(path)).toThrow("invalid daemon.log_level");
+    writeFileSync(path, '[daemon]\nlog_format = "xml"\n');
+    expect(() => loadConfig(path)).toThrow("invalid daemon.log_format");
   });
 });

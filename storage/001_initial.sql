@@ -236,6 +236,18 @@ CREATE TABLE task_events (
 CREATE INDEX task_events_task_created_idx
   ON task_events(task_id, created_at_ms, sequence);
 
+CREATE TRIGGER task_events_no_update
+BEFORE UPDATE ON task_events
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EVENT_IMMUTABLE');
+END;
+
+CREATE TRIGGER task_events_no_delete
+BEFORE DELETE ON task_events
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EVENT_IMMUTABLE');
+END;
+
 CREATE TABLE task_subscriptions (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES a2a_tasks(id),
@@ -329,6 +341,19 @@ CREATE TABLE delivery_attempts (
 
 CREATE INDEX delivery_attempts_intent_idx
   ON delivery_attempts(intent_id, attempt_number DESC);
+
+CREATE TRIGGER delivery_attempts_completed_immutable
+BEFORE UPDATE ON delivery_attempts
+WHEN OLD.outcome IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'DELIVERY_ATTEMPT_IMMUTABLE');
+END;
+
+CREATE TRIGGER delivery_attempts_no_delete
+BEFORE DELETE ON delivery_attempts
+BEGIN
+  SELECT RAISE(ABORT, 'DELIVERY_ATTEMPT_IMMUTABLE');
+END;
 
 CREATE TABLE runtime_executions (
   id TEXT PRIMARY KEY,

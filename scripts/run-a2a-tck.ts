@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Store } from "../packages/storage-sqlite/src/index";
 
 const tck = process.env.A2A_TCK_DIR;
 if (!tck || !existsSync(join(tck, "run_tck.py")))
@@ -33,6 +34,15 @@ let daemon: Bun.Subprocess | undefined,
 try {
   run([process.execPath, "build", "apps/acs/src/main.ts", "--compile", "--outfile", binary]);
   run([binary, "init"], undefined, env);
+  const tokenStore = new Store({
+      data: env.ACS_STORAGE_PATH,
+      runtime: env.ACS_CONTROL_SOCKET,
+      token: join(root, "control.token"),
+      bridgeToken: join(root, "bridge.token"),
+      secret: join(root, "secret.key"),
+    }),
+    token = tokenStore.createToken().token;
+  tokenStore.close();
   emulator = startCodexEmulator(codexSocket);
   daemon = Bun.spawn([binary, "daemon", "start"], { env, stdout: "ignore", stderr: "pipe" });
   await waitFor(() => existsSync(env.ACS_CONTROL_SOCKET));
@@ -42,8 +52,7 @@ try {
     undefined,
     env,
   );
-  const token = run([binary, "token", "show"], undefined, env).stdout.trim(),
-    upstream = `http://127.0.0.1:${servicePort}/agents/tck-agent`;
+  const upstream = `http://127.0.0.1:${servicePort}/agents/tck-agent`;
   proxy = Bun.serve({
     hostname: "127.0.0.1",
     port: proxyPort,
@@ -89,13 +98,14 @@ try {
     { cwd: tck, stdout: "inherit", stderr: "inherit" },
   );
   const exitCode = await tckProcess.exited;
-  if (exitCode !== 0) verifyExpectedFailures(tck, `http://127.0.0.1:${proxyPort}`);
+  if (exitCode !== 0 && exitCode !== 1) throw new Error(`A2A TCK exited with status ${exitCode}`);
+  verifyExpectedFailures(tck, `http://127.0.0.1:${proxyPort}`);
 } finally {
-  proxy?.stop(true);
   if (daemon) {
     daemon.kill("SIGTERM");
     await daemon.exited;
   }
+  await proxy?.stop(true);
   emulator?.stop();
   rmSync(root, { recursive: true });
 }

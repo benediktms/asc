@@ -15,15 +15,36 @@ for (const target of selected) {
   rmSync(output, { recursive: true, force: true });
   mkdirSync(output, { recursive: true });
   const executable = join(output, "acs"),
+    metafile = join(output, "build-meta.json"),
     build = Bun.spawnSync([
       "bun",
       "build",
       join(root, "apps/acs/src/main.ts"),
       "--compile",
       `--target=${target}`,
+      `--metafile=${metafile}`,
       `--outfile=${executable}`,
     ]);
   if (!build.success) throw new Error(build.stderr.toString() || `build failed for ${target}`);
+  const metadata: unknown = JSON.parse(readFileSync(metafile, "utf8"));
+  if (!isRecord(metadata) || !isRecord(metadata.inputs))
+    throw new Error("invalid Bun build metafile");
+  const forbidden = [
+      "node_modules/express/",
+      "node_modules/@grpc/",
+      "node_modules/better-sqlite3/",
+      "node_modules/sqlite3/",
+      "node_modules/typeorm/",
+      "node_modules/@prisma/",
+      "node_modules/prisma/",
+      "node_modules/sequelize/",
+    ],
+    bundled = Object.keys(metadata.inputs).find(
+      (input) =>
+        input.endsWith(".node") || forbidden.some((dependency) => input.includes(dependency)),
+    );
+  if (bundled) throw new Error(`forbidden production dependency bundled: ${bundled}`);
+  rmSync(metafile);
   for (const file of ["LICENSE", "THIRD_PARTY_NOTICES"])
     copyFileSync(join(root, file), join(output, file));
   const files = ["acs", "LICENSE", "THIRD_PARTY_NOTICES"],
@@ -37,4 +58,8 @@ for (const target of selected) {
       .join("\n");
   writeFileSync(join(output, "SHA256SUMS"), `${sums}\n`);
   console.log(output);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

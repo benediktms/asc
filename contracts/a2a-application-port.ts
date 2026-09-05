@@ -6,7 +6,7 @@
  * imports the A2A SDK.
  */
 
-import type { JsonObject, NeutralPart } from "./runtime-adapter";
+import type { JsonObject, NeutralPart, RuntimeTraceContext } from "./runtime-adapter";
 
 export interface AuthenticatedPrincipal {
   readonly id: string;
@@ -51,6 +51,7 @@ export interface AcceptA2AMessageCommand {
   readonly messageMetadata: JsonObject;
   readonly delivery: DeliveryPreference;
   readonly canonicalRequestHash: string;
+  readonly traceContext?: RuntimeTraceContext;
 }
 
 export interface AcceptedTaskSnapshot {
@@ -85,6 +86,9 @@ export interface A2ATaskListQuery {
   readonly target: A2ATarget;
   readonly contextId?: string;
   readonly states?: readonly string[];
+  readonly updatedAfter?: string;
+  readonly historyLength?: number;
+  readonly includeArtifacts?: boolean;
   readonly pageSize?: number;
   readonly cursor?: string;
 }
@@ -92,6 +96,7 @@ export interface A2ATaskListQuery {
 export interface A2ATaskPage {
   readonly tasks: readonly JsonObject[];
   readonly nextCursor?: string;
+  readonly totalSize: number;
 }
 
 export interface CancelA2ATaskCommand {

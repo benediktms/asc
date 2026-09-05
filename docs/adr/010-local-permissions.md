@@ -2,9 +2,11 @@
 
 Status: accepted
 
-ACS does not approve recipient actions or treat peer content as permission. Wake that could transfer approval ownership remains disabled until the ownership gate is proven.
+ACS does not approve recipient actions or treat peer content as permission.
 
 A real Codex `0.153.2` probe with a TUI and ACS subscribed to the same thread
 showed that `item/tool/requestUserInput` is delivered to both clients. The TUI
 remains the only client that answers; ACS records the wait and does not send a
-response. This fan-out means the ownership gate is unsafe, not merely untested.
+response. A second probe with `approvalsReviewer=user` showed that a command
+approval is routed only to the TUI; ACS receives no server request and the
+command remains blocked. Without a local owner, ACS's non-response fails closed.

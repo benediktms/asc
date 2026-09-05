@@ -251,6 +251,7 @@ export interface ControlMethodMap {
   "agents.update": {
     readonly params: {
       readonly agent: string;
+      readonly slug?: string;
       readonly displayName?: string;
       readonly description?: string;
       readonly enabled?: boolean;
@@ -480,7 +481,9 @@ export interface ControlMethodMap {
   };
 
   "inbox.list": {
-    readonly params: ExecutorTaskEvidence & {
+    readonly params: {
+      readonly evidence?: ExecutorTaskEvidence["evidence"];
+      readonly agent?: string;
       readonly states?: readonly TaskDto["state"][];
       readonly limit?: number;
       readonly cursor?: string;
@@ -512,10 +515,7 @@ export interface ControlMethodMap {
   };
 
   "deliveries.retry": {
-    readonly params: {
-      readonly deliveryId: string;
-      readonly force?: boolean;
-    };
+    readonly params: { readonly deliveryId: string };
     readonly result: { readonly delivery: DeliveryDto };
   };
 

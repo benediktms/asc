@@ -7,6 +7,37 @@
 
 export type CodexWireId = string | number;
 
+export enum CodexAppServerFailureKind {
+  Backpressure = "BACKPRESSURE",
+  ConnectionLost = "CONNECTION_LOST",
+  ConnectionUnavailable = "CONNECTION_UNAVAILABLE",
+  InvalidPayload = "INVALID_PAYLOAD",
+  NotInitialized = "NOT_INITIALIZED",
+  NotRunning = "NOT_RUNNING",
+  RequestAbortedAfterWrite = "REQUEST_ABORTED_AFTER_WRITE",
+  RequestMarkerFailedAfterWrite = "REQUEST_MARKER_FAILED_AFTER_WRITE",
+  RequestTimedOut = "REQUEST_TIMED_OUT",
+  SessionNotFound = "SESSION_NOT_FOUND",
+  UnsupportedMethod = "UNSUPPORTED_METHOD",
+  Unknown = "UNKNOWN",
+}
+
+export interface CodexAppServerFailureDto {
+  readonly kind: CodexAppServerFailureKind;
+  readonly requestFlushed: boolean;
+  readonly rpcCode?: number;
+}
+
+export class CodexAppServerError extends Error {
+  constructor(
+    message: string,
+    readonly failure: CodexAppServerFailureDto,
+  ) {
+    super(message);
+    this.name = "CodexAppServerError";
+  }
+}
+
 export type CodexJson =
   | null
   | boolean
@@ -14,6 +45,60 @@ export type CodexJson =
   | string
   | CodexJson[]
   | { readonly [key: string]: CodexJson };
+
+export interface CodexThreadDto {
+  readonly id: string;
+  readonly preview: string;
+  readonly name: string | null;
+  readonly updatedAt: number;
+  readonly cwd: string;
+  readonly cliVersion: string;
+  readonly source: unknown;
+  readonly status: { readonly type: string };
+}
+
+export interface CodexThreadListRequestDto {
+  readonly cursor?: string | null;
+  readonly limit?: number | null;
+  readonly sourceKinds?: readonly string[] | null;
+  readonly useStateDbOnly?: boolean;
+  readonly searchTerm?: string | null;
+}
+
+export interface CodexThreadReadRequestDto {
+  readonly threadId: string;
+  readonly includeTurns?: boolean;
+}
+
+export interface CodexThreadStartRequestDto {
+  readonly cwd?: string | null;
+  readonly ephemeral?: boolean | null;
+  readonly approvalPolicy?: "untrusted" | "on-request" | "never" | null;
+  readonly sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
+}
+
+export interface CodexThreadInjectItemsRequestDto {
+  readonly threadId: string;
+  readonly items: readonly CodexJson[];
+}
+
+export interface CodexTurnStartRequestDto {
+  readonly threadId: string;
+  readonly input: readonly CodexJson[];
+  readonly turnTrigger?: string | null;
+  readonly toolOutput?: {
+    readonly name: string;
+    readonly namespace: string | null;
+    readonly output: string;
+  } | null;
+}
+
+export interface CodexFunctionCallOutputDto {
+  readonly type: "function_call_output";
+  readonly name: string;
+  readonly namespace: string;
+  readonly output: string;
+}
 
 export interface CodexWireRequest {
   readonly id: CodexWireId;
@@ -91,8 +176,7 @@ export type CodexRpcResult =
     }
   | {
       readonly outcome: "transport-failure";
-      readonly requestFlushed: boolean;
-      readonly error: Error;
+      readonly failure: CodexAppServerFailureDto;
     };
 
 export interface CodexAppServerClient {

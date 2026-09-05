@@ -60,6 +60,22 @@ export interface AcsMcpToolMap {
     }>;
   };
 
+  acs_claim: {
+    readonly input: { readonly claimCode: string };
+    readonly output: McpToolResult<{
+      readonly agent: {
+        readonly id: string;
+        readonly slug: string;
+        readonly displayName: string;
+      };
+      readonly binding: {
+        readonly id: string;
+        readonly epoch: number;
+        readonly status: "active";
+      };
+    }>;
+  };
+
   acs_agents_list: {
     readonly input: {
       readonly status?: "any" | "available" | "unavailable";

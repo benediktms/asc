@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Message, Role } from "@a2a-js/sdk";
+import { Message, Role, TaskState as A2ATaskState } from "@a2a-js/sdk";
 import { Store, type Paths, type StoredPart } from "../packages/storage-sqlite/src/index";
 import { TaskState } from "../packages/domain/src/index";
 
@@ -120,11 +120,92 @@ describe("durable acceptance", () => {
       role: Role.ROLE_USER,
       parts: [{ text: "work" }],
     });
-    const first = store.accept(agent.id, principal.id, message, {}),
-      second = store.accept(agent.id, principal.id, message, {});
+    const first = store.accept(agent.id, principal.id, message, {});
+    store.setTaskState(first.task.id, principal.id, TaskState.Canceled, "canceled");
+    const second = store.accept(agent.id, principal.id, message, {});
     expect(first.duplicate).toBe(false);
     expect(second.duplicate).toBe(true);
+    expect(second.task.status?.state).toBe(A2ATaskState.TASK_STATE_CANCELED);
+    expect(second.deliveryId).toBe(first.deliveryId);
     expect(store.db.query("SELECT count(*) n FROM delivery_intents").get()).toEqual({ n: 1 });
+    store.close();
+  });
+  test("checks idempotency after acquiring the acceptance write lock", () => {
+    const store = fixture(),
+      agent = store.createAgent("idempotency-race"),
+      principal = authenticated(store),
+      seed = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "idempotency-seed",
+          role: Role.ROLE_USER,
+          parts: [{ text: "seed" }],
+        }),
+        {},
+      ),
+      originalWrite = store.write.bind(store);
+    let injectCommittedDuplicate = true;
+    store.write = <Result>(operation: () => Result) => {
+      if (injectCommittedDuplicate) {
+        injectCommittedDuplicate = false;
+        const now = Date.now();
+        store.db
+          .query(
+            "INSERT INTO idempotency_records(scope,key,request_hash,state,response_json,created_at_ms,updated_at_ms) VALUES(?,?,?,'committed',?,?,?)",
+          )
+          .run(
+            `${principal.id}:${agent.id}`,
+            "idempotency-race",
+            "racing-hash",
+            JSON.stringify({
+              task: seed.task,
+              deliveryId: seed.deliveryId,
+              stateVersion: seed.stateVersion,
+            }),
+            now,
+            now,
+          );
+      }
+      return originalWrite(operation);
+    };
+    expect(
+      store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "idempotency-race",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        {},
+        "racing-hash",
+      ),
+    ).toMatchObject({ duplicate: true, deliveryId: seed.deliveryId });
+    store.close();
+  });
+  test("keeps task events immutable", () => {
+    const store = fixture(),
+      target = store.createAgent("immutable-events"),
+      requester = authenticated(store),
+      accepted = store.accept(
+        target.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "immutable-events-message",
+          role: Role.ROLE_USER,
+          parts: [{ text: "work" }],
+        }),
+        {},
+      );
+    expect(() =>
+      store.db
+        .query("UPDATE task_events SET event_type='task-failed' WHERE task_id=?")
+        .run(accepted.task.id),
+    ).toThrow("TASK_EVENT_IMMUTABLE");
+    expect(() =>
+      store.db.query("DELETE FROM task_events WHERE task_id=?").run(accepted.task.id),
+    ).toThrow("TASK_EVENT_IMMUTABLE");
     store.close();
   });
   test("rejects target overload without partial acceptance", () => {
@@ -289,7 +370,9 @@ describe("durable acceptance", () => {
     });
     expect(store.verifyTaskProjections(true).repaired).toBe(1);
     expect(store.verifyTaskProjections().mismatched).toEqual([]);
-    expect(store.task(accepted.task.id, requester.id)?.status?.state).toBe(3);
+    expect(store.task(accepted.task.id, requester.id)?.status?.state).toBe(
+      A2ATaskState.TASK_STATE_COMPLETED,
+    );
     store.close();
   });
   test("enforces one active binding per agent and runtime session", () => {
@@ -318,13 +401,49 @@ describe("durable acceptance", () => {
       agent = store.createAgent("claimed-agent"),
       requester = authenticated(store),
       claim = store.createClaim(agent.id, requester.id),
-      binding = store.claim(claim.claimCode, "claimed-thread");
+      now = Date.now();
+    store.db
+      .query(
+        "INSERT INTO runtime_installations(id,harness_id,adapter_id,label,endpoint_json,state,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,'offline',?,?)",
+      )
+      .run("ins_other", "other", "test.other", "other", "{}", now, now);
+    const binding = store.claim(claim.claimCode, "claimed-thread", "ins_other");
     expect(claim.claimCode).toMatch(/^[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{26}$/);
     expect(binding.agentId).toBe(agent.id);
     expect(() => store.claim(claim.claimCode, "replayed-thread")).toThrow(
       "invalid or expired claim",
     );
     expect(store.binding(binding.id)?.session_opaque_id).toBe("claimed-thread");
+    expect(store.binding(binding.id)?.installation_id).toBe("ins_other");
+    store.close();
+  });
+  test("reports observed active runtime sessions by state", () => {
+    const store = fixture(),
+      agent = store.createAgent("observed-agent"),
+      binding = store.bind(agent.id, "observed-thread"),
+      storedBinding = store.binding(binding.id);
+    if (!storedBinding) throw new Error("missing stored binding");
+    store.observeSession(
+      { installationId: storedBinding.installation_id, opaqueId: "observed-thread" },
+      "busy",
+    );
+    expect(
+      store
+        .metrics()
+        .find(
+          (point) =>
+            point.name === "acs_runtime_sessions_by_state" && point.labels.state === "busy",
+        ),
+    ).toMatchObject({ value: 1 });
+    store.revokeBinding(binding.id);
+    expect(
+      store
+        .metrics()
+        .find(
+          (point) =>
+            point.name === "acs_runtime_sessions_by_state" && point.labels.state === "busy",
+        ),
+    ).toMatchObject({ value: 0 });
     store.close();
   });
   test("uses delivery defaults and queues subscribed terminal notifications", () => {
@@ -345,8 +464,26 @@ describe("durable acceptance", () => {
       replyExpected: true,
     });
     store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Working);
+    store.setTaskState(
+      accepted.task.id,
+      targetBinding.principalId,
+      TaskState.InputRequired,
+      "continue",
+    );
+    store.accept(
+      target.id,
+      senderBinding.principalId,
+      Message.fromJSON({
+        messageId: "request-2-continuation",
+        taskId: accepted.task.id,
+        contextId: accepted.task.contextId,
+        role: Role.ROLE_USER,
+        parts: [{ text: "continued" }],
+      }),
+      { notifyOn: ["terminal"] },
+    );
     store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done");
-    const notification = store.db
+    const notifications = store.db
       .query<
         {
           kind: string;
@@ -358,14 +495,15 @@ describe("durable acceptance", () => {
       >(
         "SELECT kind,target_agent_id,pinned_binding_id,state FROM delivery_intents WHERE kind='task-event-notification'",
       )
-      .get();
-    if (!notification) throw new Error("missing task notification");
-    expect(notification).toEqual({
-      kind: "task-event-notification",
-      target_agent_id: sender.id,
-      pinned_binding_id: senderBinding.id,
-      state: "pending",
-    });
+      .all();
+    expect(notifications).toEqual([
+      {
+        kind: "task-event-notification",
+        target_agent_id: sender.id,
+        pinned_binding_id: senderBinding.id,
+        state: "pending",
+      },
+    ]);
     store.close();
   });
   test("allows only the assigned agent to publish and complete work", () => {
@@ -389,11 +527,27 @@ describe("durable acceptance", () => {
     ).toThrow("TASK_NOT_ASSIGNED");
     expect(
       store.publishMessage(accepted.task.id, targetBinding.principalId, output).task.status?.state,
-    ).toBe(2);
+    ).toBe(A2ATaskState.TASK_STATE_WORKING);
     expect(
       store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done")
         .status?.state,
-    ).toBe(3);
+    ).toBe(A2ATaskState.TASK_STATE_COMPLETED);
+    const terminalVersion = store.taskVersion(accepted.task.id),
+      terminalEvents = store.eventsAfter(accepted.task.id, 0).length;
+    expect(
+      store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Completed, "done")
+        .status?.state,
+    ).toBe(A2ATaskState.TASK_STATE_COMPLETED);
+    expect(store.taskVersion(accepted.task.id)).toBe(terminalVersion);
+    expect(store.eventsAfter(accepted.task.id, 0)).toHaveLength(terminalEvents);
+    expect(() =>
+      store.setTaskState(
+        accepted.task.id,
+        targetBinding.principalId,
+        TaskState.Completed,
+        "different",
+      ),
+    ).toThrow("TASK_STATE_CONFLICT");
     store.close();
   });
   test("rejects executor callbacks from a rebound session after delivery was pinned", () => {

@@ -1,5 +1,7 @@
 import {
   AgentCard,
+  type Part,
+  Role,
   TaskState,
   type CancelTaskRequest,
   type GetExtendedAgentCardRequest,
@@ -28,10 +30,22 @@ import {
   ServerCallContext,
   type A2ARequestHandler,
 } from "@a2a-js/sdk/server";
-import type { AgentRow, Store, StoredTask } from "../../storage-sqlite/src/index";
+import type {
+  A2AApplicationPort,
+  A2ATarget,
+  AuthenticatedPrincipal,
+  DeliveryPreference,
+  TaskEventSubscription,
+} from "../../../contracts/a2a-application-port";
+import type { RuntimeTraceContext } from "../../../contracts/runtime-adapter";
+import type { NeutralPart } from "../../../contracts/runtime-adapter";
+import { A2AApplication, jsonObject, jsonValue } from "../../application/src/a2a";
+import { canonical } from "../../domain/src/index";
+import type { A2AStoragePort, AgentRow } from "../../ports/src/index";
 import { telemetry } from "../../observability/src/index";
 
-const extension = "urn:agent-communications:delivery:v1";
+const extension = "urn:agent-communications:delivery:v1",
+  deliveryStatus = "urn:agent-communications:delivery-status:v1";
 class PrincipalUser {
   constructor(readonly userName: string) {}
   get isAuthenticated() {
@@ -39,13 +53,7 @@ class PrincipalUser {
   }
 }
 
-function delivery(metadata: Record<string, unknown> | undefined): {
-  mode: "wake_when_idle" | "append_context";
-  priority: "low" | "normal" | "high";
-  notifyOn: string[];
-  replyExpected: boolean;
-  expiresAt?: string;
-} {
+function delivery(metadata: Record<string, unknown> | undefined): DeliveryPreference {
   const raw = metadata?.[extension],
     value = raw === undefined ? {} : raw;
   if (!isRecord(value)) throw new Error("VALIDATION_FAILED: delivery extension must be an object");
@@ -59,21 +67,7 @@ function delivery(metadata: Record<string, unknown> | undefined): {
     throw new Error("ACS_UNSUPPORTED_DELIVERY_MODE");
   if (priority !== "low" && priority !== "normal" && priority !== "high")
     throw new Error("VALIDATION_FAILED: invalid priority");
-  if (
-    !Array.isArray(notifyOn) ||
-    notifyOn.some(
-      (state) =>
-        !new Set([
-          "working",
-          "input-required",
-          "completed",
-          "failed",
-          "canceled",
-          "rejected",
-          "terminal",
-        ]).has(String(state)),
-    )
-  )
+  if (!Array.isArray(notifyOn) || !notifyOn.every(isNotifyState))
     throw new Error("VALIDATION_FAILED: invalid notifyOn");
   if (value.replyExpected !== undefined && typeof value.replyExpected !== "boolean")
     throw new Error("VALIDATION_FAILED: invalid replyExpected");
@@ -85,20 +79,21 @@ function delivery(metadata: Record<string, unknown> | undefined): {
   return {
     mode,
     priority,
-    notifyOn: notifyOn.map(String),
+    notifyOn,
     replyExpected: value.replyExpected ?? true,
     expiresAt: value.expiresAt,
   };
 }
 
-export function card(row: AgentRow, port: number): AgentCard {
+export function card(row: AgentRow, port: number, hostname = "127.0.0.1"): AgentCard {
+  const host = hostname.includes(":") ? `[${hostname}]` : hostname;
   return AgentCard.fromJSON({
     name: row.display_name,
     description: row.description,
     version: String(row.profile_revision),
     supportedInterfaces: [
       {
-        url: `http://127.0.0.1:${port}/agents/${row.slug}/a2a`,
+        url: `http://${host}:${port}/agents/${row.slug}/a2a`,
         protocolBinding: "JSONRPC",
         protocolVersion: "1.0",
       },
@@ -128,27 +123,70 @@ export function card(row: AgentRow, port: number): AgentCard {
 
 class Handler implements A2ARequestHandler {
   constructor(
-    private store: Store,
+    private application: A2AApplicationPort,
+    private principal: AuthenticatedPrincipal,
     private agent: AgentRow,
     private port: number,
+    private signalDelivery: () => void,
+    private hostname: string,
+    private traceContext?: RuntimeTraceContext,
   ) {}
   async getAgentCard() {
-    return card(this.agent, this.port);
+    return card(this.agent, this.port, this.hostname);
   }
   async getAuthenticatedExtendedAgentCard(
     _params: GetExtendedAgentCardRequest,
     _context: ServerCallContext,
-  ) {
+  ): Promise<AgentCard> {
     return this.getAgentCard();
   }
-  async sendMessage(params: SendMessageRequest, context: ServerCallContext): Promise<Task> {
+  async sendMessage(params: SendMessageRequest, _context: ServerCallContext): Promise<Task> {
     try {
       const message = params.message;
       if (!message) throw new Error("VALIDATION_FAILED: message is required");
-      return asTask(
-        this.store.accept(this.agent.id, principalName(context), message, delivery(params.metadata))
-          .task,
-      );
+      const preference = delivery(params.metadata),
+        parts = message.parts.map(neutralPart),
+        role = message.role === Role.ROLE_AGENT ? "agent" : "user",
+        requestMetadata = jsonObject(params.metadata ?? {}),
+        messageMetadata = jsonObject(message.metadata ?? {}),
+        accepted = await this.application.acceptMessage({
+          principal: this.principal,
+          target: target(this.agent),
+          requestCorrelationId: crypto.randomUUID(),
+          externalMessageId: message.messageId,
+          taskId: message.taskId || undefined,
+          contextId: message.contextId || undefined,
+          role,
+          parts,
+          requestMetadata,
+          messageMetadata,
+          delivery: preference,
+          canonicalRequestHash: await hash({
+            externalMessageId: message.messageId,
+            taskId: message.taskId || null,
+            contextId: message.contextId || null,
+            role,
+            parts,
+            requestMetadata,
+            messageMetadata,
+            delivery: preference,
+          }),
+          traceContext: this.traceContext,
+        }),
+        metadata = accepted.a2aSnapshot.metadata,
+        status = isRecord(metadata) ? metadata[deliveryStatus] : undefined;
+      if (!accepted.duplicate) this.signalDelivery();
+      return Task.fromJSON({
+        ...accepted.a2aSnapshot,
+        metadata: {
+          ...(isRecord(metadata) ? metadata : {}),
+          [deliveryStatus]: {
+            ...(isRecord(status) ? status : {}),
+            deliveryId: accepted.deliveryId,
+            duplicate: accepted.duplicate,
+          },
+        },
+      });
     } catch (error) {
       throw applicationError(error);
     }
@@ -158,54 +196,80 @@ class Handler implements A2ARequestHandler {
     context: ServerCallContext,
   ): AsyncGenerator<StreamResponse> {
     const accepted = await this.sendMessage(params, context),
-      principal = principalName(context),
-      state = this.streamState(accepted.id, principal);
-    yield { payload: { $case: "task", value: state.task } };
-    yield* this.updates(state.task, state.sequence);
+      subscription = await this.application.subscribeTask(this.query(accepted.id));
+    yield { payload: { $case: "task", value: Task.fromJSON(subscription.currentTask) } };
+    yield* this.updates(subscription);
   }
-  async getTask(params: GetTaskRequest, context: ServerCallContext) {
-    const task = this.store.task(params.id, principalName(context), this.agent.id);
-    if (!task) throw new JsonRpcTaskNotFoundError();
-    return trim(asTask(task), params.historyLength);
+  async getTask(params: GetTaskRequest, _context: ServerCallContext) {
+    try {
+      return Task.fromJSON(
+        await this.application.getTask(this.query(params.id, params.historyLength)),
+      );
+    } catch (error) {
+      throw applicationError(error);
+    }
   }
-  async listTasks(params: ListTasksRequest, context: ServerCallContext) {
+  async listTasks(params: ListTasksRequest, _context: ServerCallContext) {
     const pageSize = Math.min(Math.max(params.pageSize ?? 50, 1), 100),
-      page = this.store.listTasks(this.agent.id, principalName(context), {
-        contextId: params.contextId,
-        state: taskState(params.status),
-        cursor: params.pageToken,
-        limit: pageSize,
-      });
-    return {
-      tasks: page.tasks.map((task) => trim(asTask(task), params.historyLength)),
-      nextPageToken: page.nextCursor ?? "",
-      pageSize,
-      totalSize: page.total,
-    };
+      state = taskState(params.status),
+      query = {
+        principal: this.principal,
+        target: target(this.agent),
+        contextId: params.contextId || undefined,
+        states: state ? [state] : undefined,
+        updatedAfter: params.statusTimestampAfter || undefined,
+        historyLength: params.historyLength,
+        includeArtifacts: params.includeArtifacts,
+        cursor: params.pageToken || undefined,
+        pageSize,
+      };
+    try {
+      const page = await this.application.listTasks(query);
+      return {
+        tasks: page.tasks.map((task) => Task.fromJSON(task)),
+        nextPageToken: page.nextCursor ?? "",
+        pageSize,
+        totalSize: page.totalSize,
+      };
+    } catch (error) {
+      throw applicationError(error);
+    }
   }
-  async cancelTask(params: CancelTaskRequest, context: ServerCallContext) {
-    const task = this.store.task(params.id, principalName(context), this.agent.id);
-    if (!task) throw new JsonRpcTaskNotFoundError();
-    if (
-      task.status &&
-      [
-        TaskState.TASK_STATE_COMPLETED,
-        TaskState.TASK_STATE_FAILED,
-        TaskState.TASK_STATE_CANCELED,
-        TaskState.TASK_STATE_REJECTED,
-      ].includes(task.status.state)
-    )
-      throw new JsonRpcTaskNotCancelableError();
-    return asTask(this.store.requestCancellation(params.id, principalName(context)));
+  async cancelTask(params: CancelTaskRequest, _context: ServerCallContext) {
+    try {
+      const task = Task.fromJSON(await this.application.getTask(this.query(params.id)));
+      if (
+        task.status &&
+        [
+          TaskState.TASK_STATE_COMPLETED,
+          TaskState.TASK_STATE_FAILED,
+          TaskState.TASK_STATE_REJECTED,
+        ].includes(task.status.state)
+      )
+        throw new JsonRpcTaskNotCancelableError({ message: "ACS_TASK_STATE_CONFLICT" });
+      return Task.fromJSON(
+        await this.application.cancelTask({
+          principal: this.principal,
+          target: target(this.agent),
+          taskId: params.id,
+          reason:
+            isRecord(params.metadata) && typeof params.metadata.reason === "string"
+              ? params.metadata.reason
+              : undefined,
+          requestCorrelationId: crypto.randomUUID(),
+        }),
+      );
+    } catch (error) {
+      throw applicationError(error);
+    }
   }
   async *resubscribe(
     params: SubscribeToTaskRequest,
-    context: ServerCallContext,
+    _context: ServerCallContext,
   ): AsyncGenerator<StreamResponse> {
-    const principal = principalName(context),
-      state = this.streamState(params.id, principal);
-    yield { payload: { $case: "task", value: state.task } };
-    yield* this.updates(state.task, state.sequence);
+    const subscription = await this.application.subscribeTask(this.query(params.id));
+    yield { payload: { $case: "task", value: Task.fromJSON(subscription.currentTask) } };
+    yield* this.updates(subscription);
   }
   async createTaskPushNotificationConfig(
     _params: TaskPushNotificationConfig,
@@ -224,18 +288,18 @@ class Handler implements A2ARequestHandler {
   async deleteTaskPushNotificationConfig(): Promise<void> {
     throw new JsonRpcPushNotificationNotSupportedError();
   }
-  private streamState(taskId: string, principalId: string) {
-    const state = this.store.taskStreamState(taskId, principalId, this.agent.id);
-    if (!state) throw new JsonRpcTaskNotFoundError();
-    return { task: asTask(state.task), sequence: state.sequence };
+  private query(taskId: string, historyLength?: number) {
+    return {
+      principal: this.principal,
+      target: target(this.agent),
+      taskId,
+      historyLength,
+    };
   }
-  private async *updates(task: Task, sequence: number): AsyncGenerator<StreamResponse> {
-    while (!terminal(task.status?.state)) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      const events = this.store.eventsAfter(task.id, sequence);
-      for (const event of events) {
-        sequence = event.sequence;
-        task = asTask(event.task);
+  private async *updates(subscription: TaskEventSubscription): AsyncGenerator<StreamResponse> {
+    try {
+      for await (const event of subscriptionEvents(subscription)) {
+        const task = Task.fromJSON(event.a2aEvent);
         yield {
           payload: {
             $case: "statusUpdate",
@@ -243,30 +307,78 @@ class Handler implements A2ARequestHandler {
               taskId: task.id,
               contextId: task.contextId,
               status: task.status,
-              metadata: { sequence },
+              metadata: { sequence: event.sequence },
             },
           },
         };
+        if (terminal(task.status?.state)) return;
       }
+    } finally {
+      await subscription.close();
     }
   }
 }
 
-function trim(task: Task, length?: number): Task {
-  return length === undefined
-    ? task
-    : { ...task, history: length === 0 ? [] : task.history.slice(-length) };
+async function* subscriptionEvents(subscription: TaskEventSubscription) {
+  yield* subscription.replay;
+  yield* subscription.live;
 }
-function asTask(task: StoredTask): Task {
-  return Task.fromJSON(task);
+function target(agent: AgentRow): A2ATarget {
+  return {
+    agentId: agent.id,
+    slug: agent.slug,
+    profileRevision: agent.profile_revision,
+  };
+}
+function neutralPart(part: Part): NeutralPart {
+  if (part.content?.$case === "text")
+    return {
+      kind: "text",
+      text: part.content.value,
+      mediaType: part.mediaType === "text/markdown" ? "text/markdown" : "text/plain",
+    };
+  if (part.content?.$case === "url")
+    return {
+      kind: "uri",
+      uri: part.content.value,
+      name: part.filename || undefined,
+      mediaType: part.mediaType || undefined,
+    };
+  if (part.content?.$case === "data")
+    return {
+      kind: "data",
+      data: jsonValue(part.content.value),
+      name: part.filename || undefined,
+      mediaType: part.mediaType || "application/json",
+    };
+  throw new Error("ACS_UNSUPPORTED_CONTENT");
+}
+async function hash(value: unknown) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical(value)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function isNotifyState(value: unknown): value is DeliveryPreference["notifyOn"][number] {
+  return (
+    typeof value === "string" &&
+    [
+      "working",
+      "input-required",
+      "completed",
+      "failed",
+      "canceled",
+      "rejected",
+      "terminal",
+    ].includes(value)
+  );
 }
 function applicationError(error: unknown) {
   if (error instanceof JsonRpcTransportError) return error;
   const message = error instanceof Error ? error.message : String(error),
     raw = message.split(":").at(0) ?? "UNKNOWN";
-  if (raw === "ACS_TASK_NOT_VISIBLE") return new JsonRpcTaskNotFoundError();
-  if (raw === "ACS_UNSUPPORTED_CONTENT") return new JsonRpcContentTypeNotSupportedError();
-  if (raw === "ACS_TASK_STATE_CONFLICT") return new JsonRpcUnsupportedOperationError();
+  if (raw === "ACS_TASK_NOT_VISIBLE") return new JsonRpcTaskNotFoundError({ message });
+  if (raw === "ACS_UNSUPPORTED_CONTENT")
+    return new JsonRpcContentTypeNotSupportedError({ message });
+  if (raw === "ACS_TASK_STATE_CONFLICT") return new JsonRpcUnsupportedOperationError({ message });
   const code = raw.startsWith("ACS_")
     ? raw
     : raw === "TASK_STATE_CONFLICT"
@@ -274,12 +386,13 @@ function applicationError(error: unknown) {
       : raw === "VALIDATION_FAILED"
         ? "ACS_VALIDATION_FAILED"
         : "ACS_STORAGE_UNAVAILABLE";
+  const publicMessage = code === "ACS_STORAGE_UNAVAILABLE" ? code : message;
   return new JsonRpcTransportError({
     jsonrpc: "2.0",
     id: null,
     error: {
       code: -32010,
-      message,
+      message: publicMessage,
       data: {
         code,
         retryable: code === "ACS_STORAGE_UNAVAILABLE" || code === "ACS_OVERLOADED",
@@ -327,16 +440,18 @@ function taskState(state: TaskState | undefined) {
 }
 
 export async function handleA2A(
-  store: Store,
+  store: A2AStoragePort,
   request: Request,
   port: number,
   maxRequestBytes = 524288,
+  signalDelivery: () => void = () => {},
+  hostname = "127.0.0.1",
 ): Promise<Response> {
   const started = performance.now();
   telemetry.increment("acs_a2a_requests_total");
   try {
     return await telemetry.trace("a2a.receive", () =>
-      handleA2ARoute(store, request, port, maxRequestBytes),
+      handleA2ARoute(store, request, port, maxRequestBytes, signalDelivery, hostname),
     );
   } finally {
     telemetry.observe("acs_a2a_request_duration_ms", performance.now() - started);
@@ -344,21 +459,24 @@ export async function handleA2A(
 }
 
 async function handleA2ARoute(
-  store: Store,
+  store: A2AStoragePort,
   request: Request,
   port: number,
   maxRequestBytes: number,
+  signalDelivery: () => void,
+  hostname: string,
 ): Promise<Response> {
   const url = new URL(request.url),
     match = url.pathname.match(/^\/agents\/([^/]+)\/(?:\.well-known\/agent-card\.json|a2a)$/);
   if (!match) return new Response("Not found", { status: 404 });
   const slug = match.at(1);
   if (!slug) return new Response("Not found", { status: 404 });
-  const agent = store.agent(slug);
-  if (!agent) return new Response("Not found", { status: 404 });
-  if (request.method === "GET" && url.pathname.endsWith("agent-card.json")) {
+  if (url.pathname.endsWith("agent-card.json")) {
+    if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+    const agent = store.agent(slug);
+    if (!agent) return new Response("Not found", { status: 404 });
     if (!agent.enabled) return new Response("Not found", { status: 404 });
-    const json = AgentCard.toJSON(card(agent, port));
+    const json = AgentCard.toJSON(card(agent, port, hostname));
     if (!isRecord(json)) throw new Error("Agent Card serialization failed");
     return Response.json({
       ...json,
@@ -372,11 +490,19 @@ async function handleA2ARoute(
     return new Response("Unsupported media type", { status: 415 });
   const length = Number(request.headers.get("content-length") ?? 0);
   if (length > maxRequestBytes) return new Response("Request too large", { status: 413 });
+  const agent = store.agent(slug);
+  if (!agent) return new Response("Not found", { status: 404 });
   const token = request.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1],
     principal = token ? store.authenticate(token) : null;
   if (!principal) {
     store.audit(null, "security.reject", "a2a", agent.id, { reason: "unauthenticated" });
     return new Response("Unauthorized", { status: 401 });
+  }
+  if (!a2aPrincipalKind(principal.kind)) {
+    store.audit(principal.id, "security.reject", "a2a", agent.id, {
+      reason: "principal-kind-not-authorized",
+    });
+    return new Response("Forbidden", { status: 403 });
   }
   const body = await readBody(request, maxRequestBytes);
   if (body === null) return new Response("Request too large", { status: 413 });
@@ -391,20 +517,15 @@ async function handleA2ARoute(
     rpcId = typeof payload?.id === "string" || typeof payload?.id === "number" ? payload.id : null,
     requestedVersion = request.headers.get("A2A-Version");
   if (requestedVersion && requestedVersion !== "1.0")
-    return Response.json({
-      jsonrpc: "2.0",
-      id: rpcId,
-      error: toJsonRpcError(new JsonRpcVersionNotSupportedError()),
-    });
+    return errorResponse(rpcId, new JsonRpcVersionNotSupportedError());
   if (method === "SubscribeToTask") {
     const params = payload && isRecord(payload.params) ? payload.params : undefined,
       taskId = params?.id;
     if (typeof taskId === "string" && !store.task(taskId, principal.id, agent.id))
-      return Response.json({
-        jsonrpc: "2.0",
-        id: rpcId,
-        error: toJsonRpcError(new JsonRpcTaskNotFoundError()),
-      });
+      return errorResponse(
+        rpcId,
+        new JsonRpcTaskNotFoundError({ message: "ACS_TASK_NOT_VISIBLE" }),
+      );
   }
   const requiredScope =
     method === "SendMessage" || method === "SendStreamingMessage"
@@ -420,21 +541,21 @@ async function handleA2ARoute(
     return new Response("Forbidden", { status: 403 });
   }
   const context = new ServerCallContext({
-    user: new PrincipalUser(principal.id),
-    requestedVersion: requestedVersion ?? "1.0",
-  });
-  const result = await new JsonRpcTransportHandler(new Handler(store, agent, port)).handle(
-    body,
-    context,
-  );
-  if (isAcsErrorResponse(result)) {
-    const code = result.error.message.split(":").at(0) ?? "UNKNOWN";
-    result.error.data = {
-      code,
-      retryable: code === "ACS_STORAGE_UNAVAILABLE" || code === "ACS_OVERLOADED",
-      correlationId: crypto.randomUUID(),
-    };
-  }
+      user: new PrincipalUser(principal.id),
+      requestedVersion: requestedVersion ?? "1.0",
+    }),
+    result = await new JsonRpcTransportHandler(
+      new Handler(
+        new A2AApplication(store),
+        authenticatedPrincipal(principal),
+        agent,
+        port,
+        signalDelivery,
+        hostname,
+        incomingTraceContext(request.headers),
+      ),
+    ).handle(body, context);
+  addErrorContext(result);
   if (isAsyncIterable(result)) {
     const iterator = result[Symbol.asyncIterator](),
       encoder = new TextEncoder();
@@ -459,7 +580,40 @@ async function handleA2ARoute(
       headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
     });
   }
-  return Response.json(result);
+  return Response.json(result, { status: hasErrorCode(result, "ACS_OVERLOADED") ? 429 : 200 });
+}
+
+function incomingTraceContext(headers: Headers): RuntimeTraceContext | undefined {
+  const traceparent = headers.get("traceparent"),
+    match = traceparent?.match(/^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$/);
+  if (!traceparent || !match || /^0+$/.test(match[1] ?? "") || /^0+$/.test(match[2] ?? ""))
+    return undefined;
+  const tracestate = headers.get("tracestate");
+  return tracestate && validTracestate(tracestate) ? { traceparent, tracestate } : { traceparent };
+}
+
+function validTracestate(value: string) {
+  if (new TextEncoder().encode(value).byteLength > 512) return false;
+  const members = value.split(",").map((member) => member.trim());
+  if (!members.length || members.length > 32) return false;
+  const keys = new Set<string>();
+  for (const member of members) {
+    const separator = member.indexOf("="),
+      key = member.slice(0, separator),
+      item = member.slice(separator + 1);
+    if (
+      separator < 1 ||
+      !/^(?:[a-z][a-z0-9_*/-]{0,255}|[a-z0-9][a-z0-9_*/-]{0,240}@[a-z][a-z0-9_*/-]{0,13})$/.test(
+        key,
+      ) ||
+      !/^[\x20-\x2b\x2d-\x3c\x3e-\x7e]{1,256}$/.test(item) ||
+      item.endsWith(" ") ||
+      keys.has(key)
+    )
+      return false;
+    keys.add(key);
+  }
+  return true;
 }
 async function readBody(request: Request, maxBytes: number) {
   if (!request.body) return "";
@@ -480,17 +634,28 @@ async function readBody(request: Request, maxBytes: number) {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function principalName(context: ServerCallContext) {
-  const name = context.user?.userName;
-  if (!name) throw new Error("NOT_AUTHENTICATED");
-  return name;
+function authenticatedPrincipal(
+  principal: ReturnType<A2AStoragePort["authenticate"]>,
+): AuthenticatedPrincipal {
+  if (!principal) throw new Error("NOT_AUTHENTICATED");
+  if (!a2aPrincipalKind(principal.kind)) throw new Error("NOT_AUTHENTICATED");
+  return {
+    id: principal.id,
+    kind: principal.kind,
+    agentId: principal.agent_id ?? undefined,
+    bindingId: principal.binding_id ?? undefined,
+    scopes: principal.scopes,
+  };
+}
+function a2aPrincipalKind(value: string): value is AuthenticatedPrincipal["kind"] {
+  return value === "bound-agent" || value === "external-a2a-client" || value === "service";
 }
 function isAsyncIterable(value: unknown): value is AsyncIterable<StreamResponse> {
   return isRecord(value) && Symbol.asyncIterator in value;
 }
-function isAcsErrorResponse(
+function isJsonRpcErrorResponse(
   value: unknown,
-): value is { error: { message: string; data?: Record<string, unknown> } } {
+): value is { error: { message: string; data?: unknown } } {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -498,7 +663,43 @@ function isAcsErrorResponse(
     typeof value.error === "object" &&
     value.error !== null &&
     "message" in value.error &&
-    typeof value.error.message === "string" &&
-    value.error.message.startsWith("ACS_")
+    typeof value.error.message === "string"
   );
+}
+function hasErrorCode(value: unknown, code: string) {
+  if (!isJsonRpcErrorResponse(value) || !Array.isArray(value.error.data)) return false;
+  return value.error.data.some((item) => isRecord(item) && item.code === code);
+}
+function errorResponse(id: string | number | null, error: Error) {
+  const result: {
+    jsonrpc: "2.0";
+    id: string | number | null;
+    error: { code: number; message: string; data?: unknown };
+  } = { jsonrpc: "2.0", id, error: toJsonRpcError(error) };
+  addErrorContext(result);
+  return Response.json(result);
+}
+function addErrorContext(value: unknown) {
+  if (!isJsonRpcErrorResponse(value)) return;
+  const existing = value.error.data;
+  if (
+    isRecord(existing) &&
+    typeof existing.retryable === "boolean" &&
+    typeof existing.correlationId === "string"
+  ) {
+    value.error.data = [existing];
+    return;
+  }
+  const rawCode = value.error.message.split(":").at(0) ?? "UNKNOWN",
+    code = rawCode.startsWith("ACS_") ? rawCode : "ACS_PROTOCOL_ERROR",
+    context = {
+      code,
+      retryable: code === "ACS_STORAGE_UNAVAILABLE" || code === "ACS_OVERLOADED",
+      correlationId: crypto.randomUUID(),
+    };
+  value.error.data = Array.isArray(existing)
+    ? [...existing, context]
+    : existing === undefined
+      ? [context]
+      : [existing, context];
 }

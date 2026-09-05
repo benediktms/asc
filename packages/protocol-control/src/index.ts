@@ -2,13 +2,25 @@ import { readFileSync } from "node:fs";
 import type {
   AgentRow,
   BindingRow,
+  ControlStoragePort,
   DeliveryIntentRow,
   StoredArtifact,
   StoredPart,
-  Store,
-} from "../../storage-sqlite/src/index";
-import type { RuntimeAdapter, RuntimeInstallationId } from "../../../contracts/runtime-adapter";
-import type { ExecutorArtifact, ExecutorPart } from "../../../contracts/control-protocol";
+} from "../../ports/src/index";
+import type {
+  HostInvocationEvidence,
+  RuntimeAdapter,
+  RuntimeCallerAttestor,
+  RuntimeInstallationId,
+} from "../../../contracts/runtime-adapter";
+import type {
+  BridgeAttestationDto,
+  ControlErrorData,
+  DeliveryDto,
+  ExecutorArtifact,
+  ExecutorPart,
+  TaskDto,
+} from "../../../contracts/control-protocol";
 import { TaskState } from "../../domain/src/index";
 import { telemetry } from "../../observability/src/index";
 import { z } from "zod";
@@ -55,9 +67,12 @@ const partSchema = z.discriminatedUnion("kind", [
     bindingEpoch: z.number().int().positive().optional(),
     bindingId: z.string().optional(),
     claimCode: z.string().optional(),
+    client: z.object({ name: z.string(), version: z.string(), instanceId: z.string() }).optional(),
+    capabilities: z.record(z.string(), z.unknown()).optional(),
     choices: z.array(z.string()).optional(),
     cursor: z.string().optional(),
     deliveryId: z.string().optional(),
+    deliveryIds: z.array(z.string()).optional(),
     description: z.string().optional(),
     deliveryPolicy: z
       .object({
@@ -70,13 +85,17 @@ const partSchema = z.discriminatedUnion("kind", [
     displayName: z.string().optional(),
     enabled: z.boolean().optional(),
     evidence: z
-      .looseObject({
-        harnessId: z.string().optional(),
-        bridge: z.literal("mcp").optional(),
-        metadata: z.looseObject({ threadId: z.unknown() }).optional(),
-        bridgeInstanceId: z.string().optional(),
-      })
+      .union([
+        z.looseObject({
+          harnessId: z.string().optional(),
+          bridge: z.literal("mcp").optional(),
+          metadata: z.looseObject({ threadId: z.unknown() }).optional(),
+          bridgeInstanceId: z.string().optional(),
+        }),
+        z.string(),
+      ])
       .optional(),
+    fromBindingId: z.string().optional(),
     installationId: z.string().optional(),
     question: z.string().optional(),
     reason: z.string().optional(),
@@ -96,6 +115,16 @@ const partSchema = z.discriminatedUnion("kind", [
       ])
       .optional(),
     skill: z.string().optional(),
+    skills: z
+      .array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          description: z.string(),
+          tags: z.array(z.string()).optional(),
+        }),
+      )
+      .optional(),
     scopes: z.array(z.enum(["a2a:send", "a2a:read", "a2a:cancel"])).optional(),
     slug: z.string().optional(),
     summary: z.string().optional(),
@@ -103,7 +132,7 @@ const partSchema = z.discriminatedUnion("kind", [
     targetAgent: z.string().optional(),
     text: z.string().optional(),
     parts: z.array(partSchema).optional(),
-    protocolVersion: z.unknown(),
+    protocolVersion: z.string().optional(),
     limit: z.number().int().positive().optional(),
     taskId: z.string().optional(),
     ttlSeconds: z.number().int().positive().optional(),
@@ -116,7 +145,7 @@ const fail = (id: Rpc["id"] | null, error: unknown) =>
   Response.json(
     (() => {
       const message = error instanceof Error ? error.message : String(error),
-        code = message.split(":").at(0) ?? "UNKNOWN";
+        code = controlErrorCode(message.split(":").at(0) ?? "UNKNOWN");
       return {
         jsonrpc: "2.0",
         id,
@@ -134,16 +163,19 @@ const fail = (id: Rpc["id"] | null, error: unknown) =>
   );
 
 export function controlHandler(
-  store: Store,
+  store: ControlStoragePort,
   startedAt: string,
   shutdown: () => void,
   adapter?: RuntimeAdapter,
+  callerAttestor?: RuntimeCallerAttestor,
 ) {
   return async (request: Request) => {
     telemetry.increment("acs_control_requests_total");
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     if (request.headers.get("ACS-Control-Version") !== "1")
       return new Response("Unsupported control protocol version", { status: 426 });
+    if (!(request.headers.get("content-type") ?? "").startsWith("application/json"))
+      return new Response("Unsupported media type", { status: 415 });
     const token = request.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1],
       principal = token ? store.authenticate(token) : null;
     if (!principal) {
@@ -163,25 +195,29 @@ export function controlHandler(
       const p = rpc.params;
       authorize(principal, rpc.method);
       const audit = (
-        action: string,
-        resourceType: string,
-        resourceId?: string,
-        details: Record<string, unknown> = {},
-      ) =>
-        store.audit(
-          principal.id,
-          action,
-          resourceType,
-          resourceId,
-          {
-            ...details,
-          },
-          String(rpc.id),
-        );
+          action: string,
+          resourceType: string,
+          resourceId?: string,
+          details: Record<string, unknown> = {},
+        ) =>
+          store.audit(
+            principal.id,
+            action,
+            resourceType,
+            resourceId,
+            {
+              ...details,
+            },
+            String(rpc.id),
+          ),
+        attest = (evidence: Params["evidence"]) =>
+          attestEvidence(store, adapter, callerAttestor, evidence);
       switch (rpc.method) {
         case "system.initialize":
-          if (!String(p.protocolVersion ?? "1.0").startsWith("1."))
+          if (!/^1\.\d+$/.test(required(p.protocolVersion, "protocolVersion")))
             throw new Error("VALIDATION_FAILED: incompatible protocol version");
+          required(p.client, "client");
+          required(p.capabilities, "capabilities");
           return ok(rpc.id, {
             protocolVersion: "1.0",
             server: { name: "acs", version: "0.1.0", instanceId: String(process.pid) },
@@ -202,15 +238,25 @@ export function controlHandler(
             traces: telemetry.traceSnapshot(),
           });
         }
-        case "system.capabilities":
+        case "system.capabilities": {
+          const probe = adapter ? await adapter.probe() : undefined;
           return ok(rpc.id, {
-            codex: adapter?.descriptor.capabilities ?? {
-              callerAttestation: true,
+            codex: probe?.capabilities ?? {
+              listSessions: false,
+              observeSessionState: false,
+              observeExecutions: false,
               appendContext: false,
               wakeWhenIdle: false,
+              atomicDeferredWake: false,
+              steerActiveExecution: false,
+              cancelOwnedExecution: false,
+              reconcileDelivery: false,
+              callerAttestationSchemes: [],
+              supportedPartKinds: [],
             },
             a2aJsonRpc: true,
           });
+        }
         case "system.shutdown":
           if (principal.kind !== "local-user") throw new Error("NOT_AUTHORIZED");
           audit("daemon.shutdown", "system");
@@ -222,15 +268,18 @@ export function controlHandler(
             required(p.slug, "slug"),
             p.displayName,
             p.description,
+            p.skills,
           );
           audit("agent.create", "agent", createdAgent.id);
           return ok(rpc.id, { agent: agentDto(store, createdAgent) });
         case "agents.update":
           admin(principal.kind);
           const updatedAgent = store.updateAgent(required(p.agent, "agent"), {
+            slug: p.slug,
             displayName: p.displayName,
             description: p.description,
             enabled: p.enabled,
+            skills: p.skills,
           });
           audit("agent.update", "agent", updatedAgent.id);
           return ok(rpc.id, { agent: agentDto(store, updatedAgent) });
@@ -290,16 +339,18 @@ export function controlHandler(
             requestedInstallation =
               p.installationId ??
               (typeof session === "string" ? undefined : session.installationId);
-          const bindInstallation = required(
-            store.db
-              .query<{ id: RuntimeInstallationId }, []>(
-                "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-              )
-              .get(),
-            "runtime installation",
-          );
-          if (requestedInstallation && requestedInstallation !== bindInstallation.id)
-            throw new Error("BINDING_CONFLICT: runtime installation mismatch");
+          const bindInstallation = requestedInstallation
+            ? store
+                .query<{ id: RuntimeInstallationId }, [string]>(
+                  "SELECT id FROM runtime_installations WHERE id=? LIMIT 1",
+                )
+                .get(requestedInstallation)
+            : store
+                .query<{ id: RuntimeInstallationId }, []>(
+                  "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+                )
+                .get();
+          if (!bindInstallation) throw new Error("BINDING_CONFLICT: runtime installation mismatch");
           const bindSnapshot = await adapter.inspectSession({
             installationId: bindInstallation.id,
             opaqueId: sessionId,
@@ -309,6 +360,7 @@ export function controlHandler(
           const createdBinding = store.bind(required(p.agent, "agent"), sessionId, {
             continuityPolicy: p.continuityPolicy,
             deliveryPolicy: p.deliveryPolicy,
+            installationId: bindSnapshot.session.installationId,
             revokeExisting: p.revokeExisting,
           });
           store.observeSession(bindSnapshot.session, bindSnapshot.availability);
@@ -316,24 +368,18 @@ export function controlHandler(
           return ok(rpc.id, { binding: bindingDto(createdBinding, store) });
         case "bindings.claim": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
-          if (p.evidence?.harnessId !== "codex") throw new Error("UNATTESTED_CALLER");
-          const threadId = p.evidence?.metadata?.threadId;
-          if (typeof threadId !== "string") throw new Error("UNATTESTED_CALLER");
-          const claimInstallation = required(
-            store.db
-              .query<{ id: RuntimeInstallationId }, []>(
-                "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
-              )
-              .get(),
-            "runtime installation",
-          );
-          const claimSnapshot = await adapter.inspectSession({
-            installationId: claimInstallation.id,
-            opaqueId: threadId,
-          });
+          const evidence = hostInvocationEvidence(p.evidence);
+          if (!evidence || !callerAttestor) throw new Error("UNATTESTED_CALLER");
+          const proof = await callerAttestor.attest(evidence);
+          if (proof.kind !== "attested") throw new Error("UNATTESTED_CALLER");
+          const claimSnapshot = await adapter.inspectSession(proof.session);
           if (claimSnapshot.availability === "offline")
             throw new Error("RUNTIME_UNAVAILABLE: session not found");
-          const binding = store.claim(required(p.claimCode, "claimCode"), threadId);
+          const binding = store.claim(
+            required(p.claimCode, "claimCode"),
+            proof.session.opaqueId,
+            proof.session.installationId,
+          );
           store.observeSession(claimSnapshot.session, claimSnapshot.availability);
           audit("binding.claim", "binding", binding.id);
           const agent = store.agent(binding.agentId);
@@ -351,7 +397,7 @@ export function controlHandler(
           const agentFilter = p.agent ? store.agent(p.agent)?.id : undefined,
             page = boundedLocalPage(
               store,
-              store.db
+              store
                 .query<BindingRow, []>("SELECT * FROM runtime_bindings")
                 .all()
                 .filter(
@@ -387,19 +433,49 @@ export function controlHandler(
           const target = store.binding(required(p.toBindingId ?? p.bindingId, "toBindingId"));
           if (!target || target.agent_id !== agent.id || target.status !== "active")
             throw new Error("BINDING_NOT_FOUND");
-          const changed = store.db
-            .query(
-              "UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=?,updated_at_ms=? WHERE target_agent_id=? AND state IN ('pending','deferred')",
-            )
-            .run(target.id, target.epoch, Date.now(), agent.id).changes;
+          const deliveryIds = p.deliveryIds ? new Set(p.deliveryIds) : undefined,
+            candidates = store
+              .query<DeliveryIntentRow, [`agt_${string}`]>(
+                "SELECT * FROM delivery_intents WHERE target_agent_id=? AND state IN ('pending','deferred')",
+              )
+              .all(agent.id)
+              .filter(
+                (delivery) =>
+                  (!p.fromBindingId || delivery.pinned_binding_id === p.fromBindingId) &&
+                  (!deliveryIds || deliveryIds.has(delivery.id)),
+              ),
+            changed = store.write(() =>
+              candidates.reduce(
+                (count, delivery) =>
+                  count +
+                  store
+                    .query(
+                      "UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=?,updated_at_ms=? WHERE id=? AND state IN ('pending','deferred')",
+                    )
+                    .run(target.id, target.epoch, Date.now(), delivery.id).changes,
+                0,
+              ),
+            );
           audit("binding.retarget-pending", "binding", target.id, { retargeted: changed });
           return ok(rpc.id, { retargeted: changed });
         }
         case "runtimes.list": {
           const page = boundedLocalPage(
             store,
-            store.db
-              .query<{ installationId: RuntimeInstallationId; label: string }, []>(
+            store
+              .query<
+                {
+                  installationId: RuntimeInstallationId;
+                  harnessId: string;
+                  adapterId: string;
+                  label: string;
+                  state: "unknown" | "online" | "degraded" | "offline" | "incompatible";
+                  capabilitiesJson: string;
+                  protocolFingerprint: string | null;
+                  lastSeenAtMs: number | null;
+                },
+                []
+              >(
                 "SELECT id installationId,harness_id harnessId,adapter_id adapterId,label,state,capabilities_json capabilitiesJson,protocol_fingerprint protocolFingerprint,last_seen_at_ms lastSeenAtMs FROM runtime_installations",
               )
               .all(),
@@ -409,7 +485,27 @@ export function controlHandler(
             "ascending",
           );
           return ok(rpc.id, {
-            runtimes: page.items,
+            runtimes: page.items.map((runtime) => ({
+              installationId: runtime.installationId,
+              harnessId: runtime.harnessId,
+              adapterId: runtime.adapterId,
+              label: runtime.label,
+              probe:
+                runtime.lastSeenAtMs === null
+                  ? undefined
+                  : {
+                      state:
+                        runtime.state === "online"
+                          ? "ready"
+                          : runtime.state === "offline" || runtime.state === "unknown"
+                            ? "unavailable"
+                            : runtime.state,
+                      observedAt: new Date(runtime.lastSeenAtMs).toISOString(),
+                      protocolFingerprint: runtime.protocolFingerprint ?? undefined,
+                      capabilities: jsonRecord(runtime.capabilitiesJson),
+                      diagnostics: [],
+                    },
+            })),
             nextCursor: page.nextCursor,
           });
         }
@@ -424,14 +520,19 @@ export function controlHandler(
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           runtimeInstallation(store, p.installationId);
           const page = await adapter.listSessions({
-            cursor: p.cursor,
+            cursor: p.cursor ? runtimeSessionCursor(store.decodeCursor(p.cursor)) : undefined,
             limit: p.limit,
             availability: p.availability,
             text: p.text,
           });
           for (const snapshot of page.sessions)
             store.observeSession(snapshot.session, snapshot.availability);
-          return ok(rpc.id, page);
+          return ok(rpc.id, {
+            sessions: page.sessions,
+            nextCursor: page.nextCursor
+              ? store.encodeCursor({ runtimeSessionCursor: page.nextCursor })
+              : undefined,
+          });
         }
         case "runtimes.sessions.inspect": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
@@ -454,11 +555,11 @@ export function controlHandler(
           return ok(rpc.id, { session: snapshot });
         }
         case "bridge.attestCaller": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           return ok(rpc.id, a);
         }
         case "bridge.identity": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           const agent = a.kind === "attested" ? store.agent(a.agentId) : undefined;
           return ok(rpc.id, {
             attestation: a,
@@ -466,7 +567,7 @@ export function controlHandler(
           });
         }
         case "bridge.issueA2AToken": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           if (a.bindingId !== p.bindingId || a.bindingEpoch !== p.bindingEpoch)
             throw new Error("STALE_BINDING");
@@ -479,37 +580,46 @@ export function controlHandler(
           });
         }
         case "inbox.list": {
-          const a = attestEvidence(store, p.evidence);
-          if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          const states = p.states ?? ["submitted", "working", "input-required", "auth-required"],
+          const agents =
+              principal.kind === "local-user"
+                ? p.agent
+                  ? [required(store.agent(p.agent), "agent")]
+                  : store.agents()
+                : [],
+            a = principal.kind === "local-user" ? undefined : await attest(p.evidence);
+          if (a?.kind === "unattested") throw new Error("UNATTESTED_CALLER");
+          const agentIds = a?.kind === "attested" ? [a.agentId] : agents.map((agent) => agent.id),
+            states = p.states ?? ["submitted", "working", "input-required", "auth-required"],
             page = boundedLocalPage(
               store,
-              store.inbox(a.agentId).filter((row) => states.includes(row.state)),
+              agentIds
+                .flatMap((agentId) => store.inbox(agentId))
+                .filter((row) => states.includes(row.state)),
               Math.min(p.limit ?? 20, 100),
               p.cursor,
               (row) => ({ sortKey: timestampKey(row.updated_at_ms), id: row.id }),
               "descending",
             );
           return ok(rpc.id, {
-            items: page.items.map((row) => row.task),
+            items: page.items.map((row) => taskDto(store, row.id)),
             nextCursor: page.nextCursor,
           });
         }
         case "inbox.get": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          const task = store.inboxTask(a.agentId, required(p.taskId, "taskId"));
-          if (!task) throw new Error("TASK_NOT_FOUND");
-          return ok(rpc.id, { task });
+          const taskId = required(p.taskId, "taskId");
+          if (!store.inboxTask(a.agentId, taskId)) throw new Error("TASK_NOT_FOUND");
+          return ok(rpc.id, { task: taskDto(store, taskId) });
         }
         case "bridge.taskTarget": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          const row = store.db
-            .query<{ slug: string }, [string, string]>(
-              "SELECT ag.slug FROM a2a_tasks t JOIN agents ag ON ag.id=t.target_agent_id WHERE t.id=? AND t.requester_principal_id=?",
+          const row = store
+            .query<{ slug: string }, [string, string, string]>(
+              "SELECT ag.slug FROM a2a_tasks t JOIN agents ag ON ag.id=t.target_agent_id WHERE t.id=? AND (t.requester_principal_id=? OR t.target_agent_id=?)",
             )
-            .get(required(p.taskId, "taskId"), a.principalId);
+            .get(required(p.taskId, "taskId"), a.principalId, a.agentId);
           if (!row) throw new Error("TASK_NOT_FOUND");
           return ok(rpc.id, row);
         }
@@ -517,7 +627,7 @@ export function controlHandler(
         case "executor.task.fail":
         case "executor.task.requestInput":
         case "executor.task.acknowledge": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           const state = rpc.method.endsWith("complete")
             ? TaskState.Completed
@@ -526,58 +636,59 @@ export function controlHandler(
               : rpc.method.endsWith("requestInput")
                 ? TaskState.InputRequired
                 : TaskState.Working;
-          if (rpc.method.endsWith("complete") && p.artifacts?.length)
-            store.publishArtifacts(
-              required(p.taskId, "taskId"),
-              a.principalId,
-              p.artifacts.map(toArtifact),
-            );
           const details = rpc.method.endsWith("requestInput")
             ? { choices: p.choices ?? [], blocking: p.blocking ?? true }
             : rpc.method.endsWith("fail")
               ? { retryable: p.retryable ?? false }
               : {};
+          const taskId = required(p.taskId, "taskId"),
+            summary = rpc.method.endsWith("requestInput")
+              ? required(p.question, "question")
+              : rpc.method.endsWith("complete") || rpc.method.endsWith("fail")
+                ? required(p.summary, "summary")
+                : "";
+          if (rpc.method.endsWith("complete"))
+            store.completeTask(taskId, a.principalId, summary, (p.artifacts ?? []).map(toArtifact));
+          else store.setTaskState(taskId, a.principalId, state, summary, details);
           return ok(rpc.id, {
-            task: store.setTaskState(
-              required(p.taskId, "taskId"),
-              a.principalId,
-              state,
-              p.summary ?? p.question ?? "",
-              details,
-            ),
-            eventSequence: store.eventSequence(required(p.taskId, "taskId")),
+            task: taskDto(store, taskId),
+            eventSequence: store.eventSequence(taskId),
           });
         }
         case "executor.task.publishMessage": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          return ok(
-            rpc.id,
-            store.publishMessage(
-              required(p.taskId, "taskId"),
+          const taskId = required(p.taskId, "taskId"),
+            published = store.publishMessage(
+              taskId,
               a.principalId,
               (p.parts ?? []).map(toPart),
               p.summary,
-            ),
-          );
+            );
+          return ok(rpc.id, {
+            task: taskDto(store, taskId),
+            eventSequence: published.eventSequence,
+          });
         }
         case "executor.task.publishArtifact": {
-          const a = attestEvidence(store, p.evidence);
+          const a = await attest(p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          return ok(
-            rpc.id,
-            store.publishArtifacts(
-              required(p.taskId, "taskId"),
+          const taskId = required(p.taskId, "taskId"),
+            published = store.publishArtifacts(
+              taskId,
               a.principalId,
               (p.artifacts ?? []).map(toArtifact),
-            ),
-          );
+            );
+          return ok(rpc.id, {
+            task: taskDto(store, taskId),
+            eventSequence: published.eventSequence,
+          });
         }
         case "deliveries.list": {
           const targetAgent = p.targetAgent ? store.agent(p.targetAgent)?.id : undefined,
             page = boundedLocalPage(
               store,
-              store.db
+              store
                 .query<DeliveryIntentRow, []>("SELECT * FROM delivery_intents")
                 .all()
                 .filter(
@@ -595,36 +706,39 @@ export function controlHandler(
               "descending",
             );
           return ok(rpc.id, {
-            items: page.items,
+            items: page.items.map(deliveryDto),
             nextCursor: page.nextCursor,
           });
         }
         case "deliveries.get": {
-          const item = store.db
-            .query("SELECT * FROM delivery_intents WHERE id=?")
+          const item = store
+            .query<DeliveryIntentRow, [string]>("SELECT * FROM delivery_intents WHERE id=?")
             .get(required(p.deliveryId, "deliveryId"));
           if (!item) throw new Error("DELIVERY_NOT_FOUND");
-          return ok(rpc.id, { delivery: item });
+          return ok(rpc.id, { delivery: deliveryDto(item) });
         }
         case "deliveries.retry":
           admin(principal.kind);
           const retryDeliveryId = required(p.deliveryId, "deliveryId"),
             retried = store.retryDelivery(retryDeliveryId);
           audit("delivery.retry", "delivery", retryDeliveryId);
-          return ok(rpc.id, { delivery: retried });
+          return ok(rpc.id, { delivery: deliveryDto(required(retried, "delivery")) });
         case "deliveries.cancel":
           admin(principal.kind);
           const cancelDeliveryId = required(p.deliveryId, "deliveryId"),
             canceled = store.cancelDelivery(cancelDeliveryId, p.reason);
           audit("delivery.cancel", "delivery", cancelDeliveryId);
-          return ok(rpc.id, { delivery: canceled });
+          return ok(rpc.id, { delivery: deliveryDto(required(canceled, "delivery")) });
         case "deliveries.resolveUnknown":
           admin(principal.kind);
           const resolveDeliveryId = required(p.deliveryId, "deliveryId"),
             resolution = required(p.resolution, "resolution"),
             resolved = store.resolveUnknown(resolveDeliveryId, resolution);
-          audit("delivery.resolve-unknown", "delivery", resolveDeliveryId, { resolution });
-          return ok(rpc.id, { delivery: resolved });
+          audit("delivery.resolve-unknown", "delivery", resolveDeliveryId, {
+            resolution,
+            evidence: typeof p.evidence === "string" ? p.evidence : undefined,
+          });
+          return ok(rpc.id, { delivery: deliveryDto(required(resolved, "delivery")) });
         default:
           throw new Error("METHOD_NOT_FOUND");
       }
@@ -700,12 +814,64 @@ export async function controlCall(
 function admin(kind: string) {
   if (kind !== "local-user") throw new Error("NOT_AUTHORIZED");
 }
-function attestEvidence(store: Store, evidence: Params["evidence"]) {
-  if (!evidence?.metadata) return { kind: "unattested", reason: "missing-host-metadata" } as const;
-  return store.attest(evidence?.metadata?.threadId, evidence?.harnessId);
+async function attestEvidence(
+  store: ControlStoragePort,
+  adapter: RuntimeAdapter | undefined,
+  callerAttestor: RuntimeCallerAttestor | undefined,
+  evidence: Params["evidence"],
+): Promise<BridgeAttestationDto> {
+  const callerEvidence = attestationEvidence(evidence);
+  if (!callerEvidence?.metadata) return { kind: "unattested", reason: "missing-host-metadata" };
+  const hostEvidence = hostInvocationEvidence(evidence);
+  if (!callerAttestor || !hostEvidence)
+    return { kind: "unattested", reason: "unsupported-harness" };
+  const proof = await callerAttestor.attest(hostEvidence);
+  if (proof.kind !== "attested") return proof;
+  const before = store.attestSession(proof.session, proof.scheme, proof.evidenceFingerprint);
+  if (before.kind !== "attested") return before;
+  let verified = false;
+  if (adapter)
+    try {
+      const snapshot = await adapter.inspectSession(before.session);
+      if (snapshot.availability !== "offline") {
+        store.observeSession(snapshot.session, snapshot.availability);
+        verified = true;
+      }
+    } catch {}
+  const binding = store.binding(before.bindingId);
+  if (
+    !verified &&
+    (!binding?.last_observed_at_ms || binding.last_observed_at_ms < Date.now() - 30_000)
+  )
+    return { kind: "unattested", reason: "runtime-unreachable" };
+  const current = store.attestSession(proof.session, proof.scheme, proof.evidenceFingerprint);
+  return current.kind === "attested" &&
+    current.bindingId === before.bindingId &&
+    current.bindingEpoch === before.bindingEpoch
+    ? current
+    : { kind: "unattested", reason: "stale-binding" };
 }
-function runtimeInstallation(store: Store, requestedId?: string) {
-  const installation = store.db
+function attestationEvidence(evidence: Params["evidence"]) {
+  return typeof evidence === "string" ? undefined : evidence;
+}
+function hostInvocationEvidence(evidence: Params["evidence"]): HostInvocationEvidence | undefined {
+  const value = attestationEvidence(evidence);
+  if (
+    !value ||
+    typeof value.harnessId !== "string" ||
+    value.bridge !== "mcp" ||
+    typeof value.bridgeInstanceId !== "string"
+  )
+    return undefined;
+  return {
+    harnessId: value.harnessId,
+    bridge: value.bridge,
+    metadata: value.metadata,
+    bridgeInstanceId: value.bridgeInstanceId,
+  };
+}
+function runtimeInstallation(store: ControlStoragePort, requestedId?: string) {
+  const installation = store
     .query<{ id: RuntimeInstallationId }, [string | null, string | null]>(
       "SELECT id FROM runtime_installations WHERE harness_id='codex' AND (? IS NULL OR id=?) LIMIT 1",
     )
@@ -714,7 +880,7 @@ function runtimeInstallation(store: Store, requestedId?: string) {
   return installation;
 }
 function boundedLocalPage<T>(
-  store: Store,
+  store: ControlStoragePort,
   items: T[],
   limit: number,
   encodedCursor: string | undefined,
@@ -768,8 +934,8 @@ function authorize(principal: { kind: string; scopes: string[] }, method: string
   if (scope === null || (scope && !principal.scopes.includes(scope)))
     throw new Error("NOT_AUTHORIZED");
 }
-function agentDto(store: Store, agent: AgentRow) {
-  const binding = store.db
+function agentDto(store: ControlStoragePort, agent: AgentRow) {
+  const binding = store
     .query<BindingRow, [`agt_${string}`]>(
       "SELECT * FROM runtime_bindings WHERE agent_id=? AND status='active'",
     )
@@ -783,22 +949,75 @@ function agentDto(store: Store, agent: AgentRow) {
     skills: jsonArray(agent.skills_json),
     availability: binding?.last_observed_availability ?? "unknown",
     binding: binding
-      ? { id: binding.id, harnessId: "codex", epoch: binding.epoch, status: binding.status }
+      ? {
+          id: binding.id,
+          harnessId: runtimeHarnessId(store, binding.installation_id),
+          epoch: binding.epoch,
+          status: binding.status,
+        }
       : undefined,
     createdAt: new Date(agent.created_at_ms).toISOString(),
     updatedAt: new Date(agent.updated_at_ms).toISOString(),
   };
 }
+function taskDto(store: ControlStoragePort, taskId: string): TaskDto {
+  const row = required(
+    store
+      .query<
+        {
+          id: string;
+          context_id: string;
+          target_agent_id: string;
+          requester_agent_id: string | null;
+          state: TaskDto["state"];
+          state_version: number;
+          summary: string | null;
+          created_at_ms: number;
+          updated_at_ms: number;
+        },
+        [string]
+      >("SELECT * FROM a2a_tasks WHERE id=?")
+      .get(taskId),
+    "task",
+  );
+  return {
+    id: row.id,
+    contextId: row.context_id,
+    targetAgentId: row.target_agent_id,
+    requesterAgentId: row.requester_agent_id ?? undefined,
+    state: row.state,
+    stateVersion: row.state_version,
+    summary: row.summary ?? undefined,
+    createdAt: new Date(row.created_at_ms).toISOString(),
+    updatedAt: new Date(row.updated_at_ms).toISOString(),
+  };
+}
+function deliveryDto(delivery: DeliveryIntentRow): DeliveryDto {
+  return {
+    id: delivery.id,
+    kind: delivery.kind,
+    taskId: delivery.task_id,
+    targetAgentId: delivery.target_agent_id,
+    state: delivery.state,
+    reason: delivery.state_reason ?? undefined,
+    attemptCount: delivery.attempt_count,
+    bindingId: delivery.pinned_binding_id ?? undefined,
+    bindingEpoch: delivery.pinned_binding_epoch ?? undefined,
+    runtimeExecutionId: delivery.runtime_execution_id ?? undefined,
+    createdAt: new Date(delivery.created_at_ms).toISOString(),
+    updatedAt: new Date(delivery.updated_at_ms).toISOString(),
+  };
+}
 function bindingDto(
   binding: BindingRow | { id: string; agentId: string; sessionId: string; epoch: number },
-  store: Store,
+  store: ControlStoragePort,
 ) {
   const row = "agent_id" in binding ? binding : required(store.binding(binding.id), "binding");
   return {
     id: row.id,
     agentId: row.agent_id,
     installationId: row.installation_id,
-    harnessId: "codex",
+    harnessId: runtimeHarnessId(store, row.installation_id),
     session: { installationId: row.installation_id, opaqueId: row.session_opaque_id },
     epoch: row.epoch,
     status: row.status,
@@ -808,6 +1027,16 @@ function bindingDto(
     activatedAt: row.activated_at_ms ? new Date(row.activated_at_ms).toISOString() : undefined,
     revokedAt: row.revoked_at_ms ? new Date(row.revoked_at_ms).toISOString() : undefined,
   };
+}
+function runtimeHarnessId(store: ControlStoragePort, installationId: RuntimeInstallationId) {
+  return required(
+    store
+      .query<{ harness_id: string }, [RuntimeInstallationId]>(
+        "SELECT harness_id FROM runtime_installations WHERE id=?",
+      )
+      .get(installationId),
+    "runtime installation",
+  ).harness_id;
 }
 function toPart(part: ExecutorPart): StoredPart {
   if (part.kind === "text")
@@ -857,12 +1086,40 @@ function parseRpc(value: unknown): Rpc {
     (value.params !== undefined && !isRecord(value.params))
   )
     throw new Error("VALIDATION_FAILED: invalid JSON-RPC request");
+  const params = paramsSchema.safeParse(value.params ?? {});
+  if (!params.success) throw new Error("VALIDATION_FAILED: invalid params");
   return {
     jsonrpc: "2.0",
     id: value.id,
     method: value.method,
-    params: paramsSchema.parse(value.params ?? {}),
+    params: params.data,
   };
+}
+function controlErrorCode(raw: string): ControlErrorData["code"] {
+  switch (raw) {
+    case "NOT_AUTHENTICATED":
+    case "NOT_AUTHORIZED":
+    case "AGENT_NOT_FOUND":
+    case "AGENT_DISABLED":
+    case "BINDING_NOT_FOUND":
+    case "BINDING_CONFLICT":
+    case "UNATTESTED_CALLER":
+    case "STALE_BINDING":
+    case "RUNTIME_UNAVAILABLE":
+    case "RUNTIME_INCOMPATIBLE":
+    case "TASK_NOT_FOUND":
+    case "TASK_STATE_CONFLICT":
+    case "TASK_NOT_ASSIGNED":
+    case "DELIVERY_NOT_FOUND":
+    case "ACCEPTANCE_UNKNOWN":
+    case "UNSUPPORTED_CAPABILITY":
+    case "IDEMPOTENCY_CONFLICT":
+    case "VALIDATION_FAILED":
+    case "OVERLOADED":
+      return raw;
+    default:
+      return "INTERNAL";
+  }
 }
 function required<T>(value: T | null | undefined, name: string): T {
   if (value === undefined || value === null) throw new Error(`VALIDATION_FAILED: missing ${name}`);
@@ -870,6 +1127,11 @@ function required<T>(value: T | null | undefined, name: string): T {
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function runtimeSessionCursor(value: unknown) {
+  if (!isRecord(value) || typeof value.runtimeSessionCursor !== "string")
+    throw new Error("VALIDATION_FAILED: invalid cursor");
+  return value.runtimeSessionCursor;
 }
 function jsonArray(json: string) {
   const value: unknown = JSON.parse(json);

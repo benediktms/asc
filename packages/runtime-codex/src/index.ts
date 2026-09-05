@@ -1,6 +1,13 @@
-import type { ResponseItem } from "../../codex-protocol-generated/src/ResponseItem";
-import type { JsonValue } from "../../codex-protocol-generated/src/serde_json/JsonValue";
+import { createHash } from "node:crypto";
+import {
+  CodexAppServerError,
+  CodexAppServerFailureKind,
+  type CodexAppServerFailureDto,
+  type CodexThreadDto,
+} from "../../../contracts/codex-app-server-boundary";
 import type {
+  CallerAttestationResult,
+  HostInvocationEvidence,
   RuntimeAdapter,
   RuntimeAdapterContext,
   RuntimeAdapterDescriptor,
@@ -15,22 +22,53 @@ import type {
   RuntimeDeliveryResult,
   RuntimeEvent,
   NeutralPart,
+  RuntimeInstallationId,
   RuntimeProbeResult,
   RuntimeReconcileRequest,
   RuntimeReconcileResult,
+  RuntimeCallerAttestor,
   RuntimeSessionPage,
   RuntimeSessionQuery,
   RuntimeSessionRef,
   RuntimeSessionSnapshot,
 } from "../../../contracts/runtime-adapter";
-import { CodexAppServerClient, type CodexThread } from "./app-server-client";
+import { CodexAppServerClient } from "./app-server-client";
 import { telemetry } from "../../observability/src/index";
-import testedVersion from "../../codex-protocol-generated/CODEX_VERSION" with { type: "text" };
+import {
+  CODEX_PROTOCOL_FINGERPRINT,
+  jsonValue,
+  responseItem,
+  supportsCodexVersion,
+} from "./protocol-codec";
 
-export const TESTED_CODEX_VERSION = testedVersion.trim();
+export { SUPPORTED_CODEX_VERSIONS, TESTED_CODEX_VERSION } from "./protocol-codec";
 
 export function codexVersion(value: string): string | undefined {
   return value.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.at(0);
+}
+
+export class CodexCallerAttestor implements RuntimeCallerAttestor {
+  readonly harnessId = "codex";
+  readonly scheme = "codex-mcp-thread-meta-v1";
+  readonly schemes = [this.scheme];
+  constructor(private installationId: RuntimeInstallationId) {}
+  async attest(evidence: HostInvocationEvidence): Promise<CallerAttestationResult> {
+    if (evidence.harnessId !== this.harnessId)
+      return { kind: "unattested", reason: "unsupported-harness" };
+    if (!evidence.metadata) return { kind: "unattested", reason: "missing-host-metadata" };
+    const threadId = evidence.metadata.threadId;
+    if (threadId === undefined) return { kind: "unattested", reason: "missing-session-id" };
+    if (typeof threadId !== "string" || !threadId || threadId.length > 512)
+      return { kind: "unattested", reason: "invalid-session-id" };
+    return {
+      kind: "attested",
+      scheme: this.scheme,
+      session: { installationId: this.installationId, opaqueId: threadId },
+      evidenceFingerprint: createHash("sha256")
+        .update(`${this.harnessId}\0${threadId}`)
+        .digest("base64url"),
+    };
+  }
 }
 
 const capabilities: RuntimeCapabilities = {
@@ -62,6 +100,11 @@ const availabilityStates: RuntimeAvailability[] = [
   "awaiting-local-input",
   "degraded",
 ];
+type SessionCursor = {
+  phase: "stored" | "loaded";
+  vendorCursor?: string;
+  storedIds: string[];
+};
 
 export class CodexRuntimeAdapter implements RuntimeAdapter {
   readonly descriptor: RuntimeAdapterDescriptor = {
@@ -135,17 +178,18 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     try {
       if (!this.client) throw new Error("adapter not started");
       await this.client.listThreads({ limit: 1, useStateDbOnly: true }, signal);
-      if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+      if (!supportsCodexVersion(this.runtimeVersion))
         return {
           state: "incompatible",
           observedAt: new Date().toISOString(),
           runtimeVersion: this.runtimeVersion,
+          protocolFingerprint: CODEX_PROTOCOL_FINGERPRINT,
           capabilities: disabledCapabilities(),
           diagnostics: [
             {
               severity: "error",
               code: "CODEX_VERSION_UNTESTED",
-              message: `Expected Codex ${TESTED_CODEX_VERSION}, received ${this.runtimeVersion ?? "unknown"}`,
+              message: `Unsupported Codex ${this.runtimeVersion ?? "unknown"}`,
             },
           ],
         };
@@ -153,6 +197,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         state: "ready",
         observedAt: new Date().toISOString(),
         runtimeVersion: this.runtimeVersion,
+        protocolFingerprint: CODEX_PROTOCOL_FINGERPRINT,
         capabilities,
         diagnostics: [
           {
@@ -165,6 +210,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     } catch (error) {
       if (signal?.aborted) throw error;
+      const failure = appServerFailure(error);
       return {
         state: "unavailable",
         observedAt: new Date().toISOString(),
@@ -173,7 +219,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           {
             severity: "error",
             code: "CODEX_UNAVAILABLE",
-            message: error instanceof Error ? error.message : String(error),
+            message: `Codex app-server unavailable (${failure.kind})`,
           },
         ],
       };
@@ -186,48 +232,79 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.assertRunning();
     signal?.throwIfAborted();
     const client = this.requireClient(),
-      loaded = await client.loadedThreads(null, signal),
-      page = await client.listThreads(
-        {
-          cursor: query.cursor,
-          limit: Math.min(query.limit ?? 50, 100),
-          searchTerm: query.text,
-          useStateDbOnly: true,
-        },
-        signal,
-      ),
-      loadedIds = new Set(loaded.data);
-    let sessions = await Promise.all(
-      page.data.map((thread) =>
-        loadedIds.has(thread.id)
-          ? this.inspectSession(
-              {
-                installationId: this.requireContext().installationId,
-                opaqueId: thread.id,
-              },
-              signal,
-            )
-          : this.snapshot(thread),
-      ),
-    );
-    if (query.text) {
-      const search = query.text.toLocaleLowerCase();
-      sessions = sessions.filter((session) =>
-        Object.values(session.attributes).some((value) =>
-          typeof value === "string" ? value.toLocaleLowerCase().includes(search) : false,
+      limit = Math.min(query.limit ?? 50, 100),
+      cursor: SessionCursor = query.cursor
+        ? sessionCursor(query.cursor)
+        : { phase: "stored", storedIds: [] };
+    let sessions: RuntimeSessionSnapshot[], nextCursor: string | undefined;
+    if (cursor.phase === "stored") {
+      const page = await client.listThreads(
+          {
+            cursor: cursor.vendorCursor,
+            limit,
+            searchTerm: query.text,
+            sourceKinds: [],
+            useStateDbOnly: false,
+          },
+          signal,
         ),
+        storedIds = [...new Set([...cursor.storedIds, ...page.data.map((thread) => thread.id)])];
+      sessions = filterSessions(
+        page.data.map((thread) => this.snapshot(thread)),
+        query,
       );
+      nextCursor = sessionCursorString({
+        phase: page.nextCursor ? "stored" : "loaded",
+        vendorCursor: page.nextCursor ?? undefined,
+        storedIds,
+      });
+      if (!page.data.length && !page.nextCursor) {
+        const loadedPage = await client.loadedThreads(null, signal, limit);
+        sessions = filterSessions(
+          await this.loadedSessions(loadedPage.data, new Set(storedIds), signal),
+          query,
+        );
+        nextCursor = loadedPage.nextCursor
+          ? sessionCursorString({
+              phase: "loaded",
+              vendorCursor: loadedPage.nextCursor,
+              storedIds,
+            })
+          : undefined;
+      }
+    } else {
+      const loadedPage = await client.loadedThreads(cursor.vendorCursor ?? null, signal, limit);
+      sessions = filterSessions(
+        await this.loadedSessions(loadedPage.data, new Set(cursor.storedIds), signal),
+        query,
+      );
+      nextCursor = loadedPage.nextCursor
+        ? sessionCursorString({
+            phase: "loaded",
+            vendorCursor: loadedPage.nextCursor,
+            storedIds: cursor.storedIds,
+          })
+        : undefined;
     }
-    const availability = query.availability;
-    if (availability?.length)
-      sessions = sessions.filter((item) => availability.includes(item.availability));
     for (const state of availabilityStates)
       telemetry.gauge(
         "acs_runtime_sessions_by_state",
         sessions.filter((session) => session.availability === state).length,
         { state },
       );
-    return { sessions, nextCursor: page.nextCursor ?? undefined };
+    return { sessions, nextCursor };
+  }
+  private loadedSessions(ids: string[], storedIds: Set<string>, signal?: AbortSignal) {
+    return Promise.all(
+      ids
+        .filter((id) => !storedIds.has(id))
+        .map((opaqueId) =>
+          this.inspectSession(
+            { installationId: this.requireContext().installationId, opaqueId },
+            signal,
+          ),
+        ),
+    );
   }
   async inspectSession(
     session: RuntimeSessionRef,
@@ -249,11 +326,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           ).thread,
         );
       } catch (error: unknown) {
-        if (
-          /not found|invalid thread|adapter not started|not connected|connection (?:closed|reset)|socket unavailable/i.test(
-            errorMessage(error),
-          )
-        )
+        if (sessionUnavailable(appServerFailure(error).kind))
           return {
             session,
             availability: "offline",
@@ -298,9 +371,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     if (request.mode === "join_active")
       return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
+    if (request.mode === "wake_when_idle")
+      for (const execution of this.executions.values())
+        if (
+          execution.session.installationId === request.target.session.installationId &&
+          execution.session.opaqueId === request.target.session.opaqueId
+        )
+          return { outcome: "deferred", reason: "busy" };
     const snapshot = await this.inspectSession(request.target.session, signal);
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
-    if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+    if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (request.mode === "wake_when_idle") {
       if (snapshot.availability === "dormant") {
@@ -324,7 +404,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         await this.requireClient().injectItems(
           {
             threadId: request.target.session.opaqueId,
-            items: [jsonValue(JSON.stringify(this.responseItem(request.envelope)))],
+            items: [jsonValue(JSON.stringify(responseItem(request.envelope)))],
           },
           request.markRequestFlushed,
           signal,
@@ -336,26 +416,27 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
       await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
-      const response = await this.requireClient().startTurn(
-        {
-          threadId: request.target.session.opaqueId,
-          input: [],
-          turnTrigger: "agent-communications-service",
-          toolOutput: {
-            name: "receive_agent_message",
-            namespace: "acs",
-            output: JSON.stringify(request.envelope),
-          },
+      const execution = {
+          deliveryId: request.deliveryId,
+          payloadHash: request.payloadHash,
+          session: request.target.session,
+          finalParts: new Array<NeutralPart>(),
         },
-        request.markRequestFlushed,
-        signal,
-      );
-      this.executions.set(response.turn.id, {
-        deliveryId: request.deliveryId,
-        payloadHash: request.payloadHash,
-        session: request.target.session,
-        finalParts: [],
-      });
+        response = await this.requireClient().startTurn(
+          {
+            threadId: request.target.session.opaqueId,
+            input: [],
+            turnTrigger: "agent-communications-service",
+            toolOutput: {
+              name: "receive_agent_message",
+              namespace: "acs",
+              output: JSON.stringify(request.envelope),
+            },
+          },
+          request.markRequestFlushed,
+          signal,
+          (turnId) => this.executions.set(turnId, execution),
+        );
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
@@ -363,23 +444,27 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         evidence: { scheme: "codex.turn-start.v1", value: response.turn.id },
       };
     } catch (error: unknown) {
-      const message = errorMessage(error);
-      if (signal?.aborted && !/aborted after write/i.test(message)) throw error;
-      if (/timeout|connection closed|reset|aborted after write/i.test(message))
+      const failure = appServerFailure(error);
+      if (signal?.aborted && failure.kind !== CodexAppServerFailureKind.RequestAbortedAfterWrite)
+        throw error;
+      if (failure.requestFlushed && deliveryAmbiguous(failure.kind))
         return {
           outcome: "acceptance-unknown",
           ambiguity: "connection-reset",
           reconciliationToken: `${request.target.session.opaqueId}:${request.deliveryId}`,
         };
-      if (/overload|queue.*full|too many/i.test(message))
+      if (failure.kind === CodexAppServerFailureKind.Backpressure)
         return { outcome: "deferred", reason: "backpressure", retryAfterMs: 1000 };
-      if (/not found/i.test(message))
+      if (failure.kind === CodexAppServerFailureKind.SessionNotFound)
         return { outcome: "rejected", reason: "session-not-found", retryable: false };
+      if (sessionUnavailable(failure.kind)) return { outcome: "deferred", reason: "offline" };
+      if (failure.kind === CodexAppServerFailureKind.UnsupportedMethod)
+        return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
       return {
         outcome: "rejected",
         reason: "runtime-protocol-error",
         retryable: false,
-        details: { code: errorCode(error) },
+        details: { code: failure.rpcCode ?? failure.kind },
       };
     }
   }
@@ -389,7 +474,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   ): Promise<RuntimeReconcileResult> {
     this.assertRunning();
     signal?.throwIfAborted();
-    if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+    if (!supportsCodexVersion(this.runtimeVersion))
       return {
         outcome: "inconclusive",
         reason: "Codex runtime version is not supported",
@@ -423,9 +508,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           };
     } catch (error: unknown) {
       if (signal?.aborted) throw error;
+      const failure = appServerFailure(error);
       return {
         outcome: "inconclusive",
-        reason: errorMessage(error),
+        reason: `Codex reconciliation failed (${failure.kind})`,
         operatorActionRequired: true,
       };
     }
@@ -433,7 +519,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   async cancel(request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
     this.assertRunning();
     signal?.throwIfAborted();
-    if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+    if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (!this.executions.has(request.execution.opaqueId))
       return { outcome: "rejected", reason: "not-owned", retryable: false };
@@ -450,13 +536,14 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       );
       return { outcome: "accepted", acceptedAt: new Date().toISOString() };
     } catch (error: unknown) {
-      const message = errorMessage(error);
-      return /not running|not found/i.test(message)
+      const failure = appServerFailure(error);
+      return failure.kind === CodexAppServerFailureKind.NotRunning ||
+        failure.kind === CodexAppServerFailureKind.SessionNotFound
         ? { outcome: "not-running" }
-        : { outcome: "unknown", reason: message };
+        : { outcome: "unknown", reason: `Codex cancellation failed (${failure.kind})` };
     }
   }
-  private snapshot(thread: CodexThread): RuntimeSessionSnapshot {
+  private snapshot(thread: CodexThreadDto): RuntimeSessionSnapshot {
     return {
       session: { installationId: this.requireContext().installationId, opaqueId: thread.id },
       availability: status(thread),
@@ -469,14 +556,6 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       },
     };
   }
-  private responseItem(envelope: RuntimeDeliveryEnvelopeV1): ResponseItem {
-    return {
-      type: "function_call_output",
-      name: "receive_agent_message",
-      namespace: "acs",
-      output: JSON.stringify(envelope),
-    };
-  }
   private supports(envelope: RuntimeDeliveryEnvelopeV1) {
     return (envelope.message?.parts ?? envelope.event?.parts ?? []).every(
       (part) => part.kind === "text" || part.kind === "uri" || part.kind === "data",
@@ -486,7 +565,11 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (this.stopped) throw new Error("runtime adapter stopped");
   }
   private requireClient() {
-    if (!this.client || this.stopped) throw new Error("adapter not started");
+    if (!this.client || this.stopped)
+      throw new CodexAppServerError("adapter not started", {
+        kind: CodexAppServerFailureKind.ConnectionUnavailable,
+        requestFlushed: false,
+      });
     return this.client;
   }
   private requireContext() {
@@ -591,10 +674,43 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   }
 }
 
-function jsonValue(json: string): JsonValue {
-  const value: unknown = JSON.parse(json);
-  if (!isJsonValue(value)) throw new Error("runtime envelope is not JSON");
-  return value;
+function filterSessions(sessions: RuntimeSessionSnapshot[], query: RuntimeSessionQuery) {
+  const search = query.text?.toLocaleLowerCase();
+  return sessions.filter(
+    (session) =>
+      (!query.availability?.length || query.availability.includes(session.availability)) &&
+      (!search ||
+        [
+          session.session.opaqueId,
+          session.attributes.displayTitle,
+          session.attributes.cwdHint,
+          session.attributes.sourceKind,
+        ].some((value) => value?.toLocaleLowerCase().includes(search))),
+  );
+}
+function sessionCursorString(cursor: SessionCursor) {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+function sessionCursor(encoded: string): SessionCursor {
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(encoded, "base64url").toString());
+  } catch {
+    throw new Error("invalid runtime session cursor");
+  }
+  if (
+    !isRecord(value) ||
+    (value.phase !== "stored" && value.phase !== "loaded") ||
+    (value.vendorCursor !== undefined && typeof value.vendorCursor !== "string") ||
+    !Array.isArray(value.storedIds) ||
+    value.storedIds.some((id) => typeof id !== "string")
+  )
+    throw new Error("invalid runtime session cursor");
+  return {
+    phase: value.phase,
+    vendorCursor: value.vendorCursor,
+    storedIds: value.storedIds,
+  };
 }
 function runtimeSourceKind(source: unknown) {
   if (typeof source === "string") return source;
@@ -606,13 +722,8 @@ function runtimeSourceKind(source: unknown) {
   )
     return source.type;
 }
-function isJsonValue(value: unknown): value is JsonValue {
-  if (value === null || ["boolean", "number", "string"].includes(typeof value)) return true;
-  if (Array.isArray(value)) return value.every(isJsonValue);
-  return (
-    typeof value === "object" &&
-    Object.values(value).every((item) => item === undefined || isJsonValue(item))
-  );
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isItemCompleted(
   value: unknown,
@@ -671,13 +782,26 @@ function isRuntimeInputRequest(value: unknown): value is { turnId: string; isBlo
   );
 }
 
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+function appServerFailure(error: unknown): CodexAppServerFailureDto {
+  return error instanceof CodexAppServerError
+    ? error.failure
+    : { kind: CodexAppServerFailureKind.Unknown, requestFlushed: false };
 }
-function errorCode(error: unknown) {
-  return typeof error === "object" && error !== null && "code" in error
-    ? String(error.code)
-    : "unknown";
+function sessionUnavailable(kind: CodexAppServerFailureKind) {
+  return (
+    kind === CodexAppServerFailureKind.ConnectionLost ||
+    kind === CodexAppServerFailureKind.ConnectionUnavailable ||
+    kind === CodexAppServerFailureKind.NotInitialized ||
+    kind === CodexAppServerFailureKind.SessionNotFound
+  );
+}
+function deliveryAmbiguous(kind: CodexAppServerFailureKind) {
+  return (
+    kind === CodexAppServerFailureKind.ConnectionLost ||
+    kind === CodexAppServerFailureKind.RequestAbortedAfterWrite ||
+    kind === CodexAppServerFailureKind.RequestMarkerFailedAfterWrite ||
+    kind === CodexAppServerFailureKind.RequestTimedOut
+  );
 }
 function isThreadStatusChanged(
   value: unknown,
@@ -694,7 +818,7 @@ function isThreadStatusChanged(
   );
 }
 
-function status(thread: CodexThread): RuntimeAvailability {
+function status(thread: CodexThreadDto): RuntimeAvailability {
   return statusType(thread.status);
 }
 function statusType(value: { type: string }): RuntimeAvailability {

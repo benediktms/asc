@@ -2,9 +2,14 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RuntimeInstallationId, RuntimeReconcileRequest } from "../contracts/runtime-adapter";
+import type {
+  DeliveryId,
+  RuntimeDeliveryRequest,
+  RuntimeInstallationId,
+  RuntimeReconcileRequest,
+} from "../contracts/runtime-adapter";
 import { controlHandler } from "../packages/protocol-control/src/index";
-import { CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
+import { CodexCallerAttestor, CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../packages/runtime-codex/src/app-server-client";
 import { Store } from "../packages/storage-sqlite/src/index";
 
@@ -49,7 +54,13 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
       const page = await adapter.listSessions({ limit: 10 });
       expect(page.sessions).toHaveLength(2);
       expect(page.sessions.every((session) => session.availability === "idle")).toBe(true);
-      const control = controlHandler(store, new Date().toISOString(), () => {}, adapter),
+      const control = controlHandler(
+          store,
+          new Date().toISOString(),
+          () => {},
+          adapter,
+          new CodexCallerAttestor(installation.id),
+        ),
         token = readFileSync(join(root, "control.token"), "utf8"),
         call = async (method: string, params: unknown) => {
           const response = await control(
@@ -201,12 +212,12 @@ test.skipIf(process.env.ACS_REAL_CODEX_MODEL !== "1")(
       ),
       client = new CodexAppServerClient(socket, 30_000),
       adapter = new CodexRuntimeAdapter(socket);
-    let threadId: string | undefined;
+    let threadId: string | undefined, resumedClient: CodexAppServerClient | undefined;
     try {
       for (let attempt = 0; attempt < 100 && !existsSync(socket); attempt++) await Bun.sleep(50);
       if (!existsSync(socket)) throw new Error(await new Response(child.stderr).text());
       const initialized = await client.start();
-      expect(initialized.userAgent).toContain("0.153.2");
+      expect(initialized.userAgent).toContain(process.env.ACS_EXPECTED_CODEX_VERSION ?? "0.153.2");
       const started = record(
           await client.startThread({
             cwd: root,
@@ -240,56 +251,41 @@ test.skipIf(process.env.ACS_REAL_CODEX_MODEL !== "1")(
         clock: { now: () => new Date().toISOString() },
         assertBindingFence: async () => ({ valid: true }),
       });
-      expect(await adapter.probe()).toMatchObject({ state: "ready", runtimeVersion: "0.153.2" });
+      expect(await adapter.probe()).toMatchObject({
+        state: "ready",
+        runtimeVersion: process.env.ACS_EXPECTED_CODEX_VERSION ?? "0.153.2",
+      });
       expect(
-        await adapter.deliver({
-          deliveryId: "int_shared_codex",
-          target: {
-            session: { installationId: "ins_shared_codex", opaqueId: threadId },
-            bindingId: "bnd_shared_codex",
-            bindingEpoch: 1,
-          },
-          mode: "append_context",
-          envelope: {
-            schema: "urn:agent-communications:runtime-envelope:v1",
-            deliveryId: "int_shared_codex",
-            kind: "a2a-message",
-            from: { agentId: "agt_sender", name: "sender" },
-            to: { agentId: "agt_recipient", name: "recipient" },
-            message: {
-              id: "msg_shared_codex",
-              parts: [{ kind: "text", text: "The required reply token is ACS_CONTEXT_VISIBLE_OK" }],
-            },
-            provenance: { authority: "peer-agent", trustedForPermissions: false },
-          },
-          payloadHash: "shared-codex-probe",
-        }),
+        await adapter.deliver(
+          runtimeDelivery(
+            threadId,
+            "int_shared_codex",
+            "append_context",
+            "The required reply token is ACS_CONTEXT_VISIBLE_OK",
+          ),
+        ),
       ).toMatchObject({ outcome: "accepted" });
       const abort = new AbortController(),
         completion = waitForCompletion(adapter, abort.signal),
-        wake = await adapter.deliver({
-          deliveryId: "int_shared_codex_wake",
-          target: {
-            session: { installationId: "ins_shared_codex", opaqueId: threadId },
-            bindingId: "bnd_shared_codex",
-            bindingEpoch: 1,
-          },
-          mode: "wake_when_idle",
-          envelope: {
-            schema: "urn:agent-communications:runtime-envelope:v1",
-            deliveryId: "int_shared_codex_wake",
-            kind: "a2a-message",
-            from: { agentId: "agt_sender", name: "sender" },
-            to: { agentId: "agt_recipient", name: "recipient" },
-            message: {
-              id: "msg_shared_codex_wake",
-              parts: [{ kind: "text", text: "Reply only with the token from prior context." }],
-            },
-            provenance: { authority: "peer-agent", trustedForPermissions: false },
-          },
-          payloadHash: "shared-codex-wake-probe",
-        });
+        wake = await adapter.deliver(
+          runtimeDelivery(
+            threadId,
+            "int_shared_codex_wake",
+            "wake_when_idle",
+            "Reply only with the token from prior context.",
+          ),
+        );
       expect(wake).toMatchObject({ outcome: "accepted", execution: { alreadyRunning: false } });
+      expect(
+        await adapter.deliver(
+          runtimeDelivery(
+            threadId,
+            "int_shared_codex_busy",
+            "wake_when_idle",
+            "This must remain queued while the existing turn is active.",
+          ),
+        ),
+      ).toEqual({ outcome: "deferred", reason: "busy" });
       const completed = await Promise.race([
         completion,
         Bun.sleep(120_000).then(() => {
@@ -301,15 +297,52 @@ test.skipIf(process.env.ACS_REAL_CODEX_MODEL !== "1")(
         outcome: "completed",
         finalParts: [{ kind: "text", text: "ACS_CONTEXT_VISIBLE_OK" }],
       });
-      await client.request("mcpServer/tool/call", {
+      resumedClient = new CodexAppServerClient(socket, 30_000);
+      await resumedClient.start();
+      await resumedClient.resumeThread(threadId);
+      await resumedClient.request("mcpServer/tool/call", {
         server: "acs_meta_probe",
         threadId,
         tool: "capture_thread_meta",
         arguments: {},
       });
       expect(readFileSync(metadataOutput, "utf8").trim().split("\n")).toEqual([threadId, threadId]);
+      const cancelAbort = new AbortController(),
+        interrupted = waitForCompletion(adapter, cancelAbort.signal),
+        cancelWake = await adapter.deliver(
+          runtimeDelivery(
+            threadId,
+            "int_shared_codex_cancel",
+            "wake_when_idle",
+            "Run the shell command sleep 30, then reply.",
+          ),
+        );
+      if (cancelWake.outcome !== "accepted" || !cancelWake.execution)
+        throw new Error("Codex cancellation probe was not accepted");
+      await waitForBusy(adapter, threadId);
+      expect(
+        await adapter.cancel({
+          execution: {
+            normalizedId: "exe_shared_codex_cancel",
+            opaqueId: cancelWake.execution.opaqueId,
+            session: { installationId: "ins_shared_codex", opaqueId: threadId },
+            bindingId: "bnd_shared_codex",
+            bindingEpoch: 1,
+          },
+        }),
+      ).toMatchObject({ outcome: "accepted" });
+      expect(
+        await Promise.race([
+          interrupted,
+          Bun.sleep(30_000).then(() => {
+            throw new Error("real Codex cancellation timed out");
+          }),
+        ]),
+      ).toMatchObject({ outcome: "interrupted" });
+      cancelAbort.abort();
       await adapter.stop({ reason: "shutdown" });
     } finally {
+      resumedClient?.close();
       if (threadId) await client.deleteThread(threadId).catch(() => {});
       client.close();
       child.kill();
@@ -334,8 +367,47 @@ function string(value: unknown): string {
   return value;
 }
 
+function runtimeDelivery(
+  threadId: string,
+  deliveryId: DeliveryId,
+  mode: RuntimeDeliveryRequest["mode"],
+  text: string,
+): RuntimeDeliveryRequest {
+  return {
+    deliveryId,
+    target: {
+      session: { installationId: "ins_shared_codex", opaqueId: threadId },
+      bindingId: "bnd_shared_codex",
+      bindingEpoch: 1,
+    },
+    mode,
+    envelope: {
+      schema: "urn:agent-communications:runtime-envelope:v1",
+      deliveryId,
+      kind: "a2a-message",
+      from: { agentId: "agt_sender", name: "sender" },
+      to: { agentId: "agt_recipient", name: "recipient" },
+      message: { id: `msg_${deliveryId}`, parts: [{ kind: "text", text }] },
+      provenance: { authority: "peer-agent", trustedForPermissions: false },
+    },
+    payloadHash: deliveryId,
+  };
+}
+
 async function waitForCompletion(adapter: CodexRuntimeAdapter, signal: AbortSignal) {
   for await (const event of adapter.observe(signal))
     if (event.type === "execution.completed") return event;
   throw new Error("Codex observation stopped before completion");
+}
+
+async function waitForBusy(adapter: CodexRuntimeAdapter, threadId: string) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const snapshot = await adapter.inspectSession({
+      installationId: "ins_shared_codex",
+      opaqueId: threadId,
+    });
+    if (snapshot.availability === "busy") return;
+    await Bun.sleep(20);
+  }
+  throw new Error("Codex turn did not become busy");
 }

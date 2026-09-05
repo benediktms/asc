@@ -137,6 +137,11 @@ export interface RuntimeAdapterContext {
   >;
 }
 
+export interface RuntimeTraceContext {
+  readonly traceparent: string;
+  readonly tracestate?: string;
+}
+
 export interface RuntimeAdapterStopContext {
   readonly reason: "shutdown" | "restart" | "configuration-change";
   readonly deadline?: string;
@@ -218,10 +223,7 @@ export interface RuntimeDeliveryRequest {
   readonly deadline?: string;
   readonly autoResumeDormantThread?: boolean;
   readonly markRequestFlushed?: () => void;
-  readonly traceContext?: {
-    readonly traceparent?: string;
-    readonly tracestate?: string;
-  };
+  readonly traceContext?: RuntimeTraceContext;
 }
 
 export type RuntimeDeliveryResult =
@@ -420,7 +422,7 @@ export interface RuntimeAdapter {
 export interface HostInvocationEvidence {
   readonly harnessId: string;
   readonly bridge: "mcp";
-  readonly metadata?: JsonObject;
+  readonly metadata?: Readonly<Record<string, unknown>>;
   readonly bridgeInstanceId: string;
 }
 

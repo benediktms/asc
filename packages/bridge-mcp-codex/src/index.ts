@@ -4,8 +4,11 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { controlCall } from "../../protocol-control/src/index";
-import { paths } from "../../storage-sqlite/src/index";
+import { paths } from "../../config/src/index";
+import { uuidV7 } from "../../domain/src/index";
 
+const deliveryStatus = "urn:agent-communications:delivery-status:v1",
+  cancellationStatus = "urn:agent-communications:cancellation:v1";
 const result = (data: unknown): CallToolResult => ({
   content: [{ type: "text", text: JSON.stringify(data) }],
   structuredContent: {
@@ -64,6 +67,15 @@ const agentSchema = z.looseObject({
     attestation: attestationSchema,
     agent: agentSchema.optional(),
   }),
+  bindingSchema = z.looseObject({
+    id: z.string(),
+    epoch: z.number(),
+    status: z.literal("active"),
+  }),
+  claimResultSchema = z.looseObject({
+    agent: agentSchema,
+    binding: bindingSchema,
+  }),
   agentResultSchema = z.looseObject({ agent: agentSchema }),
   agentPageSchema = z.looseObject({
     items: z.array(agentSchema),
@@ -71,6 +83,28 @@ const agentSchema = z.looseObject({
   }),
   tokenSchema = z.looseObject({ token: z.string(), expiresAt: z.string() }),
   targetSchema = z.looseObject({ slug: z.string() }),
+  taskSchema = z.looseObject({
+    id: z.string(),
+    contextId: z.string(),
+    status: z.looseObject({ state: z.union([z.string(), z.number()]) }),
+    metadata: z
+      .looseObject({
+        [deliveryStatus]: z
+          .looseObject({ deliveryId: z.string(), duplicate: z.boolean().optional() })
+          .optional(),
+        [cancellationStatus]: z.looseObject({ requested: z.boolean() }).optional(),
+      })
+      .optional(),
+  }),
+  taskResultSchema = z.looseObject({ task: taskSchema }),
+  executorResultSchema = z.looseObject({
+    task: z.looseObject({ id: z.string(), state: z.string() }),
+    eventSequence: z.number(),
+  }),
+  inboxResultSchema = z.looseObject({
+    items: z.array(z.looseObject({ id: z.string(), state: z.string() })),
+    nextCursor: z.string().optional(),
+  }),
   attachment = z.discriminatedUnion("kind", [
     z.object({
       kind: z.literal("uri"),
@@ -81,7 +115,7 @@ const agentSchema = z.looseObject({
     }),
     z.object({
       kind: z.literal("data"),
-      data: z.unknown(),
+      data: z.json(),
       name: z.string(),
       mediaType: z.string(),
     }),
@@ -96,19 +130,23 @@ const hostMetadata = (extra: unknown) => {
 
 export function mcpMessageIdentity(
   hostRequestId: unknown,
-  callerThreadId: string,
+  metadata?: Record<string, unknown>,
   clientRequestId?: string,
 ) {
   if (typeof hostRequestId === "string" || typeof hostRequestId === "number")
     return { messageId: String(hostRequestId) };
-  if (clientRequestId)
+  if (
+    typeof metadata?.threadId === "string" &&
+    typeof metadata.turnId === "string" &&
+    clientRequestId
+  )
     return {
-      messageId: `mcp_${createHash("sha256")
-        .update(`${callerThreadId}\0${clientRequestId}`)
-        .digest("base64url")}`,
+      messageId: createHash("sha256")
+        .update(JSON.stringify([metadata.threadId, metadata.turnId, clientRequestId]))
+        .digest("hex"),
     };
   return {
-    messageId: crypto.randomUUID(),
+    messageId: uuidV7(),
     warning: "Host-level retry may duplicate this request because no stable call ID was available.",
   };
 }
@@ -169,9 +207,38 @@ export async function runMcp(port = 7432) {
               : identity.attestation.reason === "unbound-session"
                 ? "unbound"
                 : "unattested",
-          agent: identity.agent,
+          agent: identity.agent
+            ? {
+                id: identity.agent.id,
+                slug: identity.agent.slug,
+                displayName: identity.agent.displayName,
+              }
+            : undefined,
           harness: "codex",
           bindingEpoch: identity.attestation.bindingEpoch,
+        };
+      }),
+  );
+  server.registerTool(
+    "acs_claim",
+    {
+      description: "Bind this Codex thread using a one-time ACS claim code",
+      inputSchema: { claimCode: z.string().min(1).max(64) },
+    },
+    async ({ claimCode }, extra) =>
+      execute(async () => {
+        const claimed = await typedCall(
+          "bindings.claim",
+          { claimCode, evidence: evidence(extra) },
+          claimResultSchema,
+        );
+        return {
+          agent: {
+            id: claimed.agent.id,
+            slug: claimed.agent.slug,
+            displayName: claimed.agent.displayName,
+          },
+          binding: claimed.binding,
         };
       }),
   );
@@ -203,14 +270,16 @@ export async function runMcp(port = 7432) {
           },
           agentPageSchema,
         );
-        return { agents: page.items, nextCursor: page.nextCursor };
+        return { agents: page.items.map(agentView), nextCursor: page.nextCursor };
       }),
   );
   server.registerTool(
     "acs_agent_get",
     { description: "Get one logical ACS agent", inputSchema: { agent: z.string() } },
     async ({ agent }) =>
-      execute(async () => (await typedCall("agents.get", { agent }, agentResultSchema)).agent),
+      execute(async () =>
+        agentView((await typedCall("agents.get", { agent }, agentResultSchema)).agent),
+      ),
   );
   server.registerTool(
     "acs_send",
@@ -224,7 +293,19 @@ export async function runMcp(port = 7432) {
         delivery: z.enum(["wake_when_idle", "append_context"]).optional(),
         priority: z.enum(["low", "normal", "high"]).optional(),
         replyExpected: z.boolean().optional(),
-        notifyOn: z.array(z.string()).optional(),
+        notifyOn: z
+          .array(
+            z.enum([
+              "working",
+              "input-required",
+              "completed",
+              "failed",
+              "canceled",
+              "rejected",
+              "terminal",
+            ]),
+          )
+          .optional(),
         attachments: z.array(attachment).optional(),
         clientRequestId: z.string().optional(),
       },
@@ -232,32 +313,30 @@ export async function runMcp(port = 7432) {
     async (args, extra) =>
       execute(async () => {
         const caller = await attest(extra),
-          identity = mcpMessageIdentity(
-            extra.requestId,
-            caller.session.opaqueId,
-            args.clientRequestId,
-          ),
+          identity = mcpMessageIdentity(extra.requestId, hostMetadata(extra), args.clientRequestId),
           auth = await issueA2AToken(caller, extra),
           agent = await typedCall("agents.get", { agent: args.to }, agentResultSchema);
-        const rpc = await a2a(port, agent.agent.slug, auth.token, "SendMessage", {
-          message: {
-            messageId: identity.messageId,
-            contextId: args.contextId,
-            taskId: args.taskId,
-            role: "ROLE_USER",
-            parts: parts(args.text, args.attachments),
-          },
-          configuration: { returnImmediately: true },
-          metadata: {
-            "urn:agent-communications:delivery:v1": {
-              mode: args.delivery,
-              priority: args.priority,
-              replyExpected: args.replyExpected,
-              notifyOn: args.notifyOn,
+        const rpc = taskResultSchema.parse(
+          await a2a(port, agent.agent.slug, auth.token, "SendMessage", {
+            message: {
+              messageId: identity.messageId,
+              contextId: args.contextId,
+              taskId: args.taskId,
+              role: "ROLE_USER",
+              parts: parts(args.text, args.attachments),
             },
-          },
-        });
-        return withWarning(rpc, identity.warning);
+            configuration: { returnImmediately: true },
+            metadata: {
+              "urn:agent-communications:delivery:v1": {
+                mode: args.delivery,
+                priority: args.priority,
+                replyExpected: args.replyExpected,
+                notifyOn: args.notifyOn,
+              },
+            },
+          }),
+        );
+        return withWarning(acceptedTask(rpc.task), identity.warning);
       }),
   );
   server.registerTool(
@@ -275,10 +354,13 @@ export async function runMcp(port = 7432) {
             { evidence: evidence(extra), taskId: args.taskId },
             targetSchema,
           );
-        return await a2a(port, target.slug, auth.token, "GetTask", {
-          id: args.taskId,
-          historyLength: args.historyLength,
-        });
+        const task = taskSchema.parse(
+          await a2a(port, target.slug, auth.token, "GetTask", {
+            id: args.taskId,
+            historyLength: args.historyLength,
+          }),
+        );
+        return { task };
       }),
   );
   server.registerTool(
@@ -295,27 +377,29 @@ export async function runMcp(port = 7432) {
     async (args, extra) =>
       execute(async () => {
         const caller = await attest(extra),
-          identity = mcpMessageIdentity(
-            extra.requestId,
-            caller.session.opaqueId,
-            args.clientRequestId,
-          ),
+          identity = mcpMessageIdentity(extra.requestId, hostMetadata(extra), args.clientRequestId),
           auth = await issueA2AToken(caller, extra),
           target = await typedCall(
             "bridge.taskTarget",
             { evidence: evidence(extra), taskId: args.taskId },
             targetSchema,
           );
-        const rpc = await a2a(port, target.slug, auth.token, "SendMessage", {
-          message: {
-            messageId: identity.messageId,
-            taskId: args.taskId,
-            role: "ROLE_USER",
-            parts: parts(args.text, args.attachments),
-          },
-          configuration: { returnImmediately: true },
-        });
-        return withWarning(rpc, identity.warning);
+        const rpc = taskResultSchema.parse(
+            await a2a(port, target.slug, auth.token, "SendMessage", {
+              message: {
+                messageId: identity.messageId,
+                taskId: args.taskId,
+                role: "ROLE_USER",
+                parts: parts(args.text, args.attachments),
+              },
+              configuration: { returnImmediately: true },
+            }),
+          ),
+          accepted = acceptedTask(rpc.task);
+        return withWarning(
+          { taskId: accepted.taskId, state: accepted.state, deliveryId: accepted.deliveryId },
+          identity.warning,
+        );
       }),
   );
   server.registerTool(
@@ -333,10 +417,19 @@ export async function runMcp(port = 7432) {
             { evidence: evidence(extra), taskId: args.taskId },
             targetSchema,
           );
-        return await a2a(port, target.slug, auth.token, "CancelTask", {
-          id: args.taskId,
-          metadata: args.reason ? { reason: args.reason } : undefined,
-        });
+        const task = taskSchema.parse(
+            await a2a(port, target.slug, auth.token, "CancelTask", {
+              id: args.taskId,
+              metadata: args.reason ? { reason: args.reason } : undefined,
+            }),
+          ),
+          state = taskState(task.status.state);
+        return {
+          taskId: task.id,
+          state,
+          cancellationRequested:
+            state === "canceled" || task.metadata?.[cancellationStatus]?.requested === true,
+        };
       }),
   );
   server.registerTool(
@@ -352,7 +445,16 @@ export async function runMcp(port = 7432) {
     async (args, extra) =>
       execute(async () => {
         await attest(extra);
-        return call("executor.task.complete", { ...args, evidence: evidence(extra) });
+        const completed = await typedCall(
+          "executor.task.complete",
+          { ...args, evidence: evidence(extra) },
+          executorResultSchema,
+        );
+        return {
+          taskId: completed.task.id,
+          state: "completed",
+          eventSequence: completed.eventSequence,
+        };
       }),
   );
   server.registerTool(
@@ -368,7 +470,16 @@ export async function runMcp(port = 7432) {
     async (args, extra) =>
       execute(async () => {
         await attest(extra);
-        return call("executor.task.fail", { ...args, evidence: evidence(extra) });
+        const failed = await typedCall(
+          "executor.task.fail",
+          { ...args, evidence: evidence(extra) },
+          executorResultSchema,
+        );
+        return {
+          taskId: failed.task.id,
+          state: "failed",
+          eventSequence: failed.eventSequence,
+        };
       }),
   );
   server.registerTool(
@@ -385,7 +496,16 @@ export async function runMcp(port = 7432) {
     async (args, extra) =>
       execute(async () => {
         await attest(extra);
-        return call("executor.task.requestInput", { ...args, evidence: evidence(extra) });
+        const requested = await typedCall(
+          "executor.task.requestInput",
+          { ...args, evidence: evidence(extra) },
+          executorResultSchema,
+        );
+        return {
+          taskId: requested.task.id,
+          state: "input-required",
+          eventSequence: requested.eventSequence,
+        };
       }),
   );
   server.registerTool(
@@ -393,15 +513,68 @@ export async function runMcp(port = 7432) {
     {
       description: "List non-terminal tasks assigned to this logical agent",
       inputSchema: {
-        states: z.array(z.string()).optional(),
+        states: z.array(z.enum(["submitted", "working", "input-required"])).optional(),
         limit: z.number().int().min(1).max(100).optional(),
         cursor: z.string().optional(),
       },
     },
     async (args, extra) =>
-      execute(() => call("inbox.list", { ...args, evidence: evidence(extra) })),
+      execute(async () => {
+        const page = await typedCall(
+          "inbox.list",
+          { ...args, evidence: evidence(extra) },
+          inboxResultSchema,
+        );
+        return { tasks: page.items, nextCursor: page.nextCursor };
+      }),
   );
   await server.connect(new StdioServerTransport());
+}
+
+function agentView(agent: z.infer<typeof agentSchema>) {
+  return {
+    id: agent.id,
+    slug: agent.slug,
+    displayName: agent.displayName,
+    description: agent.description,
+    availability: agent.availability,
+    skills: agent.skills
+      .map((skill) => skill.id ?? skill.name)
+      .filter((skill): skill is string => typeof skill === "string"),
+  };
+}
+
+function acceptedTask(task: z.infer<typeof taskSchema>) {
+  const status = task.metadata?.[deliveryStatus];
+  if (!status) throw new Error("Invalid A2A acceptance metadata");
+  return {
+    taskId: task.id,
+    contextId: task.contextId,
+    state: taskState(task.status.state),
+    deliveryId: status.deliveryId,
+    duplicate: status.duplicate ?? false,
+  };
+}
+
+function taskState(state: string | number) {
+  if (typeof state === "string")
+    return state
+      .replace(/^TASK_STATE_/, "")
+      .toLowerCase()
+      .replaceAll("_", "-");
+  return (
+    [
+      "unspecified",
+      "submitted",
+      "working",
+      "completed",
+      "failed",
+      "canceled",
+      "input-required",
+      "rejected",
+      "auth-required",
+    ][state] ?? "unknown"
+  );
 }
 
 function withWarning(value: unknown, warning?: string) {

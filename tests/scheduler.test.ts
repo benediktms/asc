@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Message } from "@a2a-js/sdk";
+import { Message, TaskState as A2ATaskState } from "@a2a-js/sdk";
+import type { RuntimeDeliveryRequest } from "../contracts/runtime-adapter";
 import { DeliveryScheduler, retryDelay } from "../packages/application/src/scheduler";
+import { TaskState } from "../packages/domain/src/index";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
 import { FakeRuntimeAdapter } from "./fake-runtime-adapter";
 
@@ -83,12 +85,18 @@ describe("delivery scheduler", () => {
       agent.id,
       principal.id,
       Message.fromJSON({ messageId: "one", role: "ROLE_USER", parts: [{ text: "work" }] }),
-      { mode: "append_context" },
+      {
+        mode: "append_context",
+        traceContext: {
+          traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+          tracestate: "vendor=value",
+        },
+      },
     );
     const adapter = new FakeRuntimeAdapter();
-    let autoResumeDormantThread: boolean | undefined;
+    let delivered: RuntimeDeliveryRequest | undefined;
     adapter.deliver = async (request) => {
-      autoResumeDormantThread = request.autoResumeDormantThread;
+      delivered = request;
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
@@ -105,7 +113,293 @@ describe("delivery scheduler", () => {
         )
         .get(accepted.deliveryId),
     ).toEqual({ state: "accepted", attempt_count: 1 });
-    expect(autoResumeDormantThread).toBe(true);
+    expect(store.task(accepted.task.id, principal.id)).toMatchObject({
+      metadata: {
+        "urn:agent-communications:delivery-status:v1": {
+          state: "accepted",
+          deliveryId: accepted.deliveryId,
+          attemptCount: 1,
+        },
+      },
+    });
+    expect(delivered).toMatchObject({
+      autoResumeDormantThread: true,
+      traceContext: {
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        tracestate: "vendor=value",
+      },
+    });
+    await scheduler.stop();
+    store.close();
+  });
+  test("replays execution events received before runtime acceptance is committed", async () => {
+    const store = fixture(),
+      agent = store.createAgent("early-events"),
+      principal = authenticated(store);
+    store.bind(agent.id, "early-events-thread");
+    const accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "early-events",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "wake_when_idle" },
+      ),
+      delivering = Promise.withResolvers<{
+        session: { installationId: `ins_${string}`; opaqueId: string };
+      }>(),
+      emitted = Promise.withResolvers<void>(),
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async (request) => {
+      delivering.resolve({ session: request.target.session });
+      await emitted.promise;
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "early-turn", alreadyRunning: false },
+        evidence: { scheme: "fake", value: "early-turn" },
+      };
+    };
+    adapter.observe = async function* (signal) {
+      yield { type: "adapter.connection", state: "online" };
+      const target = await delivering.promise,
+        execution = { opaqueId: "early-turn", session: target.session };
+      yield { type: "execution.started", session: target.session, execution };
+      yield {
+        type: "execution.completed",
+        execution,
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "early final answer" }],
+      };
+      emitted.resolve();
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "early-events");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(store.task(accepted.task.id, principal.id)).toMatchObject({
+      status: {
+        state: A2ATaskState.TASK_STATE_COMPLETED,
+        message: { parts: [{ content: { value: "early final answer" } }] },
+      },
+    });
+    await scheduler.stop();
+    store.close();
+  });
+  test("uses an adapter-provided atomic wake with the default policy", async () => {
+    const store = fixture(),
+      agent = store.createAgent("atomic-wake"),
+      principal = authenticated(store);
+    store.bind(agent.id, "thread-atomic-wake");
+    const accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "atomic-wake",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "wake_when_idle" },
+      ),
+      delivered = Promise.withResolvers<void>(),
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => {
+      delivered.resolve();
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "atomic-wake" },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "atomic-wake");
+    await scheduler.start();
+    scheduler.signal();
+    await delivered.promise;
+    await Bun.sleep(0);
+    expect(deliveryState(store, accepted.deliveryId)?.state).toBe("accepted");
+    await scheduler.stop();
+    store.close();
+  });
+  test("honors runtime-probed capability reductions", async () => {
+    const store = fixture(),
+      agent = store.createAgent("probed-wake"),
+      principal = authenticated(store);
+    store.bind(agent.id, "thread-probed-wake");
+    const accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "probed-wake",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "wake_when_idle" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    let deliveries = 0;
+    adapter.probe = async () => ({
+      state: "ready",
+      observedAt: new Date().toISOString(),
+      capabilities: { ...adapter.descriptor.capabilities, atomicDeferredWake: false },
+      diagnostics: [],
+    });
+    adapter.deliver = async () => {
+      deliveries++;
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "probed-wake" },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "probed-wake");
+    await scheduler.start();
+    scheduler.signal();
+    await Bun.sleep(350);
+    expect(deliveries).toBe(0);
+    expect(deliveryState(store, accepted.deliveryId)).toEqual({
+      state: "deferred",
+      state_reason: "manual-wake-required",
+    });
+    await scheduler.stop();
+    store.close();
+  });
+  test("does not let one busy lane hide another target", async () => {
+    const store = fixture(),
+      principal = authenticated(store),
+      congested = store.createAgent("congested"),
+      available = store.createAgent("available");
+    store.bind(congested.id, "thread-congested");
+    store.bind(available.id, "thread-available");
+    for (let index = 0; index < 101; index++)
+      store.accept(
+        congested.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: `congested-${index}`,
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      );
+    store.accept(
+      available.id,
+      principal.id,
+      Message.fromJSON({
+        messageId: "available",
+        role: "ROLE_USER",
+        parts: [{ text: "work" }],
+      }),
+      { mode: "append_context" },
+    );
+    const releaseCongested = Promise.withResolvers<void>(),
+      availableDelivered = Promise.withResolvers<void>(),
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async (request) => {
+      if (request.target.session.opaqueId === "thread-congested") await releaseCongested.promise;
+      else availableDelivered.resolve();
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: request.deliveryId },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "fair-lanes", {
+      concurrency: 2,
+      leaseMs: 1000,
+      retryBaseMs: 10,
+      retryCapMs: 100,
+      reconnectMs: 10,
+    });
+    await scheduler.start();
+    scheduler.signal();
+    const delivered = await Promise.race([
+      availableDelivered.promise.then(() => true),
+      Bun.sleep(1000).then(() => false),
+    ]);
+    releaseCongested.resolve();
+    await scheduler.stop();
+    expect(delivered).toBe(true);
+    store.close();
+  });
+  test("persists redacted runtime rejection diagnostics", async () => {
+    const store = fixture(),
+      agent = store.createAgent("rejected-runtime"),
+      principal = authenticated(store);
+    store.bind(agent.id, "thread-rejected-runtime");
+    const accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "rejected-runtime",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => ({
+      outcome: "rejected",
+      reason: "runtime-protocol-error",
+      retryable: false,
+      details: { code: "INVALID_REQUEST" },
+    });
+    const scheduler = new DeliveryScheduler(store, adapter, "rejected-runtime");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(
+      store.db
+        .query<{ outcome: string; error_code: string; error_json: string }, [string]>(
+          "SELECT outcome,error_code,error_json FROM delivery_attempts WHERE intent_id=?",
+        )
+        .get(accepted.deliveryId),
+    ).toEqual({
+      outcome: "rejected",
+      error_code: "runtime-protocol-error",
+      error_json: JSON.stringify({ code: "INVALID_REQUEST" }),
+    });
+    expect(deliveryState(store, accepted.deliveryId)?.state).toBe("failed-terminal");
+    await scheduler.stop();
+    store.close();
+  });
+  test("backs off retryable runtime rejections", async () => {
+    const store = fixture(),
+      agent = store.createAgent("retryable-rejection"),
+      principal = authenticated(store);
+    store.bind(agent.id, "thread-retryable-rejection");
+    const accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "retryable-rejection",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async () => ({
+      outcome: "rejected",
+      reason: "runtime-protocol-error",
+      retryable: true,
+    });
+    const scheduler = new DeliveryScheduler(store, adapter, "retryable-rejection");
+    await scheduler.start();
+    await Bun.sleep(400);
+    const delivery = store.db
+      .query<
+        { state: string; state_reason: string; not_before_ms: number; updated_at_ms: number },
+        [string]
+      >("SELECT state,state_reason,not_before_ms,updated_at_ms FROM delivery_intents WHERE id=?")
+      .get(accepted.deliveryId);
+    expect(delivery).toMatchObject({
+      state: "deferred",
+      state_reason: "runtime-protocol-error",
+    });
+    expect(delivery?.not_before_ms).toBeGreaterThanOrEqual(delivery?.updated_at_ms ?? Infinity);
     await scheduler.stop();
     store.close();
   });
@@ -202,10 +496,36 @@ describe("delivery scheduler", () => {
     };
     const scheduler = new DeliveryScheduler(store, adapter, "replacement");
     await scheduler.start();
-    await Bun.sleep(400);
+    await Bun.sleep(700);
     expect(deliveries).toEqual([unflushed.deliveryId]);
     expect(deliveryState(store, unflushed.deliveryId)?.state).toBe("accepted");
     expect(deliveryState(store, flushed.deliveryId)?.state).toBe("acceptance-unknown");
+    expect(store.task(flushed.task.id, principal.id)).toMatchObject({
+      metadata: {
+        "urn:agent-communications:delivery-status:v1": {
+          state: "acceptance-unknown",
+          deliveryId: flushed.deliveryId,
+          attemptCount: 1,
+        },
+      },
+    });
+    expect(
+      store.db
+        .query<{ outcome: string; error_code: string }, [string]>(
+          "SELECT outcome,error_code FROM delivery_attempts WHERE id=?",
+        )
+        .get("atm_unflushed"),
+    ).toEqual({ outcome: "deferred", error_code: "lease-expired-before-write" });
+    expect(
+      store.db
+        .query<{ outcome: string; reconciliation_token: string }, [string]>(
+          "SELECT outcome,reconciliation_token FROM delivery_attempts WHERE id=?",
+        )
+        .get("atm_flushed"),
+    ).toEqual({
+      outcome: "acceptance-unknown",
+      reconciliation_token: `write-boundary-thread:${flushed.deliveryId}`,
+    });
     expect(
       store.db
         .query<{ request_flushed_at_ms: number | null }, [string, number]>(
@@ -269,6 +589,73 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("aborts in-flight runtime work during shutdown", async () => {
+    const store = fixture(),
+      agent = store.createAgent("shutdown-target"),
+      requester = authenticated(store);
+    store.bind(agent.id, "shutdown-thread");
+    const accepted = store.accept(
+      agent.id,
+      requester.id,
+      Message.fromJSON({ messageId: "shutdown", role: "ROLE_USER", parts: [{ text: "work" }] }),
+      { mode: "append_context" },
+    );
+    const adapter = new FakeRuntimeAdapter();
+    let markStarted: (() => void) | undefined,
+      aborted = false;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    adapter.deliver = async (request, signal) => {
+      markStarted?.();
+      request.markRequestFlushed?.();
+      return await new Promise<never>((_resolve, reject) => {
+        const abort = () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "shutdown");
+    await scheduler.start();
+    await started;
+    await scheduler.stop();
+    expect(aborted).toBe(true);
+    expect(deliveryState(store, accepted.deliveryId)).toEqual({
+      state: "acceptance-unknown",
+      state_reason: "request-flushed-no-response",
+    });
+    expect(
+      store.db
+        .query<{ outcome: string; reconciliation_token: string }, [string]>(
+          "SELECT outcome,reconciliation_token FROM delivery_attempts WHERE intent_id=?",
+        )
+        .get(accepted.deliveryId),
+    ).toEqual({
+      outcome: "acceptance-unknown",
+      reconciliation_token: `shutdown-thread:${accepted.deliveryId}`,
+    });
+    store.close();
+  });
+  test("stops the adapter after its connection drops", async () => {
+    const store = fixture(),
+      adapter = new FakeRuntimeAdapter();
+    let stopped = false;
+    adapter.observe = async function* () {
+      yield { type: "adapter.connection", state: "offline" };
+    };
+    adapter.stop = async () => {
+      stopped = true;
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "disconnected-shutdown");
+    await scheduler.start();
+    await Bun.sleep(10);
+    await scheduler.stop();
+    expect(stopped).toBe(true);
+    store.close();
+  });
   test("follows eligible rebinds and terminates unsafe delivery conditions", async () => {
     const store = fixture(),
       requester = authenticated(store),
@@ -305,10 +692,10 @@ describe("delivery scheduler", () => {
         { mode: "append_context" },
       );
     const pin = store.db.query(
-      "UPDATE delivery_intents SET state='deferred',pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?",
+      "UPDATE delivery_intents SET state='deferred',state_reason='offline',not_before_ms=?,pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?",
     );
-    pin.run(followOld.id, followOld.epoch, followDelivery.deliveryId);
-    pin.run(strictOld.id, strictOld.epoch, strictDelivery.deliveryId);
+    pin.run(Date.now() + 60_000, followOld.id, followOld.epoch, followDelivery.deliveryId);
+    pin.run(Date.now() + 60_000, strictOld.id, strictOld.epoch, strictDelivery.deliveryId);
     store.bind(follow.id, "follow-new", { revokeExisting: true });
     store.bind(strict.id, "strict-new", { revokeExisting: true });
     store.updateAgent(disabled.id, { enabled: false });
@@ -372,6 +759,14 @@ describe("delivery scheduler", () => {
     await scheduler.start();
     await Bun.sleep(400);
     store.requestCancellation(accepted.task.id, requester.id);
+    store.requestCancellation(accepted.task.id, requester.id);
+    expect(
+      store.db
+        .query<{ count: number }, [string]>(
+          "SELECT count(*) count FROM task_events WHERE task_id=? AND event_type='cancellation-requested'",
+        )
+        .get(accepted.task.id)?.count,
+    ).toBe(1);
     await Bun.sleep(400);
     expect(canceled).toEqual(["owned-turn"]);
     expect(
@@ -379,6 +774,48 @@ describe("delivery scheduler", () => {
         .query<{ state: string }, [string]>("SELECT state FROM a2a_tasks WHERE id=?")
         .get(accepted.task.id)?.state,
     ).toBe("canceled");
+    await scheduler.stop();
+    store.close();
+  });
+  test("settles cancellation only after an in-flight write has a definitive outcome", async () => {
+    const store = fixture(),
+      agent = store.createAgent("cancel-in-flight-target"),
+      requester = authenticated(store);
+    store.bind(agent.id, "thread-cancel-in-flight");
+    const accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "cancel-in-flight",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    const started = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    adapter.deliver = async () => {
+      started.resolve();
+      await release.promise;
+      return { outcome: "deferred", reason: "offline" };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "test-cancel-in-flight");
+    await scheduler.start();
+    await started.promise;
+    const requested = store.requestCancellation(accepted.task.id, requester.id);
+    expect(requested.status?.state).not.toBe(TaskState.Canceled);
+    expect(requested.metadata).toMatchObject({
+      "urn:agent-communications:cancellation:v1": { requested: true },
+    });
+    release.resolve();
+    await Bun.sleep(400);
+    expect(
+      store.db
+        .query<{ state: string }, [string]>("SELECT state FROM a2a_tasks WHERE id=?")
+        .get(accepted.task.id)?.state,
+    ).toBe("canceled");
+    expect(deliveryState(store, accepted.deliveryId)?.state).toBe("canceled");
     await scheduler.stop();
     store.close();
   });
@@ -434,10 +871,25 @@ describe("delivery scheduler", () => {
       await acceptedByRuntime;
       await Bun.sleep(50);
       yield {
+        type: "execution.completed",
+        execution: {
+          opaqueId: "local-input-turn",
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: "another-thread",
+          },
+        },
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "unrelated" }],
+      };
+      yield {
         type: "execution.awaiting-local-input",
         execution: {
           opaqueId: "local-input-turn",
-          session: { installationId: "ins_codex_local", opaqueId: "thread-local-input" },
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: bindingRow.session_opaque_id,
+          },
         },
         request: {
           opaqueId: "request-local-input",
@@ -454,15 +906,168 @@ describe("delivery scheduler", () => {
     await Bun.sleep(400);
     expect(
       store.db
-        .query<{ availability: string; execution_state: string; task_state: string }, [string]>(
-          "SELECT b.last_observed_availability availability,e.state execution_state,t.state task_state FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE i.id=?",
+        .query<
+          {
+            availability: string;
+            execution_id_matches: number;
+            execution_state: string;
+            task_state: string;
+          },
+          [string]
+        >(
+          "SELECT b.last_observed_availability availability,i.runtime_execution_id=e.id execution_id_matches,e.state execution_state,t.state task_state FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN a2a_tasks t ON t.id=i.task_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE i.id=?",
         )
         .get(accepted.deliveryId),
     ).toEqual({
       availability: "idle",
+      execution_id_matches: 1,
       execution_state: "awaiting-local-input",
       task_state: "working",
     });
+    await scheduler.stop();
+    store.close();
+  });
+  test("does not correlate notification executions to the task", async () => {
+    const store = fixture(),
+      sender = store.createAgent("notification-sender"),
+      target = store.createAgent("notification-target"),
+      senderBinding = store.bind(sender.id, "notification-sender-thread"),
+      targetBinding = store.bind(target.id, "notification-target-thread"),
+      accepted = store.accept(
+        target.id,
+        senderBinding.principalId,
+        Message.fromJSON({
+          messageId: "notification-execution",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { notifyOn: ["input-required"] },
+      );
+    store.db
+      .query("UPDATE delivery_intents SET state='accepted' WHERE id=?")
+      .run(accepted.deliveryId);
+    store.setTaskState(accepted.task.id, targetBinding.principalId, TaskState.Working);
+    store.setTaskState(
+      accepted.task.id,
+      targetBinding.principalId,
+      TaskState.InputRequired,
+      "question",
+    );
+    const delivered = Promise.withResolvers<{
+        installationId: `ins_${string}`;
+        opaqueId: string;
+      }>(),
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async (request) => {
+      delivered.resolve(request.target.session);
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "notification-turn", alreadyRunning: false },
+        evidence: { scheme: "fake", value: "notification-turn" },
+      };
+    };
+    adapter.observe = async function* (signal) {
+      yield { type: "adapter.connection", state: "online" };
+      const session = await delivered.promise;
+      yield {
+        type: "execution.completed",
+        execution: { opaqueId: "notification-turn", session },
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "must not complete the task" }],
+      };
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "notification-execution");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(
+      store.db
+        .query<{ state: string }, [string]>("SELECT state FROM a2a_tasks WHERE id=?")
+        .get(accepted.task.id)?.state,
+    ).toBe("input-required");
+    expect(
+      store.db.query<{ count: number }, []>("SELECT count(*) count FROM runtime_executions").get(),
+    ).toEqual({ count: 0 });
+    await scheduler.stop();
+    store.close();
+  });
+  test("finalizes the runtime execution without replacing an explicit task result", async () => {
+    const store = fixture(),
+      agent = store.createAgent("explicit-result-target"),
+      requester = authenticated(store),
+      binding = store.bind(agent.id, "thread-explicit-result"),
+      bindingRow = store.binding(binding.id),
+      accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "explicit-result",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    if (!bindingRow) throw new Error("missing binding");
+    let delivered: (() => void) | undefined, completeRuntime: (() => void) | undefined;
+    const runtimeAccepted = new Promise<void>((resolve) => {
+        delivered = resolve;
+      }),
+      runtimeCompleted = new Promise<void>((resolve) => {
+        completeRuntime = resolve;
+      });
+    adapter.deliver = async () => {
+      delivered?.();
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "explicit-result-turn", alreadyRunning: false },
+        evidence: { scheme: "fake", value: "explicit-result-turn" },
+      };
+    };
+    adapter.observe = async function* (signal) {
+      yield { type: "adapter.connection", state: "online" };
+      await runtimeCompleted;
+      yield {
+        type: "execution.completed",
+        execution: {
+          opaqueId: "explicit-result-turn",
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: bindingRow.session_opaque_id,
+          },
+        },
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "automatic result", mediaType: "text/plain" }],
+      };
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "explicit-result");
+    await scheduler.start();
+    await runtimeAccepted;
+    await Bun.sleep(50);
+    const assignee = store.db
+      .query<{ id: `prn_${string}` }, [string]>("SELECT id FROM principals WHERE binding_id=?")
+      .get(binding.id);
+    if (!assignee) throw new Error("missing assignee principal");
+    store.setTaskState(accepted.task.id, assignee.id, TaskState.Completed, "explicit result");
+    completeRuntime?.();
+    await Bun.sleep(50);
+    expect(
+      store.db.query<{ state: string }, []>("SELECT state FROM runtime_executions").get()?.state,
+    ).toBe("completed");
+    expect(
+      store.db
+        .query<{ state: string; summary: string }, [string]>(
+          "SELECT state,summary FROM a2a_tasks WHERE id=?",
+        )
+        .get(accepted.task.id),
+    ).toEqual({ state: "completed", summary: "explicit result" });
     await scheduler.stop();
     store.close();
   });
@@ -508,6 +1113,38 @@ describe("delivery scheduler", () => {
     expect(
       store.db.query("SELECT state FROM delivery_intents WHERE id=?").get(accepted.deliveryId),
     ).toEqual({ state: "accepted" });
+    expect(store.db.query("SELECT state FROM a2a_tasks WHERE id=?").get(accepted.task.id)).toEqual({
+      state: "working",
+    });
+    await scheduler.stop();
+    store.close();
+  });
+  test("keeps a completed delivery attempt immutable", async () => {
+    const store = fixture(),
+      agent = store.createAgent("immutable-attempt"),
+      requester = authenticated(store);
+    store.bind(agent.id, "immutable-attempt-thread");
+    const accepted = store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({
+          messageId: "immutable-attempt-message",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "append_context" },
+      ),
+      scheduler = new DeliveryScheduler(store, new FakeRuntimeAdapter(), "immutable-attempt");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(() =>
+      store.db
+        .query("UPDATE delivery_attempts SET outcome='rejected' WHERE intent_id=?")
+        .run(accepted.deliveryId),
+    ).toThrow("DELIVERY_ATTEMPT_IMMUTABLE");
+    expect(() =>
+      store.db.query("DELETE FROM delivery_attempts WHERE intent_id=?").run(accepted.deliveryId),
+    ).toThrow("DELIVERY_ATTEMPT_IMMUTABLE");
     await scheduler.stop();
     store.close();
   });

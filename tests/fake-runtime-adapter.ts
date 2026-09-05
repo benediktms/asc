@@ -34,8 +34,8 @@ const capabilities = {
 export class FakeRuntimeAdapter implements RuntimeAdapter {
   readonly descriptor = {
     adapterApiVersion: RUNTIME_ADAPTER_API_VERSION,
-    adapterId: "test.fake",
-    harnessId: "test",
+    adapterId: "codex.app-server",
+    harnessId: "codex",
     implementationVersion: "1",
     capabilities,
   } satisfies RuntimeAdapter["descriptor"];
@@ -67,7 +67,10 @@ export class FakeRuntimeAdapter implements RuntimeAdapter {
       signal.addEventListener("abort", () => resolve(), { once: true }),
     );
   }
-  async deliver(_request: RuntimeDeliveryRequest): Promise<RuntimeDeliveryResult> {
+  async deliver(
+    _request: RuntimeDeliveryRequest,
+    _signal?: AbortSignal,
+  ): Promise<RuntimeDeliveryResult> {
     return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
   }
   async reconcile(_request: RuntimeReconcileRequest): Promise<RuntimeReconcileResult> {

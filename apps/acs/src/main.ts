@@ -3,15 +3,20 @@ import { chmodSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { handleA2A } from "../../../packages/protocol-a2a/src/index";
 import { controlCall, controlHandler } from "../../../packages/protocol-control/src/index";
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
-import { initFiles, paths, Store } from "../../../packages/storage-sqlite/src/index";
+import { initFiles, Store } from "../../../packages/storage-sqlite/src/index";
 import {
-  codexVersion,
+  CodexCallerAttestor,
   CodexRuntimeAdapter,
+  SUPPORTED_CODEX_VERSIONS,
   TESTED_CODEX_VERSION,
 } from "../../../packages/runtime-codex/src/index";
-import { CodexAppServerClient } from "../../../packages/runtime-codex/src/app-server-client";
 import { DeliveryScheduler } from "../../../packages/application/src/scheduler";
-import { loadConfig, parseListen, writeDefaultConfig } from "../../../packages/config/src/index";
+import {
+  loadConfig,
+  parseListen,
+  paths,
+  writeDefaultConfig,
+} from "../../../packages/config/src/index";
 
 const args = Bun.argv.slice(2),
   config = paths(),
@@ -24,8 +29,6 @@ async function main() {
   if (args[0] === "init") {
     writeDefaultConfig();
     initFiles(config);
-    const store = new Store(config);
-    store.close();
     console.log(`Initialized ACS at ${config.data}`);
     return;
   }
@@ -74,6 +77,7 @@ async function main() {
     return print(
       await call("agents.update", {
         agent: required(args[2], "agent"),
+        slug: option("--slug"),
         displayName: option("--name"),
         description: option("--description"),
         enabled: args.includes("--enable") ? true : args.includes("--disable") ? false : undefined,
@@ -113,6 +117,7 @@ async function main() {
   if (args[0] === "runtimes" && args[1] === "list") return print(await call("runtimes.list"));
   if (args[0] === "codex" && args[1] === "sessions" && args[2] === "list")
     return print(await call("runtimes.sessions.list"));
+  if (args[0] === "inbox") return print(await call("inbox.list", { agent: args[1] || undefined }));
   if (args[0] === "deliveries" && args[1] === "list") return print(await call("deliveries.list"));
   if (args[0] === "deliveries" && args[1] === "get")
     return print(await call("deliveries.get", { deliveryId: required(args[2], "delivery ID") }));
@@ -129,7 +134,7 @@ async function main() {
     return print(
       await call("deliveries.resolveUnknown", {
         deliveryId: required(args[2], "delivery ID"),
-        resolution: required(option("--as"), "--as"),
+        resolution: resolutionOption(),
       }),
     );
   if (args[0] === "token" && args[1] === "show") {
@@ -152,10 +157,19 @@ async function daemon() {
     }),
     startedAt = new Date().toISOString();
   if (existsSync(config.runtime)) unlinkSync(config.runtime);
+  let scheduler: DeliveryScheduler | undefined;
   const a2a = Bun.serve({
     hostname: listen.hostname,
     port,
-    fetch: (request) => handleA2A(store, request, port, settings.security.maxRequestBytes),
+    fetch: (request) =>
+      handleA2A(
+        store,
+        request,
+        port,
+        settings.security.maxRequestBytes,
+        () => scheduler?.signal(),
+        listen.hostname,
+      ),
     error: (error) => sanitizedError(error, String(process.pid)),
   });
   let control: ReturnType<typeof Bun.serve>;
@@ -167,9 +181,21 @@ async function daemon() {
     process.env.ACS_CODEX_SOCKET ??
     `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`;
   const adapter = settings.codex.enabled
-    ? new CodexRuntimeAdapter(codexSocket, settings.codex.maxInFlightRequests)
-    : undefined;
-  const scheduler = adapter
+      ? new CodexRuntimeAdapter(codexSocket, settings.codex.maxInFlightRequests)
+      : undefined,
+    callerAttestor = adapter
+      ? new CodexCallerAttestor(
+          required(
+            store
+              .query<{ id: `ins_${string}` }, [string]>(
+                "SELECT id FROM runtime_installations WHERE adapter_id=? LIMIT 1",
+              )
+              .get(adapter.descriptor.adapterId),
+            "runtime installation",
+          ).id,
+        )
+      : undefined;
+  scheduler = adapter
     ? new DeliveryScheduler(store, adapter, String(process.pid), {
         concurrency: settings.delivery.workerConcurrency,
         leaseMs: settings.delivery.leaseSeconds * 1000,
@@ -179,18 +205,39 @@ async function daemon() {
       })
     : undefined;
   await scheduler?.start();
+  let stopping = false;
   const stop = () => {
-    a2a.stop(false);
-    control.stop(false);
-    void Promise.resolve(scheduler?.stop()).then(() => {
-      store.close();
-      if (existsSync(config.runtime)) unlinkSync(config.runtime);
-      finish?.();
-    });
+    if (stopping) return;
+    stopping = true;
+    void (async () => {
+      let forceTimer: Timer | undefined;
+      const serversStopped = Promise.all([a2a.stop(), control.stop()]),
+        forcedClosed = new Promise<void>((resolve) => {
+          forceTimer = setTimeout(() => {
+            void a2a.stop(true);
+            void control.stop(true);
+            resolve();
+          }, 1000);
+        });
+      try {
+        await scheduler?.stop();
+        await Promise.race([serversStopped, forcedClosed]);
+      } catch (error) {
+        sanitizedError(
+          error instanceof Error ? error : new Error(String(error)),
+          String(process.pid),
+        );
+      } finally {
+        if (forceTimer) clearTimeout(forceTimer);
+        store.close();
+        if (existsSync(config.runtime)) unlinkSync(config.runtime);
+        finish?.();
+      }
+    })();
   };
   control = Bun.serve({
     unix: config.runtime,
-    fetch: controlHandler(store, startedAt, stop, adapter),
+    fetch: controlHandler(store, startedAt, stop, adapter, callerAttestor),
     error: (error) => sanitizedError(error, String(process.pid)),
   });
   chmodSync(config.runtime, 0o600);
@@ -213,21 +260,37 @@ function log(
   daemonInstanceId: string,
   attributes: Record<string, unknown>,
 ) {
+  const levels = { debug: 0, info: 1, warn: 2, error: 3 };
+  if (levels[severity] < levels[settings.daemon.logLevel]) return;
+  const record = {
+    timestamp: new Date().toISOString(),
+    severity,
+    daemonInstanceId,
+    event,
+    ...attributes,
+  };
   console.error(
-    JSON.stringify({
-      timestamp: new Date().toISOString(),
-      severity,
-      daemonInstanceId,
-      event,
-      ...attributes,
-    }),
+    settings.daemon.logFormat === "json"
+      ? JSON.stringify(record)
+      : Object.entries(record)
+          .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+          .join(" "),
   );
 }
 function option(name: string) {
   const i = args.indexOf(name);
   return i < 0 ? undefined : args[i + 1];
 }
-function required<T>(value: T | undefined, name: string): T {
+function resolutionOption() {
+  const resolutions = [
+    ["--accepted", "accepted"],
+    ["--not-accepted-and-retry", "not-accepted-and-retry"],
+    ["--not-accepted-and-cancel", "not-accepted-and-cancel"],
+  ].filter(([flag]) => args.includes(flag));
+  if (resolutions.length !== 1) throw new Error("Specify exactly one delivery resolution flag");
+  return required(resolutions[0]?.[1], "delivery resolution");
+}
+function required<T>(value: T | null | undefined, name: string): T {
   if (!value) throw new Error(`Missing ${name}`);
   return value;
 }
@@ -237,44 +300,63 @@ function print(value: unknown) {
 async function doctor() {
   const codex = Bun.spawnSync([settings.codex.binary, "--version"]);
   const installedCodex = codex.success ? codex.stdout.toString().trim() : undefined,
-    socket =
-      process.env.ACS_CODEX_SOCKET ??
-      `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`,
-    client = new CodexAppServerClient(socket);
+    call = (method: string, params: unknown = {}) =>
+      controlCall(config.runtime, config.token, method, params);
   let sharedAppServer: string, runningCodexVersion: string | undefined;
   try {
-    const initialized = await client.start();
-    runningCodexVersion = codexVersion(initialized.userAgent);
-    const threads = await client.listThreads({ limit: 1, useStateDbOnly: true });
-    sharedAppServer = `ready (${threads.data.length} thread sampled)`;
+    await call("system.initialize", {
+      protocolVersion: "1.0",
+      client: { name: "acs-doctor", version: "0.1.0", instanceId: String(process.pid) },
+      capabilities: {},
+    });
+    const probeResult = recordValue(await call("runtimes.probe")),
+      probe = recordValue(probeResult.probe),
+      sessionsResult = recordValue(await call("runtimes.sessions.list", { limit: 1 })),
+      sessions = sessionsResult.sessions;
+    runningCodexVersion =
+      typeof probe.runtimeVersion === "string" ? probe.runtimeVersion : undefined;
+    sharedAppServer = `ready (${Array.isArray(sessions) ? sessions.length : 0} thread sampled)`;
   } catch (error) {
     sharedAppServer = `unavailable (${error instanceof Error ? error.message : String(error)})`;
-  } finally {
-    client.close();
   }
   print({
     codex: {
       installed: installedCodex ?? "unavailable",
       testedVersion: TESTED_CODEX_VERSION,
+      supportedVersions: SUPPORTED_CODEX_VERSIONS,
       runningVersion: runningCodexVersion ?? "unavailable",
-      compatibility: runningCodexVersion === TESTED_CODEX_VERSION ? "tested" : "untested",
+      compatibility:
+        runningCodexVersion && SUPPORTED_CODEX_VERSIONS.includes(runningCodexVersion)
+          ? "tested"
+          : "untested",
     },
     phaseZero: {
       a2aOnBun: "verified by pinned TCK",
       standaloneExecutable: "verified by clean-machine release matrix",
-      mcpAttestation: "requires real two-build evidence",
+      mcpAttestation: "verified on Codex 0.153.2 and 0.153.4",
       sharedAppServer,
       safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",
       deliveryReconciliation: "durable wake marker proven; absence remains operator-owned",
-      approvalOwnership: "unsafe: local-input requests fan out to all subscribers",
+      approvalOwnership:
+        "verified: user approvals remain TUI-owned; ACS never answers local-input requests",
     },
-    mutatingDeliveryEnabled:
-      runningCodexVersion === TESTED_CODEX_VERSION && sharedAppServer.startsWith("ready"),
+    mutatingDeliveryEnabled: Boolean(
+      runningCodexVersion &&
+      SUPPORTED_CODEX_VERSIONS.includes(runningCodexVersion) &&
+      sharedAppServer.startsWith("ready"),
+    ),
   });
+}
+function recordValue(value: unknown): Record<string, unknown> {
+  if (!isRecordValue(value)) throw new Error("Invalid control response");
+  return value;
+}
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|update|delete <agent>\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --as <resolution>\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 

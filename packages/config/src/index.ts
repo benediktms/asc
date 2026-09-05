@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export interface AcsConfig {
-  daemon: { a2aListen: string; controlSocket: string; logLevel: string; logFormat: string };
+  daemon: {
+    a2aListen: string;
+    controlSocket: string;
+    logLevel: "debug" | "info" | "warn" | "error";
+    logFormat: "pretty" | "json";
+  };
   storage: { path: string; durability: "balanced" | "strict"; busyTimeoutMs: number };
   security: {
     requireA2aAuth: boolean;
@@ -23,13 +28,21 @@ export interface AcsConfig {
   codex: {
     enabled: boolean;
     binary: string;
-    connection: string;
+    connection: "daemon";
     statusPollIntervalMs: number;
     maxInFlightRequests: number;
     allowNonAtomicWake: boolean;
     allowActiveTurnSteering: boolean;
     autoResumeDormantThreads: boolean;
   };
+}
+
+export interface Paths {
+  data: string;
+  runtime: string;
+  token: string;
+  bridgeToken: string;
+  secret: string;
 }
 
 const text = `[daemon]
@@ -70,10 +83,33 @@ allow_active_turn_steering = false
 auto_resume_dormant_threads = false
 `;
 
+export function defaultLocations(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  platform = process.platform,
+  uid = process.getuid?.() ?? 0,
+) {
+  const home = environment.HOME ?? "",
+    temporary = environment.TMPDIR ?? "/tmp";
+  if (platform === "linux")
+    return {
+      configDirectory: `${environment.XDG_CONFIG_HOME ?? `${home}/.config`}/acs`,
+      dataDirectory: `${environment.XDG_DATA_HOME ?? `${home}/.local/share`}/acs`,
+      runtimeSocket: environment.XDG_RUNTIME_DIR
+        ? `${environment.XDG_RUNTIME_DIR}/acs/control.sock`
+        : `${temporary}/acs-${uid}/control.sock`,
+    };
+  const directory = `${home}/Library/Application Support/acs`;
+  return {
+    configDirectory: directory,
+    dataDirectory: directory,
+    runtimeSocket: `${temporary}/acs-${uid}/control.sock`,
+  };
+}
+
 export function configPath() {
+  const defaults = defaultLocations();
   return (
-    process.env.ACS_CONFIG_PATH ??
-    `${process.env.ACS_HOME ?? `${process.env.HOME}/Library/Application Support/acs`}/config.toml`
+    process.env.ACS_CONFIG_PATH ?? `${process.env.ACS_HOME ?? defaults.configDirectory}/config.toml`
   );
 }
 export function writeDefaultConfig(path = configPath()) {
@@ -82,8 +118,8 @@ export function writeDefaultConfig(path = configPath()) {
   writeFileSync(path, text, { mode: 0o600 });
 }
 export function loadConfig(path = configPath()): AcsConfig {
-  const base = process.env.ACS_HOME ?? `${process.env.HOME}/Library/Application Support/acs`,
-    runtime = `${process.env.TMPDIR ?? "/tmp"}/acs-${process.getuid?.() ?? 0}/control.sock`;
+  const defaults = defaultLocations(),
+    base = process.env.ACS_HOME ?? defaults.dataDirectory;
   const root = existsSync(path) ? object(Bun.TOML.parse(readFileSync(path, "utf8")), "config") : {};
   keys(root, ["daemon", "storage", "security", "delivery", "runtimes"], "config");
   const daemon = section(root, "daemon", [
@@ -125,23 +161,32 @@ export function loadConfig(path = configPath()): AcsConfig {
       ? `127.0.0.1:${positive(Number(process.env.ACS_A2A_PORT), "ACS_A2A_PORT")}`
       : configuredListen,
     controlSocket = socketPath(
-      process.env.ACS_CONTROL_SOCKET ?? auto(string(daemon.control_socket, "auto"), runtime),
+      process.env.ACS_CONTROL_SOCKET ??
+        auto(string(daemon.control_socket, "auto"), defaults.runtimeSocket),
     ),
     defaultMode = string(delivery.default_mode, "wake_when_idle"),
-    durability = string(storage.durability, "balanced");
+    durability = string(storage.durability, "balanced"),
+    connection = string(codex.connection, "daemon"),
+    logLevel = process.env.ACS_LOG_LEVEL ?? string(daemon.log_level, "info"),
+    logFormat = process.env.ACS_LOG_FORMAT ?? string(daemon.log_format, "pretty");
   parseListen(listen);
   if (defaultMode !== "wake_when_idle" && defaultMode !== "append_context")
     throw new Error("VALIDATION_FAILED: invalid delivery.default_mode");
   if (durability !== "balanced" && durability !== "strict")
     throw new Error("VALIDATION_FAILED: invalid storage.durability");
+  if (connection !== "daemon")
+    throw new Error("VALIDATION_FAILED: invalid runtimes.codex.connection");
+  if (!isLogLevel(logLevel)) throw new Error("VALIDATION_FAILED: invalid daemon.log_level");
+  if (logFormat !== "pretty" && logFormat !== "json")
+    throw new Error("VALIDATION_FAILED: invalid daemon.log_format");
   if (!boolean(security.require_a2a_auth, true))
     throw new Error("VALIDATION_FAILED: A2A authentication is required in v1");
   return {
     daemon: {
       a2aListen: listen,
       controlSocket,
-      logLevel: process.env.ACS_LOG_LEVEL ?? string(daemon.log_level, "info"),
-      logFormat: string(daemon.log_format, "pretty"),
+      logLevel,
+      logFormat,
     },
     storage: {
       path: process.env.ACS_STORAGE_PATH ?? auto(string(storage.path, "auto"), `${base}/acs.db`),
@@ -185,7 +230,7 @@ export function loadConfig(path = configPath()): AcsConfig {
     codex: {
       enabled: boolean(codex.enabled, true),
       binary: process.env.ACS_CODEX_BINARY ?? string(codex.codex_binary, "codex"),
-      connection: string(codex.connection, "daemon"),
+      connection,
       statusPollIntervalMs: positive(
         number(codex.status_poll_interval_ms, 2000),
         "runtimes.codex.status_poll_interval_ms",
@@ -198,6 +243,23 @@ export function loadConfig(path = configPath()): AcsConfig {
       allowActiveTurnSteering: boolean(codex.allow_active_turn_steering, false),
       autoResumeDormantThreads: boolean(codex.auto_resume_dormant_threads, false),
     },
+  };
+}
+
+export function paths(): Paths {
+  const defaults = defaultLocations(),
+    base = process.env.ACS_HOME ?? defaults.dataDirectory,
+    config = loadConfig();
+  return {
+    data:
+      process.env.ACS_STORAGE_PATH ??
+      (process.env.ACS_HOME ? `${base}/acs.db` : config.storage.path),
+    runtime:
+      process.env.ACS_CONTROL_SOCKET ??
+      (process.env.ACS_HOME ? defaults.runtimeSocket : config.daemon.controlSocket),
+    token: `${base}/control.token`,
+    bridgeToken: `${base}/bridge.token`,
+    secret: `${base}/secret.key`,
   };
 }
 export function parseListen(value: string) {
@@ -258,4 +320,7 @@ function socketPath(value: string) {
 }
 function auto(value: string, fallback: string) {
   return value === "auto" ? fallback : value;
+}
+function isLogLevel(value: string): value is AcsConfig["daemon"]["logLevel"] {
+  return value === "debug" || value === "info" || value === "warn" || value === "error";
 }

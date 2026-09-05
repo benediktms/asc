@@ -9,11 +9,24 @@ import type {
   RuntimeDeliveryRequest,
   RuntimeReconcileRequest,
 } from "../contracts/runtime-adapter";
-import { CodexRuntimeAdapter, TESTED_CODEX_VERSION } from "../packages/runtime-codex/src/index";
+import {
+  CodexRuntimeAdapter,
+  SUPPORTED_CODEX_VERSIONS,
+  TESTED_CODEX_VERSION,
+} from "../packages/runtime-codex/src/index";
+import { responseItem } from "../packages/runtime-codex/src/protocol-codec";
+import { canonical } from "../packages/domain/src/index";
 
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true });
+});
+
+test("Codex codec renders the delivery envelope as canonical JSON", () => {
+  const envelope = delivery().envelope,
+    item = responseItem(envelope);
+  if (item.type !== "function_call_output") throw new Error("expected function call output");
+  expect(item.output).toBe(canonical(envelope));
 });
 
 type Fixture = {
@@ -25,6 +38,7 @@ type Fixture = {
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
   setHistoryDelivery(deliveryId: string): void;
+  setLoadedOnly(): void;
   setSessionPages(): void;
   setSource(source: unknown): void;
   setStatus(status: string): void;
@@ -54,6 +68,23 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         reason: "stale-binding",
       });
       expect(flushes).toBe(0);
+      expect(mutations(methods)).toEqual([]);
+
+      const reads = methods.filter((method) => method === "thread/read").length,
+        unsupported: RuntimeDeliveryRequest = JSON.parse(JSON.stringify(delivery()));
+      Object.assign(unsupported.envelope.message?.parts[0] ?? {}, { kind: "future" });
+      expect(await adapter.deliver(unsupported)).toMatchObject({
+        outcome: "rejected",
+        reason: "unsupported-content",
+      });
+      expect(methods.filter((method) => method === "thread/read")).toHaveLength(reads);
+      expect(mutations(methods)).toEqual([]);
+
+      expect(await adapter.deliver(delivery("join_active"))).toMatchObject({
+        outcome: "rejected",
+        reason: "unsupported-mode",
+      });
+      expect(methods.filter((method) => method === "thread/read")).toHaveLength(reads);
       expect(mutations(methods)).toEqual([]);
 
       fixture.setFence(true);
@@ -104,6 +135,12 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       ).toMatchObject({ outcome: "inconclusive", reason: "invalid Codex reconciliation token" });
       expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
       expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
+      fixture.failNext("thread/read", "overload");
+      expect(await adapter.reconcile(reconciliation)).toEqual({
+        outcome: "inconclusive",
+        reason: "Codex reconciliation failed (BACKPRESSURE)",
+        operatorActionRequired: true,
+      });
       fixture.setHistoryDelivery("int_conformance");
       expect(await adapter.reconcile(reconciliation)).toEqual({
         outcome: "accepted",
@@ -120,6 +157,11 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         outcome: "accepted",
         execution: { opaqueId: "turn-1" },
       });
+      expect(await adapter.deliver(delivery("wake_when_idle"))).toEqual({
+        outcome: "deferred",
+        reason: "busy",
+      });
+      expect(methods.filter((method) => method === "turn/start")).toHaveLength(1);
       const started = iterator.next();
       fixture.notify("turn/started", {
         threadId: "thread-1",
@@ -278,10 +320,24 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       fixture.setSessionPages();
       await adapter.start(context);
       const first = await adapter.listSessions({ limit: 1 }),
-        second = await adapter.listSessions({ limit: 1, cursor: first.nextCursor });
+        second = await adapter.listSessions({ limit: 1, cursor: first.nextCursor }),
+        third = await adapter.listSessions({ limit: 1, cursor: second.nextCursor });
       expect(first.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-2"]);
       expect(second.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-1"]);
       expect(second.sessions[0]?.availability).toBe("idle");
+      expect(third).toEqual({ sessions: [], nextCursor: undefined });
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
+    test("lists loaded sessions that are not persisted yet", async () => {
+      const fixture = await create(),
+        { adapter, context } = fixture;
+      fixture.setLoadedOnly();
+      await adapter.start(context);
+      const page = await adapter.listSessions({ limit: 1 });
+      expect(page.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-3"]);
+      expect(page.nextCursor).toBeUndefined();
       await adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
@@ -372,6 +428,19 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
 
 runtimeAdapterConformance("Codex", () => codexFixture());
 
+test("Codex runtime adapter enables mutations for every supported runtime", async () => {
+  for (const version of SUPPORTED_CODEX_VERSIONS) {
+    const fixture = await codexFixture(`codex-cli ${version}`),
+      { adapter, context, methods } = fixture;
+    await adapter.start(context);
+    expect(await adapter.probe()).toMatchObject({ state: "ready", runtimeVersion: version });
+    expect(await adapter.deliver(delivery())).toMatchObject({ outcome: "accepted" });
+    expect(mutations(methods)).toEqual(["thread/inject_items"]);
+    await adapter.stop({ reason: "shutdown" });
+    fixture.close();
+  }
+});
+
 test("Codex runtime adapter disables mutations for an untested runtime", async () => {
   const fixture = await codexFixture("codex-cli 99.0.0"),
     { adapter, context, methods } = fixture;
@@ -379,6 +448,7 @@ test("Codex runtime adapter disables mutations for an untested runtime", async (
   expect(await adapter.probe()).toMatchObject({
     state: "incompatible",
     runtimeVersion: "99.0.0",
+    protocolFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
     capabilities: { appendContext: false, wakeWhenIdle: false, cancelOwnedExecution: false },
   });
   expect(await adapter.deliver(delivery())).toMatchObject({
@@ -399,6 +469,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     failures = new Map<string, "overload" | "disconnect" | "hang">();
   let fence = true,
     historyDelivery: string | undefined,
+    loadedOnly = false,
     sessionPages = false,
     source: unknown = "test",
     status = "idle";
@@ -467,6 +538,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
                     source,
                     request.params,
                     sessionPages,
+                    loadedOnly,
                   ),
                 }),
               ),
@@ -504,6 +576,9 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     },
     setHistoryDelivery(deliveryId) {
       historyDelivery = deliveryId;
+    },
+    setLoadedOnly() {
+      loadedOnly = true;
     },
     setSessionPages() {
       sessionPages = true;
@@ -554,18 +629,28 @@ function response(
   source: unknown = "test",
   params?: unknown,
   sessionPages = false,
+  loadedOnly = false,
 ) {
   if (method === "initialize") return { userAgent };
   if (method === "thread/loaded/list")
-    return { data: sessionPages ? ["thread-1"] : [], nextCursor: null };
+    return { data: sessionPages ? ["thread-1"] : loadedOnly ? ["thread-3"] : [], nextCursor: null };
   if (method === "thread/list") {
     if (!sessionPages) return { data: [], nextCursor: null };
     return record(params).cursor === "page-2"
       ? { data: [thread("thread-1", status, source, historyDelivery)], nextCursor: null }
       : { data: [thread("thread-2", status, source)], nextCursor: "page-2" };
   }
-  if (method === "thread/read")
-    return { thread: thread("thread-1", status, source, historyDelivery) };
+  if (method === "thread/read") {
+    const threadId = record(params).threadId;
+    return {
+      thread: thread(
+        typeof threadId === "string" ? threadId : "thread-1",
+        status,
+        source,
+        historyDelivery,
+      ),
+    };
+  }
   if (method === "turn/start") return { turn: { id: "turn-1" } };
   return {};
 }

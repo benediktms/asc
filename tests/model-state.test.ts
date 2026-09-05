@@ -2,8 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Message, Role } from "@a2a-js/sdk";
-import { TaskState, transition } from "../packages/domain/src/index";
+import { Message, Role, TaskState as A2ATaskState } from "@a2a-js/sdk";
+import { BindingState, DeliveryState, TaskState, transition } from "../packages/domain/src/index";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
 
 const roots: string[] = [];
@@ -109,11 +109,11 @@ describe("reference state models", () => {
         activeId = store.bind(agent.id, `model-thread-${step}`, { revokeExisting: true }).id;
       }
       const rows = store.db
-          .query<{ id: string; epoch: number; status: string }, [string]>(
+          .query<{ id: string; epoch: number; status: BindingState }, [string]>(
             "SELECT id,epoch,status FROM runtime_bindings WHERE agent_id=? ORDER BY epoch",
           )
           .all(agent.id),
-        active = rows.filter((row) => row.status === "active");
+        active = rows.filter((row) => row.status === BindingState.Active);
       expect(rows.at(-1)?.epoch).toBe(expectedEpoch);
       expect(active.map((row) => row.id)).toEqual(activeId ? [activeId] : []);
     }
@@ -126,17 +126,7 @@ describe("reference state models", () => {
       target = store.createAgent("model-delivery"),
       requester = principal(store),
       next = random(301),
-      states = [
-        "pending",
-        "leased",
-        "attempting",
-        "deferred",
-        "accepted",
-        "acceptance-unknown",
-        "failed-terminal",
-        "canceled",
-        "superseded",
-      ],
+      states = Object.values(DeliveryState),
       operations = ["retry", "cancel", "resolve-accepted", "resolve-retry", "resolve-cancel"];
     for (let step = 0; step < 128; step++) {
       const accepted = store.accept(
@@ -155,9 +145,15 @@ describe("reference state models", () => {
         .query("UPDATE delivery_intents SET state=? WHERE id=?")
         .run(state, accepted.deliveryId);
       const allowed =
-        (operation === "retry" && ["deferred", "failed-terminal"].includes(state)) ||
-        (operation === "cancel" && !["accepted", "canceled", "superseded"].includes(state)) ||
-        (operation.startsWith("resolve-") && state === "acceptance-unknown");
+        (operation === "retry" && state === DeliveryState.Deferred) ||
+        (operation === "cancel" &&
+          [
+            DeliveryState.Pending,
+            DeliveryState.Leased,
+            DeliveryState.Deferred,
+            DeliveryState.AcceptanceUnknown,
+          ].includes(state)) ||
+        (operation.startsWith("resolve-") && state === DeliveryState.AcceptanceUnknown);
       const apply = () => {
         if (operation === "retry") return store.retryDelivery(accepted.deliveryId);
         if (operation === "cancel") return store.cancelDelivery(accepted.deliveryId);
@@ -218,7 +214,9 @@ describe("reference state models", () => {
         store.setTaskState(accepted.task.id, executor.principalId, TaskState.Completed);
       if (race === 3) store.setTaskState(accepted.task.id, executor.principalId, TaskState.Failed);
       if (race < 2)
-        expect(store.requestCancellation(accepted.task.id, requester.id).status?.state).toBe(5);
+        expect(store.requestCancellation(accepted.task.id, requester.id).status?.state).toBe(
+          A2ATaskState.TASK_STATE_CANCELED,
+        );
       else expect(() => store.requestCancellation(accepted.task.id, requester.id)).toThrow();
       expect(() =>
         store.setTaskState(accepted.task.id, executor.principalId, TaskState.Working),

@@ -23,7 +23,8 @@ describe("Codex app-server transport", () => {
     roots.push(root);
     const path = join(root, "app.sock");
     let received = "",
-      respond = true;
+      respond = true,
+      batchTurn = false;
     const server = Bun.listen({
       unix: path,
       socket: {
@@ -53,14 +54,26 @@ describe("Codex app-server transport", () => {
             payload.map((value, index) => value ^ byte(mask, index % 4)),
           ).toString();
           if (!respond) return;
-          const request = JSON.parse(received),
-            body = Buffer.from(
-              JSON.stringify({
-                id: request.id,
-                result: { userAgent: "fake", platformFamily: "unix", platformOs: "test" },
-              }),
+          const request = JSON.parse(received);
+          if (typeof request.id !== "number") return;
+          if (batchTurn && request.method === "turn/start") {
+            socket.write(
+              Buffer.concat([
+                serverFrame({ id: request.id, result: { turn: { id: "turn-batched" } } }),
+                serverFrame({
+                  method: "turn/started",
+                  params: { turn: { id: "turn-batched" } },
+                }),
+              ]),
             );
-          socket.write(Buffer.concat([Buffer.from([0x81, body.length]), body]));
+            return;
+          }
+          socket.write(
+            serverFrame({
+              id: request.id,
+              result: { userAgent: "fake", platformFamily: "unix", platformOs: "test" },
+            }),
+          );
         },
         close() {},
         error() {},
@@ -70,6 +83,21 @@ describe("Codex app-server transport", () => {
     const initialized = await client.start();
     expect(received).not.toContain("jsonrpc");
     expect(initialized.userAgent).toBe("fake");
+    await Bun.sleep(10);
+    batchTurn = true;
+    const order: string[] = [];
+    client.onNotification = (method) => order.push(method);
+    expect(
+      await client.startTurn(
+        { threadId: "thread-1", input: [], turnTrigger: "test", toolOutput: null },
+        undefined,
+        undefined,
+        (turnId) => order.push(`registered:${turnId}`),
+      ),
+    ).toEqual({ turn: { id: "turn-batched" } });
+    await Bun.sleep(0);
+    expect(order).toEqual(["registered:turn-batched", "turn/started"]);
+    batchTurn = false;
     respond = false;
     const abort = new AbortController(),
       pending = client.request("thread/list", {}, undefined, abort.signal);
@@ -82,6 +110,11 @@ describe("Codex app-server transport", () => {
     await expect(write).rejects.toThrow("app-server request aborted after write");
     expect(flushed).toBe(1);
     client.close();
+    let disconnectedFlushes = 0;
+    await expect(
+      client.request("thread/inject_items", {}, () => disconnectedFlushes++),
+    ).rejects.toThrow("not connected");
+    expect(disconnectedFlushes).toBe(0);
     server.stop();
   });
 
@@ -145,4 +178,10 @@ function byte(buffer: Uint8Array, index: number) {
   const value = buffer.at(index);
   if (value === undefined) throw new Error("invalid WebSocket frame");
   return value;
+}
+
+function serverFrame(value: unknown) {
+  const body = Buffer.from(JSON.stringify(value));
+  if (body.length >= 126) throw new Error("test frame too large");
+  return Buffer.concat([Buffer.from([0x81, body.length]), body]);
 }
