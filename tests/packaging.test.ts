@@ -14,7 +14,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true });
 });
 
-test("compiled binary runs the clean-machine service workflow", async () => {
+test("compiled binary runs a clean-machine two-agent service workflow", async () => {
   const root = mkdtempSync(join(tmpdir(), "acs-package-"));
   roots.push(root);
   const binary = join(root, "acs"),
@@ -59,17 +59,24 @@ test("compiled binary runs the clean-machine service workflow", async () => {
   for (const file of ["control.token", "bridge.token", "secret.key"])
     expect(statSync(join(root, file)).mode & 0o777).toBe(0o600);
 
-  const created = Bun.spawnSync([binary, "agents", "create", "smoke-agent"], { env });
-  expect(created.exitCode).toBe(0);
+  for (const agent of ["sender", "receiver"])
+    expect(Bun.spawnSync([binary, "agents", "create", agent], { env }).exitCode).toBe(0);
+  const listed = record(
+    JSON.parse(Bun.spawnSync([binary, "agents", "list"], { env }).stdout.toString()),
+  );
+  expect(array(listed.items).map((item) => string(record(item).slug))).toEqual([
+    "receiver",
+    "sender",
+  ]);
   const cardResponse = await fetch(
-    `http://127.0.0.1:${port}/agents/smoke-agent/.well-known/agent-card.json`,
+    `http://127.0.0.1:${port}/agents/receiver/.well-known/agent-card.json`,
   );
   expect(cardResponse.status).toBe(200);
   const card = record(await cardResponse.json());
-  expect(card.name).toBe("smoke-agent");
+  expect(card.name).toBe("receiver");
 
   const token = Bun.spawnSync([binary, "token", "show"], { env }).stdout.toString().trim();
-  const sent = await rpc(port, token, "SendMessage", {
+  const sent = await rpc(port, "receiver", token, "SendMessage", {
     message: {
       messageId: "smoke-message",
       role: "ROLE_USER",
@@ -79,8 +86,8 @@ test("compiled binary runs the clean-machine service workflow", async () => {
   const task = record(record(sent.result).task ?? sent.result),
     taskId = string(task.id);
   expect(taskId.startsWith("tsk_")).toBe(true);
-  expect((await rpc(port, token, "GetTask", { id: taskId })).error).toBeUndefined();
-  expect((await rpc(port, token, "CancelTask", { id: taskId })).error).toBeUndefined();
+  expect((await rpc(port, "receiver", token, "GetTask", { id: taskId })).error).toBeUndefined();
+  expect((await rpc(port, "receiver", token, "CancelTask", { id: taskId })).error).toBeUndefined();
 
   const mcp = Bun.spawn([binary, "mcp", "codex"], {
     env,
@@ -105,8 +112,8 @@ test("compiled binary runs the clean-machine service workflow", async () => {
   expect(initialized).toContain('"serverInfo"');
 }, 30_000);
 
-async function rpc(port: number, token: string, method: string, params: unknown) {
-  const response = await fetch(`http://127.0.0.1:${port}/agents/smoke-agent/a2a`, {
+async function rpc(port: number, agent: string, token: string, method: string, params: unknown) {
+  const response = await fetch(`http://127.0.0.1:${port}/agents/${agent}/a2a`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: method, method, params }),
@@ -147,6 +154,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 function string(value: unknown) {
   if (typeof value !== "string") throw new Error("expected string");
+  return value;
+}
+function array(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error("expected array");
   return value;
 }
 function required<T>(value: T | undefined, name: string): T {
