@@ -375,14 +375,24 @@ export function controlHandler(
           audit("binding.retarget-pending", "binding", target.id, { retargeted: changed });
           return ok(rpc.id, { retargeted: changed });
         }
-        case "runtimes.list":
-          return ok(rpc.id, {
-            runtimes: store.db
-              .query(
+        case "runtimes.list": {
+          const page = boundedLocalPage(
+            store,
+            store.db
+              .query<{ installationId: RuntimeInstallationId; label: string }, []>(
                 "SELECT id installationId,harness_id harnessId,adapter_id adapterId,label,state,capabilities_json capabilitiesJson,protocol_fingerprint protocolFingerprint,last_seen_at_ms lastSeenAtMs FROM runtime_installations",
               )
               .all(),
+            Math.min(p.limit ?? 50, 100),
+            p.cursor,
+            (runtime) => ({ sortKey: runtime.label, id: runtime.installationId }),
+            "ascending",
+          );
+          return ok(rpc.id, {
+            runtimes: page.items,
+            nextCursor: page.nextCursor,
           });
+        }
         case "runtimes.probe": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const probe = await adapter.probe(),

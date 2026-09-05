@@ -343,7 +343,10 @@ export interface ControlMethodMap {
   };
 
   "runtimes.list": {
-    readonly params: Record<string, never>;
+    readonly params: {
+      readonly limit?: number;
+      readonly cursor?: string;
+    };
     readonly result: {
       readonly runtimes: readonly {
         readonly installationId: string;
@@ -352,6 +355,7 @@ export interface ControlMethodMap {
         readonly label: string;
         readonly probe?: RuntimeProbeResult;
       }[];
+      readonly nextCursor?: string;
     };
   };
 

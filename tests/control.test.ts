@@ -81,6 +81,21 @@ describe("control protocol", () => {
     expect(await (await call("runtimes.list", {})).json()).toMatchObject({
       result: { runtimes: [{ state: "online" }] },
     });
+    const now = Date.now();
+    store.db
+      .query(
+        "INSERT INTO runtime_installations(id,harness_id,adapter_id,label,endpoint_json,state,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,'offline',?,?)",
+      )
+      .run("ins_secondary", "other", "test.other", "secondary", "{}", now, now);
+    const firstRuntimePage = await (await call("runtimes.list", { limit: 1 })).json(),
+      runtimeCursor = record(record(firstRuntimePage).result).nextCursor;
+    if (typeof runtimeCursor !== "string") throw new Error("expected runtime cursor");
+    expect(firstRuntimePage).toMatchObject({
+      result: { runtimes: [{ label: "local" }], nextCursor: expect.any(String) },
+    });
+    expect(
+      await (await call("runtimes.list", { limit: 1, cursor: runtimeCursor })).json(),
+    ).toMatchObject({ result: { runtimes: [{ label: "secondary" }] } });
     expect(
       await (
         await call("bindings.bind", {
