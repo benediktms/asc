@@ -9,6 +9,7 @@ export type CodexWireId = string | number;
 
 export enum CodexAppServerFailureKind {
   Backpressure = "BACKPRESSURE",
+  Busy = "BUSY",
   ConnectionLost = "CONNECTION_LOST",
   ConnectionUnavailable = "CONNECTION_UNAVAILABLE",
   InvalidPayload = "INVALID_PAYLOAD",

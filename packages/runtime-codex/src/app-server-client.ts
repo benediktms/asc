@@ -332,6 +332,8 @@ function appServerError(
 
 function remoteFailureKind(message: string) {
   if (/overload|queue.*full|too many/i.test(message)) return CodexAppServerFailureKind.Backpressure;
+  if (/turn (?:is )?already (?:running|active)|already has an active turn/i.test(message))
+    return CodexAppServerFailureKind.Busy;
   if (/not initialized/i.test(message)) return CodexAppServerFailureKind.NotInitialized;
   if (/not running/i.test(message)) return CodexAppServerFailureKind.NotRunning;
   if (/not found|invalid thread/i.test(message)) return CodexAppServerFailureKind.SessionNotFound;

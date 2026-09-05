@@ -157,19 +157,35 @@ describe("control protocol", () => {
           installationId: installation.id,
           session: { installationId: installation.id, opaqueId: "thread-1" },
           continuityPolicy: "strict",
-          deliveryPolicy: { wakeStrategy: "disabled", interruptOnCancel: false },
+          deliveryPolicy: {
+            wakeStrategy: "non-atomic-idle-check",
+            interruptOnCancel: false,
+          },
         })
       ).json(),
     ).toMatchObject({
       result: {
         binding: {
           continuityPolicy: "strict",
-          deliveryPolicy: { wakeStrategy: "disabled", interruptOnCancel: false },
+          deliveryPolicy: {
+            wakeStrategy: "non-atomic-idle-check",
+            interruptOnCancel: false,
+          },
         },
       },
     });
     expect(await (await call("agents.get", { agent: "backend" })).json()).toMatchObject({
       result: { agent: { availability: "idle" } },
+    });
+    const nonAtomicAudit = store.db
+      .query<{ details_json: string }, []>(
+        "SELECT details_json FROM audit_events WHERE action='binding.non-atomic-wake-enabled'",
+      )
+      .get();
+    expect(nonAtomicAudit && record(JSON.parse(nonAtomicAudit.details_json))).toEqual({
+      bindingEpoch: 1,
+      wakeStrategy: "non-atomic-idle-check",
+      residualRisk: "inspect-start-race",
     });
     const backendBinding = required(
         store.db
@@ -779,8 +795,15 @@ describe("control protocol", () => {
     expect(deliveries.items[0]).toMatchObject({
       taskId: expect.stringMatching(/^tsk_/),
       targetAgentId: beta.id,
+      mode: "wake_when_idle",
       state: "pending",
       attemptCount: 0,
+      effectiveWakePolicy: {
+        wakeStrategy: "atomic-only",
+        bindingId: betaBinding.id,
+        bindingEpoch: betaBinding.epoch,
+        source: "current-active-binding",
+      },
       createdAt: expect.any(String),
       updatedAt: expect.any(String),
     });
@@ -792,6 +815,19 @@ describe("control protocol", () => {
     store.db
       .query("UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?")
       .run(betaOldBinding.id, betaOldBinding.epoch, selectedDelivery);
+    expect(
+      await (await request("deliveries.get", { deliveryId: selectedDelivery })).json(),
+    ).toMatchObject({
+      result: {
+        delivery: {
+          effectiveWakePolicy: {
+            bindingId: betaOldBinding.id,
+            bindingEpoch: betaOldBinding.epoch,
+            source: "pinned-binding",
+          },
+        },
+      },
+    });
     expect(
       await (
         await request("bindings.retargetPending", {
