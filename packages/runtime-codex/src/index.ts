@@ -42,7 +42,7 @@ const capabilities: RuntimeCapabilities = {
   atomicDeferredWake: false,
   steerActiveExecution: false,
   cancelOwnedExecution: true,
-  reconcileDelivery: false,
+  reconcileDelivery: true,
   callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
   supportedPartKinds: ["text", "uri", "data"],
 };
@@ -51,6 +51,7 @@ const disabledCapabilities = (): RuntimeCapabilities => ({
   appendContext: false,
   wakeWhenIdle: false,
   cancelOwnedExecution: false,
+  reconcileDelivery: false,
 });
 const availabilityStates: RuntimeAvailability[] = [
   "unknown",
@@ -340,12 +341,45 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     }
   }
-  async reconcile(_request: RuntimeReconcileRequest): Promise<RuntimeReconcileResult> {
-    return {
-      outcome: "inconclusive",
-      reason: "Codex app-server does not expose injected raw history authoritatively",
-      operatorActionRequired: true,
-    };
+  async reconcile(request: RuntimeReconcileRequest): Promise<RuntimeReconcileResult> {
+    if (this.runtimeVersion !== TESTED_CODEX_VERSION)
+      return {
+        outcome: "inconclusive",
+        reason: "Codex runtime version is not supported",
+        operatorActionRequired: true,
+      };
+    if (request.reconciliationToken !== `${request.target.session.opaqueId}:${request.deliveryId}`)
+      return {
+        outcome: "inconclusive",
+        reason: "invalid Codex reconciliation token",
+        operatorActionRequired: true,
+      };
+    try {
+      const marker = await this.requireClient().findDeliveryMarker(
+        request.target.session.opaqueId,
+        request.deliveryId,
+      );
+      return marker
+        ? {
+            outcome: "accepted",
+            execution: { opaqueId: marker.turnId },
+            evidence: {
+              scheme: "codex.function-call-output.v1",
+              value: request.deliveryId,
+            },
+          }
+        : {
+            outcome: "inconclusive",
+            reason: "Codex history does not contain a durable wake marker",
+            operatorActionRequired: true,
+          };
+    } catch (error: unknown) {
+      return {
+        outcome: "inconclusive",
+        reason: errorMessage(error),
+        operatorActionRequired: true,
+      };
+    }
   }
   async cancel(request: RuntimeCancelRequest): Promise<RuntimeCancelResult> {
     if (this.runtimeVersion !== TESTED_CODEX_VERSION)

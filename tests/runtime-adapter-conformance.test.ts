@@ -24,6 +24,7 @@ type Fixture = {
   disconnect(): void;
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
+  setHistoryDelivery(deliveryId: string): void;
   setStatus(status: string): void;
   notify(method: string, params: unknown): void;
   close(): void;
@@ -85,10 +86,22 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         deliveryId: "int_conformance",
         target: delivery().target,
         payloadHash: "payload-hash",
-        reconciliationToken: "token",
+        reconciliationToken: "thread-1:int_conformance",
       };
+      expect(
+        await adapter.reconcile({ ...reconciliation, reconciliationToken: "invalid" }),
+      ).toMatchObject({ outcome: "inconclusive", reason: "invalid Codex reconciliation token" });
       expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
       expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
+      fixture.setHistoryDelivery("int_conformance");
+      expect(await adapter.reconcile(reconciliation)).toEqual({
+        outcome: "accepted",
+        execution: { opaqueId: "turn-history" },
+        evidence: {
+          scheme: "codex.function-call-output.v1",
+          value: "int_conformance",
+        },
+      });
       expect(mutations(methods)).toEqual(["thread/inject_items"]);
 
       fixture.setStatus("idle");
@@ -198,6 +211,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     buffers = new WeakMap<object, Buffer>(),
     failures = new Map<string, "overload" | "disconnect">();
   let fence = true,
+    historyDelivery: string | undefined,
     status = "idle";
   let sendNotification: ((method: string, params: unknown) => void) | undefined,
     sendRequest: ((method: string, params: unknown) => void) | undefined,
@@ -253,7 +267,10 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
           else if (typeof request.id === "number")
             socket.write(
               serverFrame(
-                JSON.stringify({ id: request.id, result: response(method, status, userAgent) }),
+                JSON.stringify({
+                  id: request.id,
+                  result: response(method, status, userAgent, historyDelivery),
+                }),
               ),
             );
         }
@@ -286,6 +303,9 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     },
     setFence(value) {
       fence = value;
+    },
+    setHistoryDelivery(deliveryId) {
+      historyDelivery = deliveryId;
     },
     setStatus(value) {
       status = value;
@@ -322,7 +342,7 @@ function delivery(mode: RuntimeDeliveryRequest["mode"] = "append_context"): Runt
   };
 }
 
-function response(method: string, status: string, userAgent: string) {
+function response(method: string, status: string, userAgent: string, historyDelivery?: string) {
   if (method === "initialize") return { userAgent };
   if (method === "thread/list") return { data: [], nextCursor: null };
   if (method === "thread/read")
@@ -336,6 +356,21 @@ function response(method: string, status: string, userAgent: string) {
         cliVersion: "test",
         source: "test",
         status: { type: status },
+        turns: historyDelivery
+          ? [
+              {
+                id: "turn-history",
+                items: [
+                  {
+                    type: "functionCallOutput",
+                    name: "receive_agent_message",
+                    namespace: "acs",
+                    output: JSON.stringify({ deliveryId: historyDelivery }),
+                  },
+                ],
+              },
+            ]
+          : [],
       },
     };
   if (method === "turn/start") return { turn: { id: "turn-1" } };

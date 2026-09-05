@@ -2,11 +2,12 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { RuntimeReconcileRequest } from "../contracts/runtime-adapter";
 import { CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../packages/runtime-codex/src/app-server-client";
 
 test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
-  "discovers loaded threads and injects context through an isolated real Codex app-server",
+  "discovers threads and reconciles a wake through an isolated real Codex app-server",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "acs-real-codex-")),
       socket = join(root, "app.sock"),
@@ -58,6 +59,59 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
       ).toMatchObject({
         outcome: "accepted",
         evidence: { scheme: "codex.thread-inject-items.v1", value: "int_real_codex" },
+      });
+      const wake = await adapter.deliver({
+        deliveryId: "int_real_codex_wake",
+        target: {
+          session: target.session,
+          bindingId: "bnd_real_codex",
+          bindingEpoch: 1,
+        },
+        mode: "wake_when_idle",
+        envelope: {
+          schema: "urn:agent-communications:runtime-envelope:v1",
+          deliveryId: "int_real_codex_wake",
+          kind: "a2a-message",
+          from: { agentId: "agt_sender", name: "sender" },
+          to: { agentId: "agt_recipient", name: "recipient" },
+          message: { id: "msg_real_codex_wake", parts: [{ kind: "text", text: "probe" }] },
+          provenance: { authority: "peer-agent", trustedForPermissions: false },
+        },
+        payloadHash: "real-codex-wake-probe",
+      });
+      if (wake.outcome !== "accepted" || !wake.execution)
+        throw new Error("Codex wake was not accepted");
+      const reconciliationRequest: RuntimeReconcileRequest = {
+        deliveryId: "int_real_codex_wake",
+        target: {
+          session: target.session,
+          bindingId: "bnd_real_codex",
+          bindingEpoch: 1,
+        },
+        payloadHash: "real-codex-wake-probe",
+        reconciliationToken: `${target.session.opaqueId}:int_real_codex_wake`,
+      };
+      let reconciliation = await adapter.reconcile(reconciliationRequest);
+      for (let attempt = 0; attempt < 100 && reconciliation.outcome !== "accepted"; attempt++) {
+        await Bun.sleep(100);
+        reconciliation = await adapter.reconcile(reconciliationRequest);
+      }
+      expect(reconciliation).toEqual({
+        outcome: "accepted",
+        execution: { opaqueId: wake.execution.opaqueId },
+        evidence: {
+          scheme: "codex.function-call-output.v1",
+          value: "int_real_codex_wake",
+        },
+      });
+      await adapter.cancel({
+        execution: {
+          normalizedId: "exe_real_codex_wake",
+          opaqueId: wake.execution.opaqueId,
+          session: target.session,
+          bindingId: "bnd_real_codex",
+          bindingEpoch: 1,
+        },
       });
       await adapter.stop({ reason: "shutdown" });
       setup.close();

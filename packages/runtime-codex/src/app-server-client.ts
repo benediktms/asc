@@ -82,6 +82,10 @@ export class CodexAppServerClient {
     const response = record(await this.request("thread/read", params));
     return { thread: decodeThread(response.thread) };
   }
+  async findDeliveryMarker(threadId: string, deliveryId: string) {
+    const response = record(await this.request("thread/read", { threadId, includeTurns: true }));
+    return findDeliveryMarker(response.thread, deliveryId);
+  }
   async startThread(params: ThreadStartParams) {
     return record(await this.request("thread/start", params));
   }
@@ -331,4 +335,28 @@ function decodeThread(value: unknown): CodexThread {
     source: thread.source,
     status: { type: stringField(status, "type") },
   };
+}
+
+function findDeliveryMarker(value: unknown, deliveryId: string) {
+  const thread = record(value);
+  if (!Array.isArray(thread.turns)) throw new Error("invalid app-server thread turns");
+  for (const turnValue of thread.turns) {
+    const turn = record(turnValue);
+    if (!Array.isArray(turn.items)) throw new Error("invalid app-server turn items");
+    for (const itemValue of turn.items) {
+      const item = record(itemValue);
+      if (
+        item.type !== "functionCallOutput" ||
+        item.name !== "receive_agent_message" ||
+        item.namespace !== "acs" ||
+        typeof item.output !== "string"
+      )
+        continue;
+      try {
+        const envelope: unknown = JSON.parse(item.output);
+        if (isRecord(envelope) && envelope.deliveryId === deliveryId)
+          return { turnId: stringField(turn, "id") };
+      } catch {}
+    }
+  }
 }
