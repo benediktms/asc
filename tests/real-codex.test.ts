@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RuntimeReconcileRequest } from "../contracts/runtime-adapter";
+import type { RuntimeInstallationId, RuntimeReconcileRequest } from "../contracts/runtime-adapter";
 import { controlHandler } from "../packages/protocol-control/src/index";
 import { CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../packages/runtime-codex/src/app-server-client";
@@ -25,9 +25,22 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
       await setup.start();
       await setup.startThread({ cwd: root, ephemeral: false });
       await setup.startThread({ cwd: root, ephemeral: false });
+      const store = new Store({
+          data: join(root, "acs.db"),
+          runtime: join(root, "control.sock"),
+          token: join(root, "control.token"),
+          bridgeToken: join(root, "bridge.token"),
+          secret: join(root, "secret.key"),
+        }),
+        installation = store.db
+          .query<{ id: RuntimeInstallationId }, []>(
+            "SELECT id FROM runtime_installations WHERE adapter_id='codex.app-server'",
+          )
+          .get();
+      if (!installation) throw new Error("missing Codex runtime installation");
       const adapter = new CodexRuntimeAdapter(socket);
       await adapter.start({
-        installationId: "ins_real_codex",
+        installationId: installation.id,
         instanceId: "real-codex-test",
         logger: { debug() {}, info() {}, warn() {}, error() {} },
         clock: { now: () => new Date().toISOString() },
@@ -36,14 +49,7 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
       const page = await adapter.listSessions({ limit: 10 });
       expect(page.sessions).toHaveLength(2);
       expect(page.sessions.every((session) => session.availability === "idle")).toBe(true);
-      const store = new Store({
-          data: join(root, "acs.db"),
-          runtime: join(root, "control.sock"),
-          token: join(root, "control.token"),
-          bridgeToken: join(root, "bridge.token"),
-          secret: join(root, "secret.key"),
-        }),
-        control = controlHandler(store, new Date().toISOString(), () => {}, adapter),
+      const control = controlHandler(store, new Date().toISOString(), () => {}, adapter),
         token = readFileSync(join(root, "control.token"), "utf8"),
         call = async (method: string, params: unknown) => {
           const response = await control(
