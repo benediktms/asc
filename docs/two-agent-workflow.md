@@ -22,8 +22,9 @@ Unix-socket control protocol, loopback A2A server, scheduler, SQLite store, and
 Codex adapter. Only the Codex app-server peer is emulated; there are no model
 calls and no assertions on prose. It also covers duplicate and conflicting
 message IDs, busy and offline recovery, strict binding fencing, ambiguous-write
-reconciliation, cancellation before queued work can run and during an
-ASC-owned execution, and approval non-ownership.
+reconciliation, terminal cancellation before queued work can run and during an
+ASC-owned execution, and emulated proof that ASC does not answer a runtime-local
+approval request on its app-server connection.
 
 Every scenario failure includes the last MCP correlation ID and a sanitized
 protocol timeline. The timeline contains only event names and opaque task,
@@ -38,11 +39,15 @@ threads, and run:
 bun run test:codex-e2e
 ```
 
-The guided verifier creates one-time claims and waits while the two real threads
-perform the same task/input/reply/completion cycle. It deliberately does not
+The guided verifier creates run-unique agents and one-time claims, records the
+exact thread bindings and epochs, and waits while two distinct real threads
+perform the task/input/reply/completion cycle. It verifies the requester and
+target identities, both runtime-fenced message deliveries, a persisted artifact,
+and then restarts ASC and re-queries that exact task. It deliberately does not
 inject `_meta` or imitate a model call: the MCP metadata must come from Codex.
-On success it writes a sanitized JSON timeline beneath `artifacts/`. Claim codes,
-message text, filesystem paths, and model output are not included.
+Only after every correlated check succeeds does it write a passing sanitized JSON
+timeline beneath `artifacts/`. Claim codes, message text, filesystem paths, and
+model output are not included.
 
 The existing `bun run test:codex-model` probe remains the lower-level check for
 model visibility, resumed-thread MCP attribution, busy delivery, and owned-turn

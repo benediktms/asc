@@ -35,7 +35,7 @@ test("two Codex agents complete the canonical task workflow across every public 
       "thread-backend-rebound",
     ]);
   servers.push(emulator.server);
-  const env = { ...environment(root, socket, port), ACS_TEST_DIAGNOSTIC_ERRORS: "1" };
+  const env = environment(root, socket, port);
   writeFileSync(join(root, "config.toml"), config(port));
   runCommand(env, "init");
   let daemon = await startDaemon(env),
@@ -146,7 +146,7 @@ test("two Codex agents complete the canonical task workflow across every public 
           "thread-architect",
         ),
       ),
-    ).toMatchObject({ taskId, state: "input-required" });
+    ).toMatchObject({ taskId, state: "working" });
     const replyDelivery = await waitForDelivery(
       emulator.deliveries,
       taskId,
@@ -191,7 +191,7 @@ test("two Codex agents complete the canonical task workflow across every public 
     ).toMatchObject({ task: { id: taskId, status: { state: "TASK_STATE_COMPLETED" } } });
 
     await exerciseIdempotencyCancellationAndBusyRecovery(env, architect, backend, emulator);
-    await exerciseOfflineRecovery(architect, backend, emulator);
+    await exerciseOfflineRecovery(env, architect, backend, emulator);
     await exerciseBindingFence(env, architect, backend, emulator);
     await exerciseAcceptanceReconciliation(architect, backend, emulator);
   } catch (error) {
@@ -270,7 +270,10 @@ async function exerciseIdempotencyCancellationAndBusyRecovery(
       .timeline()
       .some((event) => event.event === "turn/interrupt" && event.turnId === active.turnId),
   );
-  expect(command(env, "deliveries", "list").items).toBeDefined();
+  await waitForTask(architect, taskId, "thread-architect", "canceled");
+  const deliveredCount = deliveriesFor(emulator, taskId);
+  await Bun.sleep(350);
+  expect(deliveriesFor(emulator, taskId)).toBe(deliveredCount);
   const afterBusy = await waitForDelivery(emulator.deliveries, queuedTaskId, "thread-backend");
   await tool(
     architect,
@@ -284,9 +287,17 @@ async function exerciseIdempotencyCancellationAndBusyRecovery(
       .timeline()
       .some((event) => event.event === "turn/interrupt" && event.turnId === afterBusy.turnId),
   );
+  await waitForTask(architect, queuedTaskId, "thread-architect", "canceled");
+  expect(
+    array(command(env, "deliveries", "list").items)
+      .map((item) => record(item))
+      .filter((item) => item.taskId === queuedTaskId)
+      .every((item) => item.state === "accepted" || item.state === "canceled"),
+  ).toBe(true);
 }
 
 async function exerciseOfflineRecovery(
+  env: Record<string, string | undefined>,
   architect: McpProcess,
   _backend: McpProcess,
   emulator: ReturnType<typeof createCodexRuntimeEmulator>,
@@ -309,6 +320,14 @@ async function exerciseOfflineRecovery(
     { taskId: canceledTaskId },
     "thread-architect",
   );
+  await waitForTask(architect, canceledTaskId, "thread-architect", "canceled");
+  expect(
+    record(
+      array(command(env, "deliveries", "list").items)
+        .map((item) => record(item))
+        .find((item) => item.taskId === canceledTaskId),
+    ).state,
+  ).toBe("canceled");
   emulator.state("thread-backend", "idle");
   await Bun.sleep(350);
   expect(emulator.deliveries.some((item) => record(item.envelope.task).id === canceledTaskId)).toBe(
@@ -630,6 +649,9 @@ function taskState(task: Record<string, unknown>) {
     .replace(/^TASK_STATE_/, "")
     .toLowerCase()
     .replaceAll("_", "-");
+}
+function deliveriesFor(emulator: ReturnType<typeof createCodexRuntimeEmulator>, taskId: string) {
+  return emulator.deliveries.filter((item) => record(item.envelope.task).id === taskId).length;
 }
 function record(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new Error("expected object");

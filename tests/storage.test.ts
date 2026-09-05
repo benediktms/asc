@@ -571,7 +571,6 @@ describe("durable acceptance", () => {
       Message.fromJSON({
         messageId: "request-2-continuation",
         taskId: accepted.task.id,
-        contextId: accepted.task.contextId,
         role: Role.ROLE_USER,
         parts: [{ text: "continued" }],
       }),
@@ -663,8 +662,21 @@ describe("durable acceptance", () => {
     store.db
       .query("UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?")
       .run(first.id, first.epoch, accepted.deliveryId);
+    store.setTaskState(accepted.task.id, first.principalId, TaskState.Working);
+    store.setTaskState(accepted.task.id, first.principalId, TaskState.InputRequired, "continue");
     expect(() => store.bind(target.id, "new-thread")).toThrow("BINDING_CONFLICT");
     const rebound = store.bind(target.id, "new-thread", { revokeExisting: true });
+    const continuation = store.accept(
+      target.id,
+      requester.id,
+      Message.fromJSON({
+        messageId: "request-4-continuation",
+        taskId: accepted.task.id,
+        role: Role.ROLE_USER,
+        parts: [{ text: "continue" }],
+      }),
+      { mode: "append_context" },
+    );
     expect(
       store.db
         .query<{ disabled_at_ms: number | null }, [string]>(
@@ -679,6 +691,13 @@ describe("durable acceptance", () => {
         )
         .get(accepted.deliveryId),
     ).toEqual({ pinned_binding_id: first.id, pinned_binding_epoch: first.epoch });
+    expect(
+      store.db
+        .query<{ pinned_binding_id: string; pinned_binding_epoch: number }, [string]>(
+          "SELECT pinned_binding_id,pinned_binding_epoch FROM delivery_intents WHERE id=?",
+        )
+        .get(continuation.deliveryId),
+    ).toEqual({ pinned_binding_id: rebound.id, pinned_binding_epoch: rebound.epoch });
     expect(() =>
       store.setTaskState(
         accepted.task.id,

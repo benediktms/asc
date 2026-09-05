@@ -1081,7 +1081,6 @@ export class Store {
       ).count;
       if (queued >= this.limits.maxQueuedDeliveryIntents) throw new Error("ACS_OVERLOADED");
       const now = Date.now(),
-        contextId = message.contextId || id("ctx"),
         taskId = message.taskId || id("tsk"),
         messageRowId = id("msg"),
         deliveryId = id("int");
@@ -1096,6 +1095,7 @@ export class Store {
       const continuation = message.taskId
         ? this.db.query<TaskRow, [string]>("SELECT * FROM a2a_tasks WHERE id=?").get(message.taskId)
         : null;
+      const contextId = message.contextId || continuation?.context_id || id("ctx");
       if (
         continuation &&
         (continuation.requester_principal_id !== principalId ||
@@ -1155,52 +1155,38 @@ export class Store {
             "UPDATE a2a_tasks SET state=?,state_version=state_version+1,a2a_snapshot_json=?,updated_at_ms=? WHERE id=?",
           )
           .run(state, JSON.stringify(task), now, taskId);
-      try {
-        this.db
-          .query(
-            "INSERT INTO a2a_messages(id,external_message_id,task_id,context_id,sender_principal_id,sender_agent_id,target_agent_id,role,parts_json,metadata_json,canonical_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-          )
-          .run(
-            messageRowId,
-            message.messageId,
-            taskId,
-            contextId,
-            principalId,
-            requester.agent_id,
-            agentId,
-            message.role === a2aAgentRole ? "agent" : "user",
-            JSON.stringify(message.parts),
-            JSON.stringify(message.metadata ?? {}),
-            requestHash,
-            now,
-          );
-      } catch (error) {
-        throw new Error(
-          `ACCEPT_MESSAGE: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
+      this.db
+        .query(
+          "INSERT INTO a2a_messages(id,external_message_id,task_id,context_id,sender_principal_id,sender_agent_id,target_agent_id,role,parts_json,metadata_json,canonical_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          messageRowId,
+          message.messageId,
+          taskId,
+          contextId,
+          principalId,
+          requester.agent_id,
+          agentId,
+          message.role === a2aAgentRole ? "agent" : "user",
+          JSON.stringify(message.parts),
+          JSON.stringify(message.metadata ?? {}),
+          requestHash,
+          now,
         );
-      }
       const sequence = continuation?.next_event_sequence ?? 1;
-      try {
-        this.db
-          .query(
-            "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
-          )
-          .run(
-            id("evt"),
-            taskId,
-            sequence,
-            continuation ? "message-received" : "task-created",
-            principalId,
-            JSON.stringify({ messageId: message.messageId, snapshot: task }),
-            now,
-          );
-      } catch (error) {
-        throw new Error(
-          `ACCEPT_TASK_EVENT: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
+      this.db
+        .query(
+          "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
+        )
+        .run(
+          id("evt"),
+          taskId,
+          sequence,
+          continuation ? "message-received" : "task-created",
+          principalId,
+          JSON.stringify({ messageId: message.messageId, snapshot: task }),
+          now,
         );
-      }
       this.db
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
@@ -1218,35 +1204,28 @@ export class Store {
         replyExpected: options.replyExpected ?? true,
         traceContext: options.traceContext,
       };
-      try {
-        this.db
-          .query(
-            "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          )
-          .run(
-            deliveryId,
-            "a2a-message",
-            taskId,
-            messageRowId,
-            agentId,
-            acceptedBinding?.id ?? null,
-            acceptedBinding?.epoch ?? null,
-            mode,
-            priority,
-            DeliveryState.Pending,
-            now,
-            options.expiresAt ? Date.parse(options.expiresAt) : null,
-            JSON.stringify(payload),
-            this.payloadHash(payload),
-            now,
-            now,
-          );
-      } catch (error) {
-        throw new Error(
-          `ACCEPT_DELIVERY_INTENT: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
+      this.db
+        .query(
+          "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          deliveryId,
+          "a2a-message",
+          taskId,
+          messageRowId,
+          agentId,
+          acceptedBinding?.id ?? null,
+          acceptedBinding?.epoch ?? null,
+          mode,
+          priority,
+          DeliveryState.Pending,
+          now,
+          options.expiresAt ? Date.parse(options.expiresAt) : null,
+          JSON.stringify(payload),
+          this.payloadHash(payload),
+          now,
+          now,
         );
-      }
       if (requester.binding_id && options.notifyOn?.length) {
         const subscription = this.db
           .query<{ id: string }, [string, string, BindingId]>(
@@ -1669,7 +1648,7 @@ export class Store {
   private assignedTask(taskId: string, principalId: string) {
     const row = this.db
       .query<TaskRow, [string, string]>(
-        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id JOIN runtime_bindings b ON b.id=p.binding_id AND b.status='active' WHERE t.id=? AND p.disabled_at_ms IS NULL AND (NOT EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.pinned_binding_id IS NOT NULL) OR EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.pinned_binding_id=b.id AND i.pinned_binding_epoch=b.epoch))",
+        "SELECT t.* FROM a2a_tasks t JOIN principals p ON p.id=? AND p.agent_id=t.target_agent_id JOIN runtime_bindings b ON b.id=p.binding_id AND b.status='active' WHERE t.id=? AND p.disabled_at_ms IS NULL AND (NOT EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.kind='a2a-message' AND i.pinned_binding_id IS NOT NULL) OR EXISTS (SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.kind='a2a-message' AND i.pinned_binding_id=b.id AND i.pinned_binding_epoch=b.epoch AND i.id=(SELECT first_intent.id FROM delivery_intents first_intent WHERE first_intent.task_id=t.id AND first_intent.kind='a2a-message' AND first_intent.pinned_binding_id IS NOT NULL ORDER BY first_intent.created_at_ms,first_intent.id LIMIT 1)))",
       )
       .get(principalId, taskId);
     if (!row) throw new Error("TASK_NOT_ASSIGNED");
