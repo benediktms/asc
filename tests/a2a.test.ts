@@ -27,6 +27,38 @@ function fixture() {
 }
 
 describe("A2A JSON-RPC", () => {
+  test("stops reading an oversized request body", async () => {
+    const store = fixture(),
+      agent = store.createAgent("bounded"),
+      { token } = store.createToken();
+    let canceled = false;
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(5));
+        },
+        cancel() {
+          canceled = true;
+        },
+      }),
+      response = await handleA2A(
+        store,
+        new Request("http://localhost/agents/bounded/a2a", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body,
+        }),
+        7432,
+        4,
+      );
+    expect(response.status).toBe(413);
+    expect(canceled).toBe(true);
+    expect(store.agent(agent.id)?.slug).toBe("bounded");
+    store.close();
+  });
+
   test("discovers an agent and sends, reads, then cancels a durable task", async () => {
     const store = fixture(),
       agent = store.createAgent("backend"),

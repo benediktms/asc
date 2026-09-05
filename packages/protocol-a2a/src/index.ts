@@ -374,9 +374,8 @@ async function handleA2ARoute(
   const token = request.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1],
     principal = token ? store.authenticate(token) : null;
   if (!principal) return new Response("Unauthorized", { status: 401 });
-  const body = await request.text();
-  if (Buffer.byteLength(body) > maxRequestBytes)
-    return new Response("Request too large", { status: 413 });
+  const body = await readBody(request, maxRequestBytes);
+  if (body === null) return new Response("Request too large", { status: 413 });
   let payload: Record<string, unknown> | undefined;
   try {
     const parsed = JSON.parse(body);
@@ -452,6 +451,22 @@ async function handleA2ARoute(
     });
   }
   return Response.json(result);
+}
+async function readBody(request: Request, maxBytes: number) {
+  if (!request.body) return "";
+  const reader = request.body.getReader(),
+    chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return Buffer.concat(chunks, size).toString();
+    size += value.byteLength;
+    if (size > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
