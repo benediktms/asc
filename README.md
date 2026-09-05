@@ -14,6 +14,19 @@ bun run build
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.
 
+Create and securely claim the current Codex session without copying a thread
+ID:
+
+```sh
+acs agents create backend --claim
+# In the intended Codex session, call acs_claim with the returned claimCode.
+```
+
+For operator-driven binding, `acs codex bind backend` opens a discovered-session
+picker; automation can use `acs codex bind backend --session <opaque-thread-id>`.
+See [the registration contract](docs/registration.md) for retry and rebind
+semantics.
+
 `bun run check` runs TypeScript, oxlint (including `no-explicit-any` and bans on
 handwritten type assertions and non-null assertions), oxfmt, package
 import-boundary checks, and the test suite. Persistence uses Bun's native SQLite

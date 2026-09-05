@@ -182,8 +182,32 @@ describe("control protocol", () => {
       callerEvidence = evidence("thread-1");
     await call("agents.create", { slug: "claimed" });
     const claim = record(
-      record(await (await call("agents.createClaim", { agent: "claimed" })).json()).result,
-    );
+        record(await (await call("agents.createClaim", { agent: "claimed" })).json()).result,
+      ),
+      claimed = record(
+        await (
+          await call("bindings.claim", {
+            claimCode: claim.claimCode,
+            continuityPolicy: "strict",
+            deliveryPolicy: { wakeStrategy: "disabled" },
+            evidence: evidence("claimed-thread"),
+          })
+        ).json(),
+      );
+    expect(claimed).toMatchObject({
+      result: {
+        agent: { slug: "claimed" },
+        idempotent: false,
+        binding: {
+          installationId: installation.id,
+          session: { opaqueId: "claimed-thread" },
+          continuityPolicy: "strict",
+          deliveryPolicy: { wakeStrategy: "disabled" },
+        },
+      },
+    });
+    const claimedResult = record(claimed.result),
+      claimedBinding = record(claimedResult.binding);
     expect(
       await (
         await call("bindings.claim", {
@@ -192,14 +216,124 @@ describe("control protocol", () => {
         })
       ).json(),
     ).toMatchObject({
-      result: {
-        agent: { slug: "claimed" },
-        binding: {
-          installationId: installation.id,
-          session: { opaqueId: "claimed-thread" },
-        },
+      result: { idempotent: true, binding: { id: claimedBinding.id, epoch: 1 } },
+    });
+    expect(
+      await (
+        await call("bindings.claim", {
+          claimCode: claim.claimCode,
+          evidence: evidence("claim-thief"),
+        })
+      ).json(),
+    ).toMatchObject({ error: { data: { code: "CLAIM_CONSUMED" } } });
+    expect(
+      await (
+        await call("bindings.claim", {
+          claimCode: claim.claimCode,
+          evidence: evidence("claimed-thread", "other"),
+        })
+      ).json(),
+    ).toMatchObject({
+      error: {
+        message: expect.stringContaining("unsupported-harness"),
+        data: { code: "UNATTESTED_CALLER" },
       },
     });
+    expect(
+      await (
+        await call("bindings.claim", {
+          claimCode: claim.claimCode,
+          evidence: {
+            harnessId: "codex",
+            bridge: "mcp",
+            metadata: { threadId: ["ambiguous-one", "ambiguous-two"] },
+            bridgeInstanceId: "test-bridge",
+          },
+        })
+      ).json(),
+    ).toMatchObject({
+      error: {
+        message: expect.stringContaining("invalid-session-id"),
+        data: { code: "UNATTESTED_CALLER" },
+      },
+    });
+    expect(
+      await (await call("bridge.identity", { evidence: evidence("claimed-thread") })).json(),
+    ).toMatchObject({ result: { agent: { slug: "claimed" }, attestation: { kind: "attested" } } });
+
+    await call("agents.create", { slug: "expired" });
+    const expiredClaim = record(
+      record(await (await call("agents.createClaim", { agent: "expired" })).json()).result,
+    );
+    if (typeof expiredClaim.claimId !== "string") throw new Error("missing expired claim ID");
+    store.db
+      .query("UPDATE binding_claims SET created_at_ms=?,expires_at_ms=? WHERE id=?")
+      .run(Date.now() - 2_000, Date.now() - 1_000, expiredClaim.claimId);
+    expect(
+      await (
+        await call("bindings.claim", {
+          claimCode: expiredClaim.claimCode,
+          evidence: evidence("expired-thread"),
+        })
+      ).json(),
+    ).toMatchObject({ error: { data: { code: "CLAIM_EXPIRED" } } });
+    expect(
+      await (
+        await call("bindings.claim", {
+          claimCode: "RAW-CLAIM-SECRET",
+          evidence: evidence("invalid-thread"),
+        })
+      ).json(),
+    ).toMatchObject({ error: { data: { code: "CLAIM_INVALID" } } });
+    const rejectedAudit = store.db
+        .query<{ details_json: string }, []>(
+          "SELECT details_json FROM audit_events WHERE action='binding.claim.reject' AND details_json LIKE '%CLAIM_INVALID%' LIMIT 1",
+        )
+        .get(),
+      claimAudit = store.db
+        .query<{ details: string }, []>(
+          "SELECT group_concat(details_json) details FROM audit_events WHERE action LIKE 'binding.claim.%'",
+        )
+        .get();
+    expect(rejectedAudit?.details_json).toContain("CLAIM_INVALID");
+    expect(claimAudit?.details).not.toContain("RAW-CLAIM-SECRET");
+
+    const rebindClaim = record(
+      record(await (await call("agents.createClaim", { agent: "claimed" })).json()).result,
+    );
+    expect(
+      await (
+        await call("bindings.claim", {
+          claimCode: rebindClaim.claimCode,
+          evidence: evidence("new-claimed-thread"),
+        })
+      ).json(),
+    ).toMatchObject({ error: { data: { code: "BINDING_CONFLICT" } } });
+    const reboundClaim = record(
+      await (
+        await call("bindings.claim", {
+          claimCode: rebindClaim.claimCode,
+          revokeExisting: true,
+          evidence: evidence("new-claimed-thread"),
+        })
+      ).json(),
+    );
+    expect(reboundClaim).toMatchObject({
+      result: {
+        idempotent: false,
+        binding: { epoch: 2, session: { opaqueId: "new-claimed-thread" } },
+      },
+    });
+    expect(
+      await (await call("bridge.identity", { evidence: evidence("claimed-thread") })).json(),
+    ).toMatchObject({ result: { attestation: { kind: "unattested", reason: "unbound-session" } } });
+    expect(
+      store.db
+        .query<{ count: number }, []>(
+          "SELECT count(*) count FROM audit_events WHERE action IN ('binding.claim.consume','binding.claim.reject','binding.rebind')",
+        )
+        .get()?.count,
+    ).toBeGreaterThanOrEqual(6);
     expect(
       await (await call("bridge.attestCaller", { evidence: callerEvidence })).json(),
     ).toMatchObject({
@@ -511,7 +645,16 @@ describe("control protocol", () => {
         })
       ).json(),
     ).toMatchObject({ error: { data: { code: "BINDING_CONFLICT" } } });
-    expect(new Set(inspected)).toEqual(new Set(["thread-1", "claimed-thread"]));
+    expect(new Set(inspected)).toEqual(
+      new Set([
+        "thread-1",
+        "claimed-thread",
+        "claim-thief",
+        "expired-thread",
+        "invalid-thread",
+        "new-claimed-thread",
+      ]),
+    );
     expect(inspected.length).toBeGreaterThan(1);
     expect((await call("agents.list", {}, "2")).status).toBe(426);
     expect(
@@ -520,7 +663,7 @@ describe("control protocol", () => {
           "SELECT count(*) n FROM audit_events WHERE action IN ('agent.create','binding.bind')",
         )
         .get()?.n,
-    ).toBe(3);
+    ).toBe(4);
     expect(await (await call("agents.delete", { agent: "backend" })).json()).toMatchObject({
       result: { deleted: true },
     });

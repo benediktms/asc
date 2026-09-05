@@ -61,7 +61,12 @@ export interface AcsMcpToolMap {
   };
 
   acs_claim: {
-    readonly input: { readonly claimCode: string };
+    readonly input: {
+      readonly claimCode: string;
+      readonly continuityPolicy?: "follow-pending" | "strict";
+      readonly allowNonAtomicWake?: boolean;
+      readonly revokeExisting?: boolean;
+    };
     readonly output: McpToolResult<{
       readonly agent: {
         readonly id: string;
@@ -73,6 +78,7 @@ export interface AcsMcpToolMap {
         readonly epoch: number;
         readonly status: "active";
       };
+      readonly idempotent: boolean;
     }>;
   };
 
