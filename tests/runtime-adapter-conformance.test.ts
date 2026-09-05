@@ -561,6 +561,60 @@ test("Codex leaves local and unknown requests unanswered and reports redacted di
   fixture.close();
 });
 
+test("Codex distinguishes nonblocking input and globally blocks malformed unknown requests", async () => {
+  const fixture = await codexFixture(),
+    { adapter, context, serverResponses } = fixture;
+  await adapter.start(context);
+  expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
+    outcome: "accepted",
+    execution: { opaqueId: "turn-1" },
+  });
+  const controller = new AbortController(),
+    iterator = adapter.observe(controller.signal)[Symbol.asyncIterator]();
+  expect((await iterator.next()).value).toMatchObject({ type: "adapter.connection" });
+
+  fixture.request("item/tool/requestUserInput", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "item-nonblocking",
+    isBlocking: false,
+    questions: [],
+  });
+  const next = iterator.next();
+  expect(
+    await Promise.race([next.then(() => "event"), Bun.sleep(25).then(() => "none")]),
+  ).toBe("none");
+  controller.abort();
+  await next;
+
+  fixture.request("future/malformed/request", {});
+  await Bun.sleep(10);
+  expect(serverResponses).toEqual([]);
+  expect(
+    await adapter.deliver({
+      ...delivery("wake_when_idle"),
+      target: {
+        ...delivery().target,
+        session: { installationId: "ins_conformance", opaqueId: "unrelated-thread" },
+      },
+    }),
+  ).toEqual({ outcome: "deferred", reason: "busy" });
+
+  fixture.notify("serverRequest/resolved", { requestId: "server-request-1" });
+  await Bun.sleep(10);
+  expect(
+    await adapter.deliver({
+      ...delivery("wake_when_idle"),
+      target: {
+        ...delivery().target,
+        session: { installationId: "ins_conformance", opaqueId: "unrelated-thread" },
+      },
+    }),
+  ).toMatchObject({ outcome: "accepted" });
+  await adapter.stop({ reason: "shutdown" });
+  fixture.close();
+});
+
 test("Codex runtime adapter disables mutations for an untested runtime", async () => {
   const fixture = await codexFixture("codex-cli 99.0.0"),
     { adapter, context, methods } = fixture;

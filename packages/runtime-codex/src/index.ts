@@ -409,7 +409,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           return { outcome: "deferred", reason: "busy" };
     if (request.mode === "wake_when_idle") {
       const pending = [...this.pendingServerRequests.values()].find(
-        (item) => item.threadId === request.target.session.opaqueId,
+        (item) => !item.threadId || item.threadId === request.target.session.opaqueId,
       );
       if (pending) {
         this.requireContext().logger.info("codex.delivery.blocked_by_server_request", {
@@ -731,7 +731,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       policyVersion: CODEX_SERVER_REQUEST_POLICY_VERSION,
       answered: false,
     });
-    if (policy.blocksExecution && context.threadId && blocking)
+    if (policy.blocksExecution && blocking)
       this.pendingServerRequests.set(requestId, {
         threadId: context.threadId,
         turnId: context.turnId,
@@ -739,7 +739,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         action: policy.action,
         kind: policy.kind,
       });
-    if (!context.turnId) return;
+    if (!blocking || !context.turnId) return;
     const execution = this.executions.get(context.turnId);
     if (!execution) return;
     this.emit({
