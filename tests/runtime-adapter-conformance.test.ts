@@ -25,6 +25,7 @@ type Fixture = {
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
   setHistoryDelivery(deliveryId: string): void;
+  setSessionPages(): void;
   setSource(source: unknown): void;
   setStatus(status: string): void;
   notify(method: string, params: unknown): void;
@@ -271,6 +272,20 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       fixture.close();
     });
 
+    test("does not repeat loaded sessions across stored pages", async () => {
+      const fixture = await create(),
+        { adapter, context } = fixture;
+      fixture.setSessionPages();
+      await adapter.start(context);
+      const first = await adapter.listSessions({ limit: 1 }),
+        second = await adapter.listSessions({ limit: 1, cursor: first.nextCursor });
+      expect(first.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-2"]);
+      expect(second.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-1"]);
+      expect(second.sessions[0]?.availability).toBe("idle");
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
     test("does not expose unknown runtime source metadata", async () => {
       const fixture = await create(),
         { adapter, context } = fixture;
@@ -384,6 +399,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     failures = new Map<string, "overload" | "disconnect" | "hang">();
   let fence = true,
     historyDelivery: string | undefined,
+    sessionPages = false,
     source: unknown = "test",
     status = "idle";
   let sendNotification: ((method: string, params: unknown) => void) | undefined,
@@ -443,7 +459,15 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
               serverFrame(
                 JSON.stringify({
                   id: request.id,
-                  result: response(method, status, userAgent, historyDelivery, source),
+                  result: response(
+                    method,
+                    status,
+                    userAgent,
+                    historyDelivery,
+                    source,
+                    request.params,
+                    sessionPages,
+                  ),
                 }),
               ),
             );
@@ -480,6 +504,9 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     },
     setHistoryDelivery(deliveryId) {
       historyDelivery = deliveryId;
+    },
+    setSessionPages() {
+      sessionPages = true;
     },
     setSource(value) {
       source = value;
@@ -525,39 +552,50 @@ function response(
   userAgent: string,
   historyDelivery?: string,
   source: unknown = "test",
+  params?: unknown,
+  sessionPages = false,
 ) {
   if (method === "initialize") return { userAgent };
-  if (method === "thread/list") return { data: [], nextCursor: null };
+  if (method === "thread/loaded/list")
+    return { data: sessionPages ? ["thread-1"] : [], nextCursor: null };
+  if (method === "thread/list") {
+    if (!sessionPages) return { data: [], nextCursor: null };
+    return record(params).cursor === "page-2"
+      ? { data: [thread("thread-1", status, source, historyDelivery)], nextCursor: null }
+      : { data: [thread("thread-2", status, source)], nextCursor: "page-2" };
+  }
   if (method === "thread/read")
-    return {
-      thread: {
-        id: "thread-1",
-        preview: "test",
-        name: null,
-        updatedAt: 1,
-        cwd: "/tmp",
-        cliVersion: "test",
-        source,
-        status: { type: status },
-        turns: historyDelivery
-          ? [
-              {
-                id: "turn-history",
-                items: [
-                  {
-                    type: "functionCallOutput",
-                    name: "receive_agent_message",
-                    namespace: "acs",
-                    output: JSON.stringify({ deliveryId: historyDelivery }),
-                  },
-                ],
-              },
-            ]
-          : [],
-      },
-    };
+    return { thread: thread("thread-1", status, source, historyDelivery) };
   if (method === "turn/start") return { turn: { id: "turn-1" } };
   return {};
+}
+
+function thread(id: string, status: string, source: unknown, historyDelivery?: string) {
+  return {
+    id,
+    preview: "test",
+    name: null,
+    updatedAt: 1,
+    cwd: "/tmp",
+    cliVersion: "test",
+    source,
+    status: { type: status },
+    turns: historyDelivery
+      ? [
+          {
+            id: "turn-history",
+            items: [
+              {
+                type: "functionCallOutput",
+                name: "receive_agent_message",
+                namespace: "acs",
+                output: JSON.stringify({ deliveryId: historyDelivery }),
+              },
+            ],
+          },
+        ]
+      : [],
+  };
 }
 
 function mutations(methods: string[]) {

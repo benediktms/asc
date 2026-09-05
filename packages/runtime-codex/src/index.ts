@@ -196,24 +196,20 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         },
         signal,
       ),
-      stored = new Set(page.data.map((thread) => thread.id)),
-      loadedSnapshots = await Promise.all(
-        loaded.data
-          .filter((threadId) => !stored.has(threadId))
-          .map((threadId) =>
-            this.inspectSession(
+      loadedIds = new Set(loaded.data);
+    let sessions = await Promise.all(
+      page.data.map((thread) =>
+        loadedIds.has(thread.id)
+          ? this.inspectSession(
               {
                 installationId: this.requireContext().installationId,
-                opaqueId: threadId,
+                opaqueId: thread.id,
               },
               signal,
-            ),
-          ),
-      );
-    let sessions = [
-      ...loadedSnapshots.filter((session) => session.availability !== "offline"),
-      ...page.data.map((thread) => this.snapshot(thread)),
-    ];
+            )
+          : this.snapshot(thread),
+      ),
+    );
     if (query.text) {
       const search = query.text.toLocaleLowerCase();
       sessions = sessions.filter((session) =>
