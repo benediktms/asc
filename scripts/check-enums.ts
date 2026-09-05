@@ -4,7 +4,7 @@ const failures: string[] = [];
 for await (const file of new Bun.Glob("{apps,contracts,packages,scripts,tests}/**/*.ts").scan({
   cwd: import.meta.dir + "/..",
 })) {
-  if (file.startsWith("packages/codex-protocol-generated/")) continue;
+  if (file.includes("/profiles/") && file.includes("/generated/")) continue;
   const source = await Bun.file(import.meta.dir + "/../" + file).text(),
     tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const visit = (node: ts.Node) => {

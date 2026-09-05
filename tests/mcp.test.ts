@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mcpMessageIdentity } from "../packages/bridge-mcp-codex/src/index";
+import { identityState, mcpMessageIdentity } from "../packages/bridge-mcp-codex/src/index";
 
 describe("Codex MCP bridge", () => {
+  test("reports actionable caller-attestation states", () => {
+    expect(identityState({ kind: "unattested", reason: "unbound-session" })).toBe("unbound");
+    expect(identityState({ kind: "unattested", reason: "unsupported-runtime-version" })).toBe(
+      "unsupported",
+    );
+    expect(identityState({ kind: "unattested", reason: "invalid-session-id" })).toBe("malformed");
+    expect(identityState({ kind: "unattested", reason: "stale-binding" })).toBe("stale");
+  });
+
   test("prefers host call identity and warns for a fresh fallback", () => {
     expect(mcpMessageIdentity(42)).toEqual({ messageId: "42" });
     const explicit = mcpMessageIdentity(

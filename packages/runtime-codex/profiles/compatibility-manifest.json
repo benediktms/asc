@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "evidence": {
+    "adapter-conformance": {
+      "kind": "automated-emulator",
+      "source": "tests/runtime-adapter-conformance.test.ts"
+    },
+    "real-model-root": {
+      "kind": "opt-in-real-runtime",
+      "source": "tests/real-codex.test.ts",
+      "versions": ["0.153.2", "0.153.4"],
+      "scenario": "root and app-server-managed thread"
+    },
+    "real-model-resumed": {
+      "kind": "opt-in-real-runtime",
+      "source": "tests/real-codex.test.ts",
+      "versions": ["0.153.2", "0.153.4"],
+      "scenario": "resumed thread"
+    },
+    "real-tui-approval": {
+      "kind": "recorded-manual-probe",
+      "source": "docs/adr/010-local-permissions.md",
+      "versions": ["0.153.2"],
+      "scenario": "interactive TUI approval ownership"
+    },
+    "negative-protocol-finding": {
+      "kind": "recorded-negative-probe",
+      "source": "docs/adr/007-ambiguous-acceptance.md"
+    }
+  },
+  "profiles": [
+    {
+      "profileId": "codex-app-server-v1",
+      "versions": ["0.153.2", "0.153.4"],
+      "generatedTypesDirectory": "profiles/codex-app-server-v1/generated",
+      "generation": {
+        "command": "codex app-server generate-ts --experimental --out <dir> && codex app-server generate-json-schema --experimental --out <dir>",
+        "generatorVersion": "0.153.2",
+        "schemaDigest": "sha256:5fa8cef8f14df1c9c5fe72d04a37424a435cd0a190728f3268dc6a692e7c09fa",
+        "sourcePackage": "@openai/codex@0.153.2",
+        "sourcePackageDigest": "sha512-IRocJlE+jCZGYHwIJWBja2nDswTSZY4sNddQgU5xiR/mVWxo5WcO8pqcajXJea1XDoNK9CaVzizVhUxDhFkU6g=="
+      },
+      "callerAttestation": {
+        "decoderId": "codex-mcp-thread-meta-v1",
+        "requiredKeys": ["threadId"],
+        "optionalKeys": [],
+        "ignoredKeys": ["all unrecognized host metadata", "all model-supplied tool arguments"]
+      },
+      "capabilities": {
+        "listSessions": { "supported": true, "evidence": ["adapter-conformance"] },
+        "observeSessionState": {
+          "supported": true,
+          "evidence": ["adapter-conformance", "real-model-root"]
+        },
+        "observeExecutions": {
+          "supported": true,
+          "evidence": ["adapter-conformance", "real-model-root"]
+        },
+        "appendContext": { "supported": true, "evidence": ["real-model-root"] },
+        "wakeWhenIdle": { "supported": true, "evidence": ["real-model-root"] },
+        "atomicDeferredWake": { "supported": false, "evidence": ["negative-protocol-finding"] },
+        "steerActiveExecution": { "supported": false, "evidence": ["negative-protocol-finding"] },
+        "cancelOwnedExecution": { "supported": true, "evidence": ["real-model-root"] },
+        "reconcileDelivery": { "supported": true, "evidence": ["adapter-conformance"] },
+        "callerAttestation": {
+          "supported": true,
+          "evidence": ["real-model-root", "real-model-resumed"]
+        },
+        "sharedClientObservation": { "supported": true, "evidence": ["real-model-root"] },
+        "localApprovalOwnershipSafe": { "supported": true, "evidence": ["real-tui-approval"] }
+      },
+      "versionEvidence": {
+        "0.153.2": ["real-model-root", "real-model-resumed", "real-tui-approval"],
+        "0.153.4": ["real-model-root", "real-model-resumed"]
+      },
+      "scenarioEvidence": {
+        "root": "real",
+        "resumed": "real",
+        "forked": "unverified",
+        "appServerManaged": "real",
+        "interactiveTui": "real",
+        "subagentOriginated": "unverified"
+      }
+    }
+  ]
+}

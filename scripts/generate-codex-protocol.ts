@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, ".."),
-  committedOutput = join(root, "packages/codex-protocol-generated"),
+  committedOutput = join(root, "packages/runtime-codex/profiles/codex-app-server-v1/generated"),
   temporary = mkdtempSync(join(tmpdir(), "acs-codex-protocol-")),
   check = process.argv.includes("--check"),
   output = check ? join(temporary, "output") : committedOutput;

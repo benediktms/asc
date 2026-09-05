@@ -66,3 +66,11 @@ notifications through one Unix-socket app-server; reconnect behavior is covered
 by the adapter conformance suite. User-routed command approvals remain exclusive
 to the TUI. `requestUserInput` fans out to every subscribed client, but ACS never
 answers it, so a missing local owner fails closed.
+
+Codex support is selected through an exact, digest-verified compatibility
+profile with capability-specific evidence. An unknown build with the same schema
+is diagnostic-only until its behavioral probes are reviewed. See
+[`docs/codex-compatibility.md`](docs/codex-compatibility.md) for the manifest,
+evidence boundary, and upgrade workflow. Forked-thread and subagent-originated
+caller metadata remain explicitly unverified rather than inferred from root
+thread behavior.
