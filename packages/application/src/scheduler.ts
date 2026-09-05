@@ -675,9 +675,9 @@ export class DeliveryScheduler {
     const now = Date.now();
     this.store.db
       .query(
-        "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE state='deferred' AND state_reason IN ('offline','dormant') AND target_agent_id IN (SELECT agent_id FROM runtime_bindings WHERE installation_id=? AND session_opaque_id=? AND status='active')",
+        "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE state='deferred' AND (state_reason IN ('offline','dormant') OR (?='idle' AND state_reason IN ('busy','policy'))) AND target_agent_id IN (SELECT agent_id FROM runtime_bindings WHERE installation_id=? AND session_opaque_id=? AND status='active')",
       )
-      .run(now, now, session.installationId, session.opaqueId);
+      .run(now, now, availability, session.installationId, session.opaqueId);
   }
 }
 

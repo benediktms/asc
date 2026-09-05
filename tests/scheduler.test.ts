@@ -511,7 +511,7 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
-  test("wakes an offline delivery when its bound session becomes ready", async () => {
+  test("wakes offline and busy deliveries when their bound session becomes ready", async () => {
     const store = fixture(),
       agent = store.createAgent("status-wake-target"),
       requester = authenticated(store),
@@ -529,12 +529,17 @@ describe("delivery scheduler", () => {
         { mode: "append_context" },
       ),
       firstDelivery = Promise.withResolvers<void>(),
+      secondDelivery = Promise.withResolvers<void>(),
       adapter = new FakeRuntimeAdapter();
     let deliveries = 0;
     adapter.deliver = async () => {
       if (++deliveries === 1) {
         firstDelivery.resolve();
         return { outcome: "deferred", reason: "offline", retryAfterMs: 30_000 };
+      }
+      if (deliveries === 2) {
+        secondDelivery.resolve();
+        return { outcome: "deferred", reason: "busy", retryAfterMs: 30_000 };
       }
       return {
         outcome: "accepted",
@@ -562,14 +567,32 @@ describe("delivery scheduler", () => {
           attributes: {},
         },
       };
+      await secondDelivery.promise;
+      await Bun.sleep(25);
+      yield {
+        type: "session.observed",
+        session: {
+          installationId: bindingRow.installation_id,
+          opaqueId: bindingRow.session_opaque_id,
+        },
+        snapshot: {
+          session: {
+            installationId: bindingRow.installation_id,
+            opaqueId: bindingRow.session_opaque_id,
+          },
+          availability: "idle",
+          observedAt: new Date().toISOString(),
+          attributes: {},
+        },
+      };
       await new Promise<void>((resolve) =>
         signal.addEventListener("abort", () => resolve(), { once: true }),
       );
     };
     const scheduler = new DeliveryScheduler(store, adapter, "status-wake");
     await scheduler.start();
-    await Bun.sleep(700);
-    expect(deliveries).toBe(2);
+    await Bun.sleep(950);
+    expect(deliveries).toBe(3);
     expect(deliveryState(store, accepted.deliveryId)?.state).toBe("accepted");
     await scheduler.stop();
     store.close();
