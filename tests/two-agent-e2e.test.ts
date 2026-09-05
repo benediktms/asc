@@ -619,7 +619,11 @@ function jsonRpcResponse(output: string, id: string) {
 }
 
 function data(response: Record<string, unknown>) {
-  return record(record(record(response.result).structuredContent).data);
+  const result = record(response.result),
+    structured = record(result.structuredContent);
+  if (!isRecord(structured.data))
+    throw new Error(`MCP tool returned no data: ${JSON.stringify(response)}`);
+  return structured.data;
 }
 function taskState(task: Record<string, unknown>) {
   return string(record(task.status).state)
