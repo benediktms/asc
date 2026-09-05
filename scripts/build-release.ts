@@ -8,6 +8,13 @@ const root = resolve(import.meta.dir, ".."),
   requested = targetIndex < 0 ? undefined : process.argv.at(targetIndex + 1),
   selected = requested ? [requested] : targets;
 
+const revision =
+  process.env.GITHUB_SHA ??
+  Bun.spawnSync(["git", "rev-parse", "--short=12", "HEAD"], { cwd: root })
+    .stdout.toString()
+    .trim() ??
+  "unknown";
+
 if (requested && !targets.includes(requested)) throw new Error(`unsupported target: ${requested}`);
 
 for (const target of selected) {
@@ -24,6 +31,7 @@ for (const target of selected) {
       `--target=${target}`,
       `--metafile=${metafile}`,
       `--outfile=${executable}`,
+      `--define=process.env.ACS_BUILD_COMMIT=${JSON.stringify(revision || "unknown")}`,
     ]);
   if (!build.success) throw new Error(build.stderr.toString() || `build failed for ${target}`);
   const metadata: unknown = JSON.parse(readFileSync(metafile, "utf8"));

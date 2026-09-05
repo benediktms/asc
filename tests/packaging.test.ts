@@ -74,7 +74,7 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     a2aToken = tokenStore.createToken().token;
   tokenStore.close();
 
-  const daemon = Bun.spawn([binary, "daemon", "start"], {
+  const daemon = Bun.spawn([binary, "daemon", "run"], {
     env,
     stdout: "pipe",
     stderr: "pipe",
@@ -344,6 +344,27 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   expect(await daemon.exited).toBe(0);
   subscriptionReader.releaseLock();
   processes.splice(processes.indexOf(daemon), 1);
+
+  const starts = [
+    Bun.spawn([binary, "daemon", "start"], { env, stdout: "pipe", stderr: "pipe" }),
+    Bun.spawn([binary, "daemon", "start"], { env, stdout: "pipe", stderr: "pipe" }),
+  ];
+  expect(await Promise.all(starts.map((started) => started.exited))).toEqual([0, 0]);
+  const startResults = await Promise.all(
+    starts.map(async (started) => JSON.parse(await new Response(started.stdout).text())),
+  );
+  expect(startResults).toContainEqual(expect.objectContaining({ status: "running" }));
+  expect(startResults).toContainEqual(
+    expect.objectContaining({ status: "running", alreadyRunning: true }),
+  );
+  expect(
+    JSON.parse(Bun.spawnSync([binary, "daemon", "status"], { env }).stdout.toString()),
+  ).toMatchObject({ status: "running", version: "0.1.0" });
+  expect(Bun.spawnSync([binary, "daemon", "restart"], { env }).exitCode).toBe(0);
+  expect(Bun.spawnSync([binary, "daemon", "stop"], { env }).exitCode).toBe(0);
+  expect(
+    JSON.parse(Bun.spawnSync([binary, "daemon", "status"], { env }).stdout.toString()),
+  ).toEqual({ status: "stopped" });
 }, 30_000);
 
 function fakeCodex(path: string) {

@@ -38,6 +38,7 @@ import type {
   StoredTask,
 } from "../../ports/src/index";
 import { z } from "zod";
+import type { Paths } from "../../config/src/index";
 
 const a2aAgentRole = 2;
 export type {
@@ -128,7 +129,7 @@ interface TaskRow {
   next_event_sequence: number;
   a2a_snapshot_json: string;
 }
-export function initFiles(target = paths()): string {
+export function initFiles(target: Paths = paths()): string {
   mkdirSync(dirname(target.data), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(target.runtime), { recursive: true, mode: 0o700 });
   if ((statSync(dirname(target.runtime)).mode & 0o777) !== 0o700)
@@ -158,7 +159,7 @@ export class Store {
     durability: "balanced" | "strict";
   };
   constructor(
-    readonly config = paths(),
+    readonly config: Paths = paths(),
     limits: Partial<Store["limits"]> = {},
   ) {
     this.limits = {

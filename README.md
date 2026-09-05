@@ -8,11 +8,51 @@ bun run check
 bun run format
 bun run build
 ./dist/acs init
-./dist/acs daemon start
+./dist/acs daemon run
 ```
 
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.
+
+## Install and daemon lifecycle
+
+Release artifacts are standalone executables; Bun and `node_modules` are not
+required on the target machine. Install a downloaded release into a private
+per-user prefix, initialize ASC, and start it in the background:
+
+```sh
+chmod +x ./acs
+./acs install --prefix "$HOME/.local" --non-interactive
+acs init
+acs daemon start
+acs daemon status
+acs codex install-mcp
+```
+
+`install` copies the executable to a platform- and version-specific directory
+under the prefix, then atomically changes `bin/acs`. An already-running daemon
+continues using its original executable until `acs daemon restart` is requested.
+The Codex MCP registration uses the stable `bin/acs` path recorded during
+installation.
+
+`acs daemon run` remains the foreground/debugging command. `start`, `status`,
+`restart`, and `stop` manage a detached per-user process without systemd or
+launchd. Lifecycle operations are serialized; status and stop validate the PID,
+OS process-start marker, executable, and command before treating a record as
+live or sending a signal. The daemon first receives a control-plane shutdown,
+then bounded TERM/KILL fallbacks if necessary.
+
+Logs are written to the platform data directory under `logs/daemon.log`. At
+startup, files at least 5 MiB are rotated, retaining three older files. See
+[the deployment specification](docs/deployment.md) for paths and safety rules.
+
+```sh
+acs daemon stop
+acs uninstall
+```
+
+Uninstall removes only the recorded ASC symlink and owned version directory.
+Configuration, databases, logs, and secrets are preserved.
 
 Create and securely claim the current Codex session without copying a thread
 ID:
