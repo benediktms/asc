@@ -47,5 +47,5 @@ multi-user deployment is outside v1.
 
 The implemented controls are covered by storage, control, A2A, adapter,
 scheduler, emulator, and compiled-binary tests. v1 release remains fail-closed
-until the real-Codex attestation, shared-daemon, safe-delivery, approval-ownership,
-and two-agent demo gates documented by `acs codex doctor` are completed.
+until the real-Codex attestation, shared-daemon, safe-delivery, and
+approval-ownership gates documented by `acs codex doctor` are completed.

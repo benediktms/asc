@@ -245,8 +245,8 @@ async function doctor() {
       compatibility: runningCodexVersion === TESTED_CODEX_VERSION ? "tested" : "untested",
     },
     phaseZero: {
-      a2aOnBun: "locally testable",
-      standaloneExecutable: "locally testable",
+      a2aOnBun: "verified by pinned TCK",
+      standaloneExecutable: "verified by clean-machine release matrix",
       mcpAttestation: "requires real two-build evidence",
       sharedAppServer,
       safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",

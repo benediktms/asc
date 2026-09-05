@@ -45,7 +45,7 @@ acceptance-unknown reconciliation is automatic, with operator resolution when
 the Codex adapter cannot prove authoritative history. Wake acceptance can be
 recovered from its durable named function-output marker; context-only ambiguity
 remains operator-owned because injected items are absent from turn history.
-Two-build MCP metadata, approval ownership, and the clean-machine two-agent demo
-remain release gates. On Codex `0.153.2`,
+Two-build MCP metadata, shared-daemon integration, and approval ownership remain
+release gates. On Codex `0.153.2`,
 `requestUserInput` fans out to every subscribed client, so ACS observes but never
 answers those requests; a unique local approval owner cannot yet be proven.
