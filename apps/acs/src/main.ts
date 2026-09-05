@@ -163,7 +163,9 @@ async function daemon() {
   const codexSocket =
     process.env.ACS_CODEX_SOCKET ??
     `${process.env.CODEX_HOME ?? `${process.env.HOME}/.codex`}/app-server-control/app-server-control.sock`;
-  const adapter = settings.codex.enabled ? new CodexRuntimeAdapter(codexSocket) : undefined;
+  const adapter = settings.codex.enabled
+    ? new CodexRuntimeAdapter(codexSocket, settings.codex.maxInFlightRequests)
+    : undefined;
   const scheduler = adapter
     ? new DeliveryScheduler(store, adapter, String(process.pid), {
         concurrency: settings.delivery.workerConcurrency,

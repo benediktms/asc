@@ -86,6 +86,46 @@ describe("Codex app-server transport", () => {
     client.close();
     server.stop();
   });
+
+  test("rejects requests above the configured in-flight limit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acs-codex-overload-"));
+    roots.push(root);
+    const path = join(root, "app.sock");
+    let markPending: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+        markPending = resolve;
+      }),
+      server = Bun.listen({
+        unix: path,
+        socket: {
+          open() {},
+          data(socket, data) {
+            const text = Buffer.from(data).toString();
+            if (!text.startsWith("GET ")) {
+              markPending?.();
+              return;
+            }
+            const key = text.match(/Sec-WebSocket-Key: (.+)\r/i)?.at(1);
+            if (!key) throw new Error("missing WebSocket key");
+            const accept = createHash("sha1")
+              .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+              .digest("base64");
+            socket.write(
+              `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+            );
+          },
+          close() {},
+          error() {},
+        },
+      }),
+      client = new CodexAppServerClient(path, 10_000, 1_000, 1),
+      starting = client.start();
+    await pending;
+    await expect(client.request("thread/list", {})).rejects.toThrow("app-server overloaded");
+    client.close();
+    await expect(starting).rejects.toThrow("app-server connection closed");
+    server.stop();
+  });
 });
 
 function byte(buffer: Uint8Array, index: number) {

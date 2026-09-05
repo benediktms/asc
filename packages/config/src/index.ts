@@ -22,6 +22,7 @@ export interface AcsConfig {
     binary: string;
     connection: string;
     statusPollIntervalMs: number;
+    maxInFlightRequests: number;
     allowNonAtomicWake: boolean;
     allowActiveTurnSteering: boolean;
     autoResumeDormantThreads: boolean;
@@ -57,6 +58,7 @@ enabled = true
 codex_binary = "codex"
 connection = "daemon"
 status_poll_interval_ms = 2000
+max_in_flight_requests = 128
 allow_non_atomic_wake = false
 allow_active_turn_steering = false
 auto_resume_dormant_threads = false
@@ -104,6 +106,7 @@ export function loadConfig(path = configPath()): AcsConfig {
       "codex_binary",
       "connection",
       "status_poll_interval_ms",
+      "max_in_flight_requests",
       "allow_non_atomic_wake",
       "allow_active_turn_steering",
       "auto_resume_dormant_threads",
@@ -166,6 +169,10 @@ export function loadConfig(path = configPath()): AcsConfig {
       statusPollIntervalMs: positive(
         number(codex.status_poll_interval_ms, 2000),
         "runtimes.codex.status_poll_interval_ms",
+      ),
+      maxInFlightRequests: positive(
+        number(codex.max_in_flight_requests, 128),
+        "runtimes.codex.max_in_flight_requests",
       ),
       allowNonAtomicWake: boolean(codex.allow_non_atomic_wake, false),
       allowActiveTurnSteering: boolean(codex.allow_active_turn_steering, false),

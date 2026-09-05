@@ -87,13 +87,21 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
   >();
 
-  constructor(readonly socketPath: string) {}
+  constructor(
+    readonly socketPath: string,
+    readonly maxInFlightRequests = 128,
+  ) {}
 
   async start(context: RuntimeAdapterContext) {
     if (this.client) return;
     this.context = context;
     this.stopped = false;
-    const client = new CodexAppServerClient(this.socketPath);
+    const client = new CodexAppServerClient(
+      this.socketPath,
+      10_000,
+      1_000,
+      this.maxInFlightRequests,
+    );
     this.client = client;
     client.onNotification = (method, params) => this.handleNotification(method, params);
     client.onRequest = (requestId, method, params) =>

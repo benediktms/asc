@@ -47,6 +47,7 @@ export class CodexAppServerClient {
     readonly socketPath: string,
     readonly timeoutMs = 10_000,
     readonly connectTimeoutMs = 1_000,
+    readonly maxInFlightRequests = 128,
   ) {}
 
   async start() {
@@ -111,6 +112,8 @@ export class CodexAppServerClient {
 
   async request(method: string, params: unknown): Promise<unknown> {
     if (!this.upgraded) throw new Error("app-server client is not connected");
+    if (this.pending.size >= this.maxInFlightRequests)
+      throw new Error("app-server overloaded: maximum in-flight requests reached");
     const id = this.nextId++;
     const promise = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
