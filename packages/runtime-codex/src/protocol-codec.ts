@@ -1,25 +1,45 @@
-import { createHash } from "node:crypto";
-import type {
-  CodexFunctionCallOutputDto,
-  CodexJson,
+import {
+  CodexAppServerError,
+  type CodexAppServerFailureDto,
+  type CodexFunctionCallOutputDto,
+  type CodexJson,
 } from "../../../contracts/codex-app-server-boundary";
-import type { RuntimeDeliveryEnvelopeV1 } from "../../../contracts/runtime-adapter";
+import type {
+  RuntimeAvailability,
+  RuntimeDeliveryEnvelopeV1,
+} from "../../../contracts/runtime-adapter";
 import { canonical } from "../../domain/src/index";
-import testedVersion from "../../codex-protocol-generated/CODEX_VERSION" with { type: "text" };
-import clientRequestSchema from "../../codex-protocol-generated/schema/ClientRequest.json" with { type: "text" };
-import serverNotificationSchema from "../../codex-protocol-generated/schema/ServerNotification.json" with { type: "text" };
-import type { ResponseItem } from "../../codex-protocol-generated/src/ResponseItem";
+import type { ResponseItem } from "../profiles/codex-app-server-v1/generated/src/ResponseItem";
+import { CODEX_PROTOCOL_FINGERPRINT, type CodexCompatibilityProfile } from "./compatibility";
 
-export const TESTED_CODEX_VERSION = testedVersion.trim();
-export const SUPPORTED_CODEX_VERSIONS = Object.freeze([TESTED_CODEX_VERSION, "0.153.4"]);
-export const CODEX_PROTOCOL_FINGERPRINT = createHash("sha256")
-  .update(JSON.stringify(clientRequestSchema))
-  .update("\0")
-  .update(JSON.stringify(serverNotificationSchema))
-  .digest("hex");
+export interface CodexProtocolCodec {
+  readonly profileId: string;
+  readonly schemaDigest: string;
+  normalizeStatus(status: { readonly type: string }): RuntimeAvailability;
+  renderDeliveryEnvelope(envelope: RuntimeDeliveryEnvelopeV1): CodexFunctionCallOutputDto;
+  parseHistoryMarker(value: unknown, deliveryId: string): boolean;
+  translateError(error: unknown): CodexAppServerFailureDto | undefined;
+}
 
-export function supportsCodexVersion(version: string | undefined): boolean {
-  return version !== undefined && SUPPORTED_CODEX_VERSIONS.includes(version);
+export function createCodexProtocolCodec(profile: CodexCompatibilityProfile): CodexProtocolCodec {
+  return {
+    profileId: profile.profileId,
+    schemaDigest: CODEX_PROTOCOL_FINGERPRINT,
+    normalizeStatus,
+    renderDeliveryEnvelope: responseItem,
+    parseHistoryMarker(value, deliveryId) {
+      if (typeof value !== "string") return false;
+      try {
+        const parsed: unknown = JSON.parse(value);
+        return isRecord(parsed) && parsed.deliveryId === deliveryId;
+      } catch {
+        return false;
+      }
+    },
+    translateError(error) {
+      return error instanceof CodexAppServerError ? error.failure : undefined;
+    },
+  };
 }
 
 export function responseItem(envelope: RuntimeDeliveryEnvelopeV1): CodexFunctionCallOutputDto {
@@ -29,6 +49,21 @@ export function responseItem(envelope: RuntimeDeliveryEnvelopeV1): CodexFunction
     namespace: "acs",
     output: canonical(envelope),
   } satisfies ResponseItem;
+}
+
+function normalizeStatus(value: { readonly type: string }): RuntimeAvailability {
+  switch (value.type) {
+    case "idle":
+      return "idle";
+    case "active":
+      return "busy";
+    case "notLoaded":
+      return "dormant";
+    case "systemError":
+      return "degraded";
+    default:
+      return "unknown";
+  }
 }
 
 export function jsonValue(json: string): CodexJson {
@@ -44,4 +79,8 @@ function isJsonValue(value: unknown): value is CodexJson {
     typeof value === "object" &&
     Object.values(value).every((item) => item === undefined || isJsonValue(item))
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

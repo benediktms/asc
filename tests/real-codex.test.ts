@@ -9,7 +9,12 @@ import type {
   RuntimeReconcileRequest,
 } from "../contracts/runtime-adapter";
 import { controlHandler } from "../packages/protocol-control/src/index";
-import { CodexCallerAttestor, CodexRuntimeAdapter } from "../packages/runtime-codex/src/index";
+import {
+  CodexCallerAttestor,
+  CodexRuntimeAdapter,
+  selectCodexCompatibility,
+  TESTED_CODEX_VERSION,
+} from "../packages/runtime-codex/src/index";
 import { CodexAppServerClient } from "../packages/runtime-codex/src/app-server-client";
 import { Store } from "../packages/storage-sqlite/src/index";
 
@@ -59,7 +64,9 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
           new Date().toISOString(),
           () => {},
           adapter,
-          new CodexCallerAttestor(installation.id),
+          new CodexCallerAttestor(installation.id, () =>
+            selectCodexCompatibility(TESTED_CODEX_VERSION),
+          ),
         ),
         token = readFileSync(join(root, "control.token"), "utf8"),
         call = async (method: string, params: unknown) => {

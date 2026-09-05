@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Message, Role, TaskState as A2ATaskState } from "@a2a-js/sdk";
 import { controlHandler } from "../packages/protocol-control/src/index";
-import { CodexCallerAttestor } from "../packages/runtime-codex/src/index";
+import {
+  CodexCallerAttestor,
+  selectCodexCompatibility,
+  TESTED_CODEX_VERSION,
+} from "../packages/runtime-codex/src/index";
 import { Store, type Paths } from "../packages/storage-sqlite/src/index";
 import { FakeRuntimeAdapter } from "./fake-runtime-adapter";
 
@@ -52,7 +56,9 @@ describe("control protocol", () => {
         new Date().toISOString(),
         () => {},
         adapter,
-        new CodexCallerAttestor(installation.id),
+        new CodexCallerAttestor(installation.id, () =>
+          selectCodexCompatibility(TESTED_CODEX_VERSION),
+        ),
       ),
       token = readFileSync(paths.token, "utf8");
     expect(
@@ -709,7 +715,9 @@ describe("control protocol", () => {
         new Date().toISOString(),
         () => {},
         adapter,
-        new CodexCallerAttestor(installation.id),
+        new CodexCallerAttestor(installation.id, () =>
+          selectCodexCompatibility(TESTED_CODEX_VERSION),
+        ),
       ),
       token = readFileSync(paths.token, "utf8"),
       request = (method: string, params: unknown) =>

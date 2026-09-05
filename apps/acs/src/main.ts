@@ -8,6 +8,7 @@ import { initFiles, Store } from "../../../packages/storage-sqlite/src/index";
 import {
   CodexCallerAttestor,
   CodexRuntimeAdapter,
+  selectCodexCompatibility,
   SUPPORTED_CODEX_VERSIONS,
   TESTED_CODEX_VERSION,
 } from "../../../packages/runtime-codex/src/index";
@@ -190,6 +191,7 @@ async function daemon() {
               .get(adapter.descriptor.adapterId),
             "runtime installation",
           ).id,
+          () => adapter.compatibility(),
         )
       : undefined;
   scheduler = adapter
@@ -356,7 +358,9 @@ async function doctor() {
   const installedCodex = codex.success ? codex.stdout.toString().trim() : undefined,
     call = (method: string, params: unknown = {}) =>
       controlCall(config.runtime, config.token, method, params);
-  let sharedAppServer: string, runningCodexVersion: string | undefined;
+  let sharedAppServer: string,
+    runningCodexVersion: string | undefined,
+    runtimeCapabilities: Record<string, unknown> = {};
   try {
     await call("system.initialize", {
       protocolVersion: "1.0",
@@ -369,20 +373,38 @@ async function doctor() {
       sessions = sessionsResult.sessions;
     runningCodexVersion =
       typeof probe.runtimeVersion === "string" ? probe.runtimeVersion : undefined;
+    runtimeCapabilities = recordValue(probe.capabilities);
     sharedAppServer = `ready (${Array.isArray(sessions) ? sessions.length : 0} thread sampled)`;
   } catch (error) {
     sharedAppServer = `unavailable (${error instanceof Error ? error.message : String(error)})`;
   }
+  const selection = selectCodexCompatibility(runningCodexVersion),
+    selectedProfile = selection.state === "incompatible" ? undefined : selection.profile;
   print({
     codex: {
       installed: installedCodex ?? "unavailable",
       testedVersion: TESTED_CODEX_VERSION,
       supportedVersions: SUPPORTED_CODEX_VERSIONS,
       runningVersion: runningCodexVersion ?? "unavailable",
-      compatibility:
-        runningCodexVersion && SUPPORTED_CODEX_VERSIONS.includes(runningCodexVersion)
-          ? "tested"
-          : "untested",
+      compatibility: selection.state,
+      selectedProfile: selectedProfile?.profileId ?? "none",
+      schemaDigest: selectedProfile?.generation.schemaDigest ?? "unknown",
+      capabilities: Object.fromEntries(
+        Object.entries(selectedProfile?.capabilities ?? {}).map(([name, value]) => [
+          name,
+          {
+            enabled: runtimeCapabilities[name] === true,
+            supported: value.supported,
+            evidence: value.evidence,
+          },
+        ]),
+      ),
+      callerAttestation: selectedProfile
+        ? {
+            decoder: selectedProfile.callerAttestation.decoderId,
+            scenarios: selectedProfile.scenarioEvidence,
+          }
+        : { decoder: "none", scenarios: {} },
     },
     phaseZero: {
       a2aOnBun: "verified by pinned TCK",
@@ -395,8 +417,8 @@ async function doctor() {
         "verified: user approvals remain TUI-owned; ACS never answers local-input requests",
     },
     mutatingDeliveryEnabled: Boolean(
-      runningCodexVersion &&
-      SUPPORTED_CODEX_VERSIONS.includes(runningCodexVersion) &&
+      selection.state === "tested" &&
+      runtimeCapabilities.appendContext === true &&
       sharedAppServer.startsWith("ready"),
     ),
   });

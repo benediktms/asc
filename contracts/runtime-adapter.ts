@@ -441,6 +441,8 @@ export type CallerAttestationResult =
         | "missing-host-metadata"
         | "missing-session-id"
         | "invalid-session-id"
+        | "unsupported-runtime-version"
+        | "ambiguous-runtime-evidence"
         | "runtime-unreachable";
     };
 

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, ".."),
-  committedOutput = join(root, "packages/codex-protocol-generated"),
+  committedOutput = join(root, "packages/runtime-codex/profiles/codex-app-server-v1/generated"),
   temporary = mkdtempSync(join(tmpdir(), "acs-codex-protocol-")),
   check = process.argv.includes("--check"),
   output = check ? join(temporary, "output") : committedOutput;
@@ -62,6 +62,7 @@ try {
   for (const file of [
     "ClientRequest.json",
     "ServerNotification.json",
+    "ServerRequest.json",
     "v1/InitializeParams.json",
     "v1/InitializeResponse.json",
     "v2/ThreadInjectItemsParams.json",

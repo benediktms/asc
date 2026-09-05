@@ -36,12 +36,27 @@ import { CodexAppServerClient } from "./app-server-client";
 import { telemetry } from "../../observability/src/index";
 import {
   CODEX_PROTOCOL_FINGERPRINT,
-  jsonValue,
-  responseItem,
-  supportsCodexVersion,
-} from "./protocol-codec";
+  CODEX_COMPATIBILITY_PROFILES,
+  profileCapabilities,
+  selectCodexCompatibility,
+  type CodexCompatibilitySelection,
+} from "./compatibility";
+import { createCodexProtocolCodec, jsonValue } from "./protocol-codec";
 
-export { SUPPORTED_CODEX_VERSIONS, TESTED_CODEX_VERSION } from "./protocol-codec";
+export {
+  CODEX_COMPATIBILITY_PROFILES,
+  CODEX_PROTOCOL_FINGERPRINT,
+  selectCodexCompatibility,
+  SUPPORTED_CODEX_VERSIONS,
+  TESTED_CODEX_VERSION,
+  validateCodexCompatibilityManifest,
+} from "./compatibility";
+export type {
+  CodexCompatibilityManifest,
+  CodexCompatibilityProfile,
+  CodexCompatibilitySelection,
+} from "./compatibility";
+export type { CodexProtocolCodec } from "./protocol-codec";
 
 export function codexVersion(value: string): string | undefined {
   return value.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.at(0);
@@ -51,45 +66,44 @@ export class CodexCallerAttestor implements RuntimeCallerAttestor {
   readonly harnessId = "codex";
   readonly scheme = "codex-mcp-thread-meta-v1";
   readonly schemes = [this.scheme];
-  constructor(private installationId: RuntimeInstallationId) {}
+  constructor(
+    private installationId: RuntimeInstallationId,
+    private compatibility: () => CodexCompatibilitySelection,
+  ) {}
   async attest(evidence: HostInvocationEvidence): Promise<CallerAttestationResult> {
     if (evidence.harnessId !== this.harnessId)
       return { kind: "unattested", reason: "unsupported-harness" };
+    const selected = this.compatibility();
+    if (
+      selected.state !== "tested" ||
+      selected.profile.capabilities.callerAttestation?.supported !== true
+    )
+      return { kind: "unattested", reason: "unsupported-runtime-version" };
     if (!evidence.metadata) return { kind: "unattested", reason: "missing-host-metadata" };
-    const threadId = evidence.metadata.threadId;
+    const threadId = decodeCallerThreadId(evidence.metadata);
     if (threadId === undefined) return { kind: "unattested", reason: "missing-session-id" };
-    if (typeof threadId !== "string" || !threadId || threadId.length > 512)
-      return { kind: "unattested", reason: "invalid-session-id" };
+    if (threadId === null) return { kind: "unattested", reason: "invalid-session-id" };
     return {
       kind: "attested",
-      scheme: this.scheme,
+      scheme: selected.profile.callerAttestation.decoderId,
       session: { installationId: this.installationId, opaqueId: threadId },
       evidenceFingerprint: createHash("sha256")
-        .update(`${this.harnessId}\0${threadId}`)
+        .update(`${selected.profile.callerAttestation.decoderId}\0${this.harnessId}\0${threadId}`)
         .digest("base64url"),
+      attributes: { compatibilityProfile: selected.profile.profileId },
     };
   }
 }
 
-const capabilities: RuntimeCapabilities = {
-  listSessions: true,
-  observeSessionState: true,
-  observeExecutions: true,
-  appendContext: true,
-  wakeWhenIdle: true,
-  atomicDeferredWake: false,
-  steerActiveExecution: false,
-  cancelOwnedExecution: true,
-  reconcileDelivery: true,
-  callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
-  supportedPartKinds: ["text", "uri", "data"],
-};
+const defaultProfile = defaultCompatibilityProfile();
+const capabilities: RuntimeCapabilities = profileCapabilities(defaultProfile);
 const disabledCapabilities = (): RuntimeCapabilities => ({
   ...capabilities,
   appendContext: false,
   wakeWhenIdle: false,
   cancelOwnedExecution: false,
   reconcileDelivery: false,
+  callerAttestationSchemes: [],
 });
 const availabilityStates: RuntimeAvailability[] = [
   "unknown",
@@ -100,6 +114,12 @@ const availabilityStates: RuntimeAvailability[] = [
   "awaiting-local-input",
   "degraded",
 ];
+
+function defaultCompatibilityProfile() {
+  const profile = CODEX_COMPATIBILITY_PROFILES.at(0);
+  if (!profile) throw new Error("Codex compatibility manifest has no profiles");
+  return profile;
+}
 type SessionCursor = {
   phase: "stored" | "loaded";
   vendorCursor?: string;
@@ -134,6 +154,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     readonly socketPath: string,
     readonly maxInFlightRequests = 128,
   ) {}
+
+  compatibility(): CodexCompatibilitySelection {
+    return selectCodexCompatibility(this.runtimeVersion);
+  }
 
   async start(context: RuntimeAdapterContext) {
     if (this.client) return;
@@ -178,7 +202,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     try {
       if (!this.client) throw new Error("adapter not started");
       await this.client.listThreads({ limit: 1, useStateDbOnly: true }, signal);
-      if (!supportsCodexVersion(this.runtimeVersion))
+      const selected = this.compatibility();
+      if (selected.state !== "tested")
         return {
           state: "incompatible",
           observedAt: new Date().toISOString(),
@@ -188,8 +213,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           diagnostics: [
             {
               severity: "error",
-              code: "CODEX_VERSION_UNTESTED",
-              message: `Unsupported Codex ${this.runtimeVersion ?? "unknown"}`,
+              code:
+                selected.state === "candidate-compatible"
+                  ? "CODEX_VERSION_CANDIDATE"
+                  : "CODEX_PROTOCOL_INCOMPATIBLE",
+              message:
+                selected.state === "candidate-compatible"
+                  ? `Codex ${this.runtimeVersion ?? "unknown"} matches profile ${selected.profile.profileId}, but has no reviewed behavior evidence`
+                  : `Unsupported Codex ${this.runtimeVersion ?? "unknown"} (${selected.reason})`,
+              remediation:
+                "Run the documented Codex profile evaluation workflow before enabling mutations.",
             },
           ],
         };
@@ -198,8 +231,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         observedAt: new Date().toISOString(),
         runtimeVersion: this.runtimeVersion,
         protocolFingerprint: CODEX_PROTOCOL_FINGERPRINT,
-        capabilities,
+        capabilities: profileCapabilities(selected.profile),
         diagnostics: [
+          {
+            severity: "info",
+            code: "CODEX_PROFILE_SELECTED",
+            message: `Selected compatibility profile ${selected.profile.profileId}`,
+          },
           {
             severity: "warning",
             code: "NON_ATOMIC_WAKE_ONLY",
@@ -380,8 +418,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           return { outcome: "deferred", reason: "busy" };
     const snapshot = await this.inspectSession(request.target.session, signal);
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
-    if (!supportsCodexVersion(this.runtimeVersion))
+    const selected = this.compatibility();
+    if (selected.state !== "tested")
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
+    const selectedCapabilities = profileCapabilities(selected.profile);
+    if (
+      (request.mode === "append_context" && !selectedCapabilities.appendContext) ||
+      (request.mode === "wake_when_idle" && !selectedCapabilities.wakeWhenIdle)
+    )
+      return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
     if (request.mode === "wake_when_idle") {
       if (snapshot.availability === "dormant") {
         if (!request.autoResumeDormantThread) return { outcome: "deferred", reason: "dormant" };
@@ -404,7 +449,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         await this.requireClient().injectItems(
           {
             threadId: request.target.session.opaqueId,
-            items: [jsonValue(JSON.stringify(responseItem(request.envelope)))],
+            items: [
+              jsonValue(
+                JSON.stringify(
+                  createCodexProtocolCodec(selected.profile).renderDeliveryEnvelope(
+                    request.envelope,
+                  ),
+                ),
+              ),
+            ],
           },
           request.markRequestFlushed,
           signal,
@@ -474,7 +527,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   ): Promise<RuntimeReconcileResult> {
     this.assertRunning();
     signal?.throwIfAborted();
-    if (!supportsCodexVersion(this.runtimeVersion))
+    const selected = this.compatibility();
+    if (selected.state !== "tested" || !profileCapabilities(selected.profile).reconcileDelivery)
       return {
         outcome: "inconclusive",
         reason: "Codex runtime version is not supported",
@@ -519,7 +573,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   async cancel(request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
     this.assertRunning();
     signal?.throwIfAborted();
-    if (!supportsCodexVersion(this.runtimeVersion))
+    const selected = this.compatibility();
+    if (selected.state !== "tested" || !profileCapabilities(selected.profile).cancelOwnedExecution)
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (!this.executions.has(request.execution.opaqueId))
       return { outcome: "rejected", reason: "not-owned", retryable: false };
@@ -546,7 +601,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private snapshot(thread: CodexThreadDto): RuntimeSessionSnapshot {
     return {
       session: { installationId: this.requireContext().installationId, opaqueId: thread.id },
-      availability: status(thread),
+      availability: this.codec().normalizeStatus(thread.status),
       observedAt: new Date().toISOString(),
       revision: String(thread.updatedAt),
       attributes: {
@@ -594,7 +649,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         session,
         snapshot: {
           session,
-          availability: statusType(params.status),
+          availability: this.codec().normalizeStatus(params.status),
           observedAt: new Date().toISOString(),
           attributes: {},
         },
@@ -672,6 +727,22 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       },
     });
   }
+  private codec() {
+    const selected = this.compatibility();
+    return createCodexProtocolCodec(
+      selected.state === "incompatible" ? defaultProfile : selected.profile,
+    );
+  }
+}
+
+function decodeCallerThreadId(
+  metadata: Readonly<Record<string, unknown>>,
+): string | null | undefined {
+  const threadId = metadata.threadId;
+  if (threadId === undefined) return undefined;
+  return typeof threadId === "string" && threadId.length > 0 && threadId.length <= 512
+    ? threadId
+    : null;
 }
 
 function filterSessions(sessions: RuntimeSessionSnapshot[], query: RuntimeSessionQuery) {
@@ -816,22 +887,4 @@ function isThreadStatusChanged(
     value.status !== null &&
     "type" in value.status
   );
-}
-
-function status(thread: CodexThreadDto): RuntimeAvailability {
-  return statusType(thread.status);
-}
-function statusType(value: { type: string }): RuntimeAvailability {
-  switch (value.type) {
-    case "idle":
-      return "idle";
-    case "active":
-      return "busy";
-    case "notLoaded":
-      return "dormant";
-    case "systemError":
-      return "degraded";
-    default:
-      return "unknown";
-  }
 }

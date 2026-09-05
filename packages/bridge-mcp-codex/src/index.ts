@@ -152,6 +152,23 @@ export function mcpMessageIdentity(
   };
 }
 
+export function identityState(attestation: z.infer<typeof attestationSchema>) {
+  if (attestation.kind === "attested") return "bound";
+  if (attestation.reason === "unbound-session") return "unbound";
+  if (attestation.reason === "unsupported-runtime-version") return "unsupported";
+  if (attestation.reason === "stale-binding") return "stale";
+  if (
+    [
+      "missing-host-metadata",
+      "missing-session-id",
+      "invalid-session-id",
+      "ambiguous-runtime-evidence",
+    ].includes(attestation.reason)
+  )
+    return "malformed";
+  return "unattested";
+}
+
 export async function runMcp(port = 7432) {
   const config = paths(),
     call = (method: string, params: unknown = {}) =>
@@ -202,12 +219,9 @@ export async function runMcp(port = 7432) {
           identitySchema,
         );
         return {
-          state:
-            identity.attestation.kind === "attested"
-              ? "bound"
-              : identity.attestation.reason === "unbound-session"
-                ? "unbound"
-                : "unattested",
+          state: identityState(identity.attestation),
+          reason:
+            identity.attestation.kind === "unattested" ? identity.attestation.reason : undefined,
           agent: identity.agent
             ? {
                 id: identity.agent.id,
