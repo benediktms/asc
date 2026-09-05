@@ -25,6 +25,7 @@ type Fixture = {
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
   setHistoryDelivery(deliveryId: string): void;
+  setSource(source: unknown): void;
   setStatus(status: string): void;
   notify(method: string, params: unknown): void;
   close(): void;
@@ -246,6 +247,18 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       fixture.close();
     });
 
+    test("does not expose unknown runtime source metadata", async () => {
+      const fixture = await create(),
+        { adapter, context } = fixture;
+      await adapter.start(context);
+      fixture.setSource({ type: "cli", token: "secret-value" });
+      const snapshot = await adapter.inspectSession(delivery().target.session);
+      expect(snapshot.attributes.sourceKind).toBe("cli");
+      expect(JSON.stringify(snapshot)).not.toContain("secret-value");
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
     test("honors aborts without hiding an ambiguous write", async () => {
       const fixture = await create(),
         { adapter, context, methods } = fixture;
@@ -347,6 +360,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     failures = new Map<string, "overload" | "disconnect" | "hang">();
   let fence = true,
     historyDelivery: string | undefined,
+    source: unknown = "test",
     status = "idle";
   let sendNotification: ((method: string, params: unknown) => void) | undefined,
     sendRequest: ((method: string, params: unknown) => void) | undefined,
@@ -405,7 +419,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
               serverFrame(
                 JSON.stringify({
                   id: request.id,
-                  result: response(method, status, userAgent, historyDelivery),
+                  result: response(method, status, userAgent, historyDelivery, source),
                 }),
               ),
             );
@@ -443,6 +457,9 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
     setHistoryDelivery(deliveryId) {
       historyDelivery = deliveryId;
     },
+    setSource(value) {
+      source = value;
+    },
     setStatus(value) {
       status = value;
     },
@@ -478,7 +495,13 @@ function delivery(mode: RuntimeDeliveryRequest["mode"] = "append_context"): Runt
   };
 }
 
-function response(method: string, status: string, userAgent: string, historyDelivery?: string) {
+function response(
+  method: string,
+  status: string,
+  userAgent: string,
+  historyDelivery?: string,
+  source: unknown = "test",
+) {
   if (method === "initialize") return { userAgent };
   if (method === "thread/list") return { data: [], nextCursor: null };
   if (method === "thread/read")
@@ -490,7 +513,7 @@ function response(method: string, status: string, userAgent: string, historyDeli
         updatedAt: 1,
         cwd: "/tmp",
         cliVersion: "test",
-        source: "test",
+        source,
         status: { type: status },
         turns: historyDelivery
           ? [

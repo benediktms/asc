@@ -469,8 +469,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       attributes: {
         displayTitle: thread.name ?? thread.preview,
         cwdHint: thread.cwd,
-        sourceKind:
-          typeof thread.source === "string" ? thread.source : JSON.stringify(thread.source),
+        sourceKind: runtimeSourceKind(thread.source),
       },
     };
   }
@@ -600,6 +599,16 @@ function jsonValue(json: string): JsonValue {
   const value: unknown = JSON.parse(json);
   if (!isJsonValue(value)) throw new Error("runtime envelope is not JSON");
   return value;
+}
+function runtimeSourceKind(source: unknown) {
+  if (typeof source === "string") return source;
+  if (
+    typeof source === "object" &&
+    source !== null &&
+    "type" in source &&
+    typeof source.type === "string"
+  )
+    return source.type;
 }
 function isJsonValue(value: unknown): value is JsonValue {
   if (value === null || ["boolean", "number", "string"].includes(typeof value)) return true;
