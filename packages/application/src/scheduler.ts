@@ -55,6 +55,7 @@ export class DeliveryScheduler {
   private context?: RuntimeAdapterContext;
   private connected = false;
   private nextConnectAt = 0;
+  private reconnectAttempts = 0;
   constructor(
     private store: Store,
     private adapter: RuntimeAdapter,
@@ -210,10 +211,21 @@ export class DeliveryScheduler {
     try {
       await this.adapter.start(required(this.context, "adapter context"));
       this.connected = true;
+      this.reconnectAttempts = 0;
       this.observeTask = this.observe();
     } catch {
-      this.nextConnectAt = Date.now() + this.options.reconnectMs;
+      this.scheduleReconnect();
     }
+  }
+  private scheduleReconnect() {
+    this.nextConnectAt =
+      Date.now() +
+      retryDelay(
+        ++this.reconnectAttempts,
+        Math.random,
+        this.options.reconnectMs,
+        this.options.retryCapMs,
+      );
   }
   private async cancelOne() {
     const row = this.store.db
@@ -542,7 +554,7 @@ export class DeliveryScheduler {
     for await (const event of this.adapter.observe(this.abort.signal)) {
       if (event.type === "adapter.connection" && event.state === "offline") {
         this.connected = false;
-        this.nextConnectAt = Date.now() + this.options.reconnectMs;
+        this.scheduleReconnect();
         return;
       }
       this.project(event);
