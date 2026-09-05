@@ -54,16 +54,25 @@ export interface StoredArtifact {
 }
 
 type StoredAttestation =
-  | { readonly kind: "unattested"; readonly reason: "missing-session-id" | "unbound-session" }
+  | {
+      readonly kind: "unattested";
+      readonly reason:
+        | "unsupported-harness"
+        | "missing-session-id"
+        | "invalid-session-id"
+        | "unbound-session";
+    }
   | {
       readonly kind: "attested";
       readonly scheme: "codex-mcp-thread-meta-v1";
+      readonly session: RuntimeSessionRef;
       readonly bindingId: BindingId;
       readonly bindingEpoch: number;
       readonly agentId: `agt_${string}`;
       readonly principalId: `prn_${string}`;
       readonly slug: string;
       readonly displayName: string;
+      readonly evidenceFingerprint: string;
     };
 
 const storedPartSchema = z.object({
@@ -707,12 +716,15 @@ export class Store {
       return binding;
     });
   }
-  attest(threadId: unknown): StoredAttestation {
-    if (typeof threadId !== "string" || !threadId || threadId.length > 512)
+  attest(threadId: unknown, harnessId: unknown = "codex"): StoredAttestation {
+    if (harnessId !== "codex") return { kind: "unattested", reason: "unsupported-harness" };
+    if (typeof threadId !== "string" || !threadId)
       return { kind: "unattested", reason: "missing-session-id" };
+    if (threadId.length > 512) return { kind: "unattested", reason: "invalid-session-id" };
     const row = this.db
       .query<
         {
+          installation_id: RuntimeInstallationId;
           binding_id: BindingId;
           epoch: number;
           agent_id: `agt_${string}`;
@@ -720,25 +732,29 @@ export class Store {
           slug: string;
           display_name: string;
         },
-        [string]
+        [string, string]
       >(
-        "SELECT b.id binding_id,b.epoch,b.agent_id,p.id principal_id,a.slug,a.display_name FROM runtime_bindings b JOIN principals p ON p.binding_id=b.id JOIN agents a ON a.id=b.agent_id WHERE b.session_opaque_id=? AND b.status='active' AND p.disabled_at_ms IS NULL",
+        "SELECT b.installation_id,b.id binding_id,b.epoch,b.agent_id,p.id principal_id,a.slug,a.display_name FROM runtime_bindings b JOIN runtime_installations r ON r.id=b.installation_id JOIN principals p ON p.binding_id=b.id JOIN agents a ON a.id=b.agent_id WHERE b.session_opaque_id=? AND r.harness_id=? AND b.status='active' AND p.disabled_at_ms IS NULL",
       )
-      .get(threadId);
+      .get(threadId, harnessId);
     return row
       ? {
           kind: "attested",
           scheme: "codex-mcp-thread-meta-v1",
+          session: { installationId: row.installation_id, opaqueId: threadId },
           bindingId: row.binding_id,
           bindingEpoch: row.epoch,
           agentId: row.agent_id,
           principalId: row.principal_id,
           slug: row.slug,
           displayName: row.display_name,
+          evidenceFingerprint: createHash("sha256")
+            .update(`${harnessId}\0${threadId}`)
+            .digest("base64url"),
         }
       : { kind: "unattested", reason: "unbound-session" };
   }
-  issueToken(principalId: string, ttlSeconds = 300) {
+  issueToken(principalId: string, scopes: readonly string[], ttlSeconds = 300) {
     const token = randomBytes(32).toString("base64url"),
       now = Date.now();
     this.db
@@ -750,7 +766,7 @@ export class Store {
         principalId,
         this.hashToken(token),
         token.slice(0, 6),
-        '["a2a:send","a2a:read","a2a:cancel"]',
+        JSON.stringify(scopes),
         now,
         now + ttlSeconds * 1000,
       );

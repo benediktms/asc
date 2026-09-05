@@ -75,7 +75,12 @@ test.skipIf(process.env.ACS_REAL_CODEX !== "1")(
         expect(
           record(
             await call("bridge.identity", {
-              evidence: { metadata: { threadId: session.session.opaqueId } },
+              evidence: {
+                harnessId: "codex",
+                bridge: "mcp",
+                metadata: { threadId: session.session.opaqueId },
+                bridgeInstanceId: "real-codex-test",
+              },
             }),
           ).agent,
         ).toMatchObject({ slug });

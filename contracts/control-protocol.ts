@@ -400,6 +400,7 @@ export interface ControlMethodMap {
 
   "bridge.issueA2AToken": {
     readonly params: {
+      readonly evidence: ExecutorTaskEvidence["evidence"];
       readonly bindingId: string;
       readonly bindingEpoch: number;
       readonly scopes: readonly ("a2a:send" | "a2a:read" | "a2a:cancel")[];

@@ -51,12 +51,17 @@ const agentSchema = z.looseObject({
       }),
     ),
   }),
-  identitySchema = z.looseObject({
-    attestation: z.looseObject({
-      kind: z.string(),
-      reason: z.string().optional(),
-      bindingEpoch: z.number().optional(),
+  attestationSchema = z.discriminatedUnion("kind", [
+    z.looseObject({
+      kind: z.literal("attested"),
+      bindingId: z.string(),
+      bindingEpoch: z.number(),
+      session: z.object({ installationId: z.string(), opaqueId: z.string() }),
     }),
+    z.looseObject({ kind: z.literal("unattested"), reason: z.string() }),
+  ]),
+  identitySchema = z.looseObject({
+    attestation: attestationSchema,
     agent: agentSchema.optional(),
   }),
   agentResultSchema = z.looseObject({ agent: agentSchema }),
@@ -64,7 +69,7 @@ const agentSchema = z.looseObject({
     items: z.array(agentSchema),
     nextCursor: z.string().optional(),
   }),
-  tokenSchema = z.looseObject({ token: z.string() }),
+  tokenSchema = z.looseObject({ token: z.string(), expiresAt: z.string() }),
   targetSchema = z.looseObject({ slug: z.string() }),
   attachment = z.discriminatedUnion("kind", [
     z.object({
@@ -82,12 +87,11 @@ const agentSchema = z.looseObject({
     }),
   ]);
 type Attachment = z.infer<typeof attachment>;
-const threadId = (extra: unknown) => {
+const hostMetadataSchema = z.record(z.string(), z.unknown());
+const hostMetadata = (extra: unknown) => {
   if (typeof extra !== "object" || extra === null || !("_meta" in extra)) return undefined;
-  const metadata = extra._meta;
-  if (typeof metadata !== "object" || metadata === null || !("threadId" in metadata))
-    return undefined;
-  return typeof metadata.threadId === "string" ? metadata.threadId : undefined;
+  const parsed = hostMetadataSchema.safeParse(extra._meta);
+  return parsed.success ? parsed.data : undefined;
 };
 
 export function mcpMessageIdentity(
@@ -122,11 +126,32 @@ export async function runMcp(port = 7432) {
   });
   const server = new McpServer({ name: "acs", version: "0.1.0" });
   const evidence = (extra: unknown) => ({
-    harnessId: "codex",
-    bridge: "mcp",
-    metadata: { threadId: threadId(extra) },
-    bridgeInstanceId: String(process.pid),
-  });
+      harnessId: "codex",
+      bridge: "mcp",
+      metadata: hostMetadata(extra),
+      bridgeInstanceId: String(process.pid),
+    }),
+    attest = async (extra: unknown) => {
+      const attestation = await typedCall(
+        "bridge.attestCaller",
+        { evidence: evidence(extra) },
+        attestationSchema,
+      );
+      if (attestation.kind !== "attested")
+        throw new Error(`UNATTESTED_CALLER: ${attestation.reason}`);
+      return attestation;
+    },
+    issueA2AToken = (attestation: Awaited<ReturnType<typeof attest>>, extra: unknown) =>
+      typedCall(
+        "bridge.issueA2AToken",
+        {
+          evidence: evidence(extra),
+          bindingId: attestation.bindingId,
+          bindingEpoch: attestation.bindingEpoch,
+          scopes: ["a2a:send", "a2a:read", "a2a:cancel"],
+        },
+        tokenSchema,
+      );
   server.registerTool(
     "acs_identity",
     { description: "Show the calling Codex thread's ACS identity" },
@@ -206,10 +231,13 @@ export async function runMcp(port = 7432) {
     },
     async (args, extra) =>
       execute(async () => {
-        const tid = threadId(extra);
-        if (!tid) throw new Error("UNATTESTED_CALLER");
-        const identity = mcpMessageIdentity(extra.requestId, tid, args.clientRequestId),
-          auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
+        const caller = await attest(extra),
+          identity = mcpMessageIdentity(
+            extra.requestId,
+            caller.session.opaqueId,
+            args.clientRequestId,
+          ),
+          auth = await issueA2AToken(caller, extra),
           agent = await typedCall("agents.get", { agent: args.to }, agentResultSchema);
         const rpc = await a2a(port, agent.agent.slug, auth.token, "SendMessage", {
           message: {
@@ -240,12 +268,11 @@ export async function runMcp(port = 7432) {
     },
     async (args, extra) =>
       execute(async () => {
-        const tid = threadId(extra);
-        if (!tid) throw new Error("UNATTESTED_CALLER");
-        const auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
+        const caller = await attest(extra),
+          auth = await issueA2AToken(caller, extra),
           target = await typedCall(
             "bridge.taskTarget",
-            { threadId: tid, taskId: args.taskId },
+            { evidence: evidence(extra), taskId: args.taskId },
             targetSchema,
           );
         return await a2a(port, target.slug, auth.token, "GetTask", {
@@ -267,13 +294,16 @@ export async function runMcp(port = 7432) {
     },
     async (args, extra) =>
       execute(async () => {
-        const tid = threadId(extra);
-        if (!tid) throw new Error("UNATTESTED_CALLER");
-        const identity = mcpMessageIdentity(extra.requestId, tid, args.clientRequestId),
-          auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
+        const caller = await attest(extra),
+          identity = mcpMessageIdentity(
+            extra.requestId,
+            caller.session.opaqueId,
+            args.clientRequestId,
+          ),
+          auth = await issueA2AToken(caller, extra),
           target = await typedCall(
             "bridge.taskTarget",
-            { threadId: tid, taskId: args.taskId },
+            { evidence: evidence(extra), taskId: args.taskId },
             targetSchema,
           );
         const rpc = await a2a(port, target.slug, auth.token, "SendMessage", {
@@ -296,12 +326,11 @@ export async function runMcp(port = 7432) {
     },
     async (args, extra) =>
       execute(async () => {
-        const tid = threadId(extra);
-        if (!tid) throw new Error("UNATTESTED_CALLER");
-        const auth = await typedCall("bridge.issueA2AToken", { threadId: tid }, tokenSchema),
+        const caller = await attest(extra),
+          auth = await issueA2AToken(caller, extra),
           target = await typedCall(
             "bridge.taskTarget",
-            { threadId: tid, taskId: args.taskId },
+            { evidence: evidence(extra), taskId: args.taskId },
             targetSchema,
           );
         return await a2a(port, target.slug, auth.token, "CancelTask", {
@@ -321,7 +350,10 @@ export async function runMcp(port = 7432) {
       },
     },
     async (args, extra) =>
-      execute(() => call("executor.task.complete", { ...args, threadId: threadId(extra) })),
+      execute(async () => {
+        await attest(extra);
+        return call("executor.task.complete", { ...args, evidence: evidence(extra) });
+      }),
   );
   server.registerTool(
     "acs_task_fail",
@@ -334,7 +366,10 @@ export async function runMcp(port = 7432) {
       },
     },
     async (args, extra) =>
-      execute(() => call("executor.task.fail", { ...args, threadId: threadId(extra) })),
+      execute(async () => {
+        await attest(extra);
+        return call("executor.task.fail", { ...args, evidence: evidence(extra) });
+      }),
   );
   server.registerTool(
     "acs_task_request_input",
@@ -348,7 +383,10 @@ export async function runMcp(port = 7432) {
       },
     },
     async (args, extra) =>
-      execute(() => call("executor.task.requestInput", { ...args, threadId: threadId(extra) })),
+      execute(async () => {
+        await attest(extra);
+        return call("executor.task.requestInput", { ...args, evidence: evidence(extra) });
+      }),
   );
   server.registerTool(
     "acs_inbox_list",
@@ -361,7 +399,7 @@ export async function runMcp(port = 7432) {
       },
     },
     async (args, extra) =>
-      execute(() => call("inbox.list", { ...args, threadId: threadId(extra) })),
+      execute(() => call("inbox.list", { ...args, evidence: evidence(extra) })),
   );
   await server.connect(new StdioServerTransport());
 }

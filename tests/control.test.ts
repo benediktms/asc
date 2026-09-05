@@ -80,6 +80,74 @@ describe("control protocol", () => {
     expect(await (await call("agents.get", { agent: "backend" })).json()).toMatchObject({
       result: { agent: { availability: "idle" } },
     });
+    const backendBinding = required(
+        store.db
+          .query<{ id: string; epoch: number }, []>(
+            "SELECT id,epoch FROM runtime_bindings WHERE status='active'",
+          )
+          .get(),
+        "binding",
+      ),
+      callerEvidence = evidence("thread-1");
+    expect(
+      await (await call("bridge.attestCaller", { evidence: callerEvidence })).json(),
+    ).toMatchObject({
+      result: {
+        kind: "attested",
+        bindingId: backendBinding.id,
+        bindingEpoch: backendBinding.epoch,
+        session: { installationId: installation.id, opaqueId: "thread-1" },
+        evidenceFingerprint: expect.any(String),
+      },
+    });
+    expect(
+      await (
+        await call("bridge.attestCaller", {
+          evidence: evidence("thread-1", "other"),
+        })
+      ).json(),
+    ).toMatchObject({ result: { kind: "unattested", reason: "unsupported-harness" } });
+    expect(
+      await (await call("bridge.attestCaller", { evidence: evidence() })).json(),
+    ).toMatchObject({ result: { kind: "unattested", reason: "missing-host-metadata" } });
+    const bridgeToken = readFileSync(paths.bridgeToken, "utf8"),
+      issued = record(
+        record(
+          await (
+            await call(
+              "bridge.issueA2AToken",
+              {
+                evidence: callerEvidence,
+                bindingId: backendBinding.id,
+                bindingEpoch: backendBinding.epoch,
+                scopes: ["a2a:read"],
+                ttlSeconds: 30,
+              },
+              "1",
+              bridgeToken,
+            )
+          ).json(),
+        ).result,
+      ),
+      issuedToken = issued.token;
+    if (typeof issuedToken !== "string") throw new Error("expected issued token");
+    expect(issued.expiresAt).toEqual(expect.any(String));
+    expect(store.authenticate(issuedToken)?.scopes).toEqual(["a2a:read"]);
+    expect(
+      await (
+        await call(
+          "bridge.issueA2AToken",
+          {
+            evidence: callerEvidence,
+            bindingId: backendBinding.id,
+            bindingEpoch: backendBinding.epoch + 1,
+            scopes: ["a2a:read"],
+          },
+          "1",
+          bridgeToken,
+        )
+      ).json(),
+    ).toMatchObject({ error: { data: { code: "STALE_BINDING" } } });
     expect(await (await call("runtimes.probe", {})).json()).toMatchObject({
       result: { probe: { state: "ready" } },
     });
@@ -139,8 +207,7 @@ describe("control protocol", () => {
         )
         .get()?.n,
     ).toBe(2);
-    const bridgeToken = readFileSync(paths.bridgeToken, "utf8"),
-      denied = (await call("agents.create", { slug: "forbidden" }, "1", bridgeToken)).json();
+    const denied = (await call("agents.create", { slug: "forbidden" }, "1", bridgeToken)).json();
     expect(await denied).toMatchObject({ error: { message: "NOT_AUTHORIZED" } });
     expect((await call("agents.list", {}, "1", "invalid-token")).status).toBe(401);
     expect(
@@ -226,12 +293,12 @@ describe("control protocol", () => {
     expect([...deliveries.items, ...moreDeliveries.items]).toHaveLength(2);
 
     const inbox = await call("inbox.list", {
-      threadId: betaBinding.sessionId,
+      evidence: evidence(betaBinding.sessionId),
       states: ["submitted"],
       limit: 1,
     });
     const moreInbox = await call("inbox.list", {
-      threadId: betaBinding.sessionId,
+      evidence: evidence(betaBinding.sessionId),
       states: ["submitted"],
       limit: 1,
       cursor: inbox.nextCursor,
@@ -253,6 +320,14 @@ function page(value: unknown) {
 }
 function slugs(items: Record<string, unknown>[]) {
   return items.map((item) => item.slug);
+}
+function evidence(threadId?: string, harnessId = "codex") {
+  return {
+    harnessId,
+    bridge: "mcp",
+    metadata: threadId ? { threadId } : undefined,
+    bridgeInstanceId: "test",
+  };
 }
 function record(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new Error("expected object");

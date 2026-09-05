@@ -52,6 +52,7 @@ const partSchema = z.discriminatedUnion("kind", [
       )
       .optional(),
     artifacts: z.array(artifactSchema).optional(),
+    bindingEpoch: z.number().int().positive().optional(),
     bindingId: z.string().optional(),
     claimCode: z.string().optional(),
     choices: z.array(z.string()).optional(),
@@ -69,7 +70,12 @@ const partSchema = z.discriminatedUnion("kind", [
     displayName: z.string().optional(),
     enabled: z.boolean().optional(),
     evidence: z
-      .looseObject({ metadata: z.looseObject({ threadId: z.unknown() }).optional() })
+      .looseObject({
+        harnessId: z.string().optional(),
+        bridge: z.literal("mcp").optional(),
+        metadata: z.looseObject({ threadId: z.unknown() }).optional(),
+        bridgeInstanceId: z.string().optional(),
+      })
       .optional(),
     installationId: z.string().optional(),
     question: z.string().optional(),
@@ -90,6 +96,7 @@ const partSchema = z.discriminatedUnion("kind", [
       ])
       .optional(),
     skill: z.string().optional(),
+    scopes: z.array(z.enum(["a2a:send", "a2a:read", "a2a:cancel"])).optional(),
     slug: z.string().optional(),
     summary: z.string().optional(),
     continuityPolicy: z.enum(["follow-pending", "strict"]).optional(),
@@ -99,7 +106,6 @@ const partSchema = z.discriminatedUnion("kind", [
     protocolVersion: z.unknown(),
     limit: z.number().int().positive().optional(),
     taskId: z.string().optional(),
-    threadId: z.unknown(),
     ttlSeconds: z.number().int().positive().optional(),
     toBindingId: z.string().optional(),
   });
@@ -310,6 +316,7 @@ export function controlHandler(
           return ok(rpc.id, { binding: bindingDto(createdBinding, store) });
         case "bindings.claim": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
+          if (p.evidence?.harnessId !== "codex") throw new Error("UNATTESTED_CALLER");
           const threadId = p.evidence?.metadata?.threadId;
           if (typeof threadId !== "string") throw new Error("UNATTESTED_CALLER");
           const claimInstallation = required(
@@ -447,11 +454,11 @@ export function controlHandler(
           return ok(rpc.id, { session: snapshot });
         }
         case "bridge.attestCaller": {
-          const a = store.attest(p.evidence?.metadata?.threadId);
+          const a = attestEvidence(store, p.evidence);
           return ok(rpc.id, a);
         }
         case "bridge.identity": {
-          const a = store.attest(p.evidence?.metadata?.threadId);
+          const a = attestEvidence(store, p.evidence);
           const agent = a.kind === "attested" ? store.agent(a.agentId) : undefined;
           return ok(rpc.id, {
             attestation: a,
@@ -459,12 +466,20 @@ export function controlHandler(
           });
         }
         case "bridge.issueA2AToken": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          return ok(rpc.id, { token: store.issueToken(a.principalId), principalId: a.principalId });
+          if (a.bindingId !== p.bindingId || a.bindingEpoch !== p.bindingEpoch)
+            throw new Error("STALE_BINDING");
+          const scopes = required(p.scopes, "scopes"),
+            ttlSeconds = Math.min(p.ttlSeconds ?? 300, 300),
+            issuedToken = store.issueToken(a.principalId, scopes, ttlSeconds);
+          return ok(rpc.id, {
+            token: issuedToken,
+            expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+          });
         }
         case "inbox.list": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           const states = p.states ?? ["submitted", "working", "input-required", "auth-required"],
             page = boundedLocalPage(
@@ -481,14 +496,14 @@ export function controlHandler(
           });
         }
         case "inbox.get": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           const task = store.inboxTask(a.agentId, required(p.taskId, "taskId"));
           if (!task) throw new Error("TASK_NOT_FOUND");
           return ok(rpc.id, { task });
         }
         case "bridge.taskTarget": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           const row = store.db
             .query<{ slug: string }, [string, string]>(
@@ -502,7 +517,7 @@ export function controlHandler(
         case "executor.task.fail":
         case "executor.task.requestInput":
         case "executor.task.acknowledge": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           const state = rpc.method.endsWith("complete")
             ? TaskState.Completed
@@ -534,7 +549,7 @@ export function controlHandler(
           });
         }
         case "executor.task.publishMessage": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           return ok(
             rpc.id,
@@ -547,7 +562,7 @@ export function controlHandler(
           );
         }
         case "executor.task.publishArtifact": {
-          const a = store.attest(p.threadId);
+          const a = attestEvidence(store, p.evidence);
           if (a.kind !== "attested") throw new Error("UNATTESTED_CALLER");
           return ok(
             rpc.id,
@@ -684,6 +699,10 @@ export async function controlCall(
 
 function admin(kind: string) {
   if (kind !== "local-user") throw new Error("NOT_AUTHORIZED");
+}
+function attestEvidence(store: Store, evidence: Params["evidence"]) {
+  if (!evidence?.metadata) return { kind: "unattested", reason: "missing-host-metadata" } as const;
+  return store.attest(evidence?.metadata?.threadId, evidence?.harnessId);
 }
 function runtimeInstallation(store: Store, requestedId?: string) {
   const installation = store.db
