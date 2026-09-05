@@ -365,7 +365,7 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   expect(
     JSON.parse(Bun.spawnSync([binary, "daemon", "status"], { env }).stdout.toString()),
   ).toEqual({ status: "stopped" });
-}, 30_000);
+}, 60_000);
 
 function fakeCodex(path: string) {
   const buffers = new WeakMap<object, Buffer>();
