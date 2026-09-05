@@ -98,11 +98,14 @@ export class CodexAppServerClient {
   async deleteThread(threadId: string): Promise<void> {
     await this.request("thread/delete", { threadId });
   }
-  async injectItems(params: ThreadInjectItemsParams): Promise<void> {
-    await this.request("thread/inject_items", params);
+  async injectItems(
+    params: ThreadInjectItemsParams,
+    markRequestFlushed?: () => void,
+  ): Promise<void> {
+    await this.request("thread/inject_items", params, markRequestFlushed);
   }
-  async startTurn(params: TurnStartParams) {
-    const response = record(await this.request("turn/start", params)),
+  async startTurn(params: TurnStartParams, markRequestFlushed?: () => void) {
+    const response = record(await this.request("turn/start", params, markRequestFlushed)),
       turn = record(response.turn);
     return { turn: { id: stringField(turn, "id") } };
   }
@@ -110,7 +113,11 @@ export class CodexAppServerClient {
     await this.request("turn/interrupt", { threadId, turnId });
   }
 
-  async request(method: string, params: unknown): Promise<unknown> {
+  async request(
+    method: string,
+    params: unknown,
+    markRequestFlushed?: () => void,
+  ): Promise<unknown> {
     if (!this.upgraded) throw new Error("app-server client is not connected");
     if (this.pending.size >= this.maxInFlightRequests)
       throw new Error("app-server overloaded: maximum in-flight requests reached");
@@ -122,7 +129,15 @@ export class CodexAppServerClient {
       }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
     });
-    this.sendFrame(0x1, Buffer.from(JSON.stringify({ id, method, params })));
+    try {
+      markRequestFlushed?.();
+      this.sendFrame(0x1, Buffer.from(JSON.stringify({ id, method, params })));
+    } catch (error) {
+      const pending = this.pending.get(id);
+      if (pending) clearTimeout(pending.timer);
+      this.pending.delete(id);
+      throw error;
+    }
     return telemetry.trace("codex.rpc", () => promise);
   }
 

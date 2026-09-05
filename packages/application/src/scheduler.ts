@@ -348,9 +348,9 @@ export class DeliveryScheduler {
         .run(binding.id, binding.epoch, number, now, intent.id);
       this.store.db
         .query(
-          "INSERT INTO delivery_attempts(id,intent_id,attempt_number,adapter_id,binding_id,binding_epoch,started_at_ms,request_flushed_at_ms) VALUES(?,?,?,?,?,?,?,?)",
+          "INSERT INTO delivery_attempts(id,intent_id,attempt_number,adapter_id,binding_id,binding_epoch,started_at_ms) VALUES(?,?,?,?,?,?,?)",
         )
-        .run(attempt, intent.id, number, "codex.app-server", binding.id, binding.epoch, now, now);
+        .run(attempt, intent.id, number, "codex.app-server", binding.id, binding.epoch, now);
     });
     const payload: DeliveryPayload = JSON.parse(intent.payload_json),
       parties = required(
@@ -413,6 +413,13 @@ export class DeliveryScheduler {
       envelope,
       payloadHash: intent.payload_hash,
       deadline: intent.deadline_ms ? new Date(intent.deadline_ms).toISOString() : undefined,
+      markRequestFlushed: () => {
+        this.store.db
+          .query(
+            "UPDATE delivery_attempts SET request_flushed_at_ms=? WHERE id=? AND request_flushed_at_ms IS NULL",
+          )
+          .run(Date.now(), attempt);
+      },
     });
     const completed = Date.now();
     if (result.outcome === "accepted") {
@@ -539,6 +546,11 @@ export class DeliveryScheduler {
       this.store.db
         .query(
           "UPDATE delivery_intents SET state='pending',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE state='leased' AND lease_expires_at_ms<=?",
+        )
+        .run(now, now);
+      this.store.db
+        .query(
+          "UPDATE delivery_intents AS i SET state='pending',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE state='attempting' AND lease_expires_at_ms<=? AND NOT EXISTS (SELECT 1 FROM delivery_attempts a WHERE a.intent_id=i.id AND a.attempt_number=i.attempt_count AND a.request_flushed_at_ms IS NOT NULL)",
         )
         .run(now, now);
       this.store.db

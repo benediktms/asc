@@ -296,10 +296,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (!fence.valid) return { outcome: "rejected", reason: "stale-binding", retryable: false };
     try {
       if (request.mode === "append_context") {
-        await this.requireClient().injectItems({
-          threadId: request.target.session.opaqueId,
-          items: [jsonValue(JSON.stringify(this.responseItem(request.envelope)))],
-        });
+        await this.requireClient().injectItems(
+          {
+            threadId: request.target.session.opaqueId,
+            items: [jsonValue(JSON.stringify(this.responseItem(request.envelope)))],
+          },
+          request.markRequestFlushed,
+        );
         return {
           outcome: "accepted",
           acceptedAt: new Date().toISOString(),
@@ -307,16 +310,19 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
       await this.requireClient().resumeThread(request.target.session.opaqueId);
-      const response = await this.requireClient().startTurn({
-        threadId: request.target.session.opaqueId,
-        input: [],
-        turnTrigger: "agent-communications-service",
-        toolOutput: {
-          name: "receive_agent_message",
-          namespace: "acs",
-          output: JSON.stringify(request.envelope),
+      const response = await this.requireClient().startTurn(
+        {
+          threadId: request.target.session.opaqueId,
+          input: [],
+          turnTrigger: "agent-communications-service",
+          toolOutput: {
+            name: "receive_agent_message",
+            namespace: "acs",
+            output: JSON.stringify(request.envelope),
+          },
         },
-      });
+        request.markRequestFlushed,
+      );
       this.executions.set(response.turn.id, {
         deliveryId: request.deliveryId,
         payloadHash: request.payloadHash,

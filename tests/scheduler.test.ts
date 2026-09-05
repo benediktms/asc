@@ -119,6 +119,76 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("redelivers only attempts that expired before the runtime write", async () => {
+    const store = fixture(),
+      agent = store.createAgent("write-boundary-worker"),
+      principal = authenticated(store),
+      binding = store.bind(agent.id, "write-boundary-thread"),
+      unflushed = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({ messageId: "unflushed", role: "ROLE_USER", parts: [{ text: "one" }] }),
+        { mode: "append_context" },
+      ),
+      flushed = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({ messageId: "flushed", role: "ROLE_USER", parts: [{ text: "two" }] }),
+        { mode: "append_context" },
+      ),
+      expired = Date.now() - 1;
+    store.db
+      .query(
+        "UPDATE delivery_intents SET state='attempting',attempt_count=1,pinned_binding_id=?,pinned_binding_epoch=?,lease_owner='dead-process',lease_expires_at_ms=? WHERE id IN (?,?)",
+      )
+      .run(binding.id, binding.epoch, expired, unflushed.deliveryId, flushed.deliveryId);
+    const insertAttempt = store.db.query(
+      "INSERT INTO delivery_attempts(id,intent_id,attempt_number,adapter_id,binding_id,binding_epoch,started_at_ms,request_flushed_at_ms) VALUES(?,?,1,'codex.app-server',?,?,?,?)",
+    );
+    insertAttempt.run(
+      "atm_unflushed",
+      unflushed.deliveryId,
+      binding.id,
+      binding.epoch,
+      expired,
+      null,
+    );
+    insertAttempt.run(
+      "atm_flushed",
+      flushed.deliveryId,
+      binding.id,
+      binding.epoch,
+      expired,
+      expired,
+    );
+
+    const deliveries: string[] = [],
+      adapter = new FakeRuntimeAdapter();
+    adapter.deliver = async (request) => {
+      deliveries.push(request.deliveryId);
+      request.markRequestFlushed?.();
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        evidence: { scheme: "fake", value: "recovered" },
+      };
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "replacement");
+    await scheduler.start();
+    await Bun.sleep(400);
+    expect(deliveries).toEqual([unflushed.deliveryId]);
+    expect(deliveryState(store, unflushed.deliveryId)?.state).toBe("accepted");
+    expect(deliveryState(store, flushed.deliveryId)?.state).toBe("acceptance-unknown");
+    expect(
+      store.db
+        .query<{ request_flushed_at_ms: number | null }, [string, number]>(
+          "SELECT request_flushed_at_ms FROM delivery_attempts WHERE intent_id=? AND attempt_number=?",
+        )
+        .get(unflushed.deliveryId, 2)?.request_flushed_at_ms,
+    ).toBeNumber();
+    await scheduler.stop();
+    store.close();
+  });
   test("renews the attempt lease during a runtime call", async () => {
     const store = fixture(),
       agent = store.createAgent("lease-renewal"),

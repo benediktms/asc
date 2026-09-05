@@ -42,27 +42,34 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         state: "online",
       });
 
+      let flushes = 0;
+      const markRequestFlushed = () => flushes++;
       fixture.setFence(false);
-      expect(await adapter.deliver(delivery())).toMatchObject({
+      expect(await adapter.deliver({ ...delivery(), markRequestFlushed })).toMatchObject({
         outcome: "rejected",
         reason: "stale-binding",
       });
+      expect(flushes).toBe(0);
       expect(mutations(methods)).toEqual([]);
 
       fixture.setFence(true);
-      const accepted = await adapter.deliver(delivery());
+      const accepted = await adapter.deliver({ ...delivery(), markRequestFlushed });
       expect(accepted).toEqual({
         outcome: "accepted",
         acceptedAt: expect.any(String),
         evidence: { scheme: "codex.thread-inject-items.v1", value: "int_conformance" },
       });
+      expect(flushes).toBe(1);
       expect(mutations(methods)).toEqual(["thread/inject_items"]);
 
       fixture.setStatus("active");
-      expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
+      expect(
+        await adapter.deliver({ ...delivery("wake_when_idle"), markRequestFlushed }),
+      ).toMatchObject({
         outcome: "deferred",
         reason: "busy",
       });
+      expect(flushes).toBe(1);
       expect(mutations(methods)).toEqual(["thread/inject_items"]);
 
       fixture.setStatus("future-status");
