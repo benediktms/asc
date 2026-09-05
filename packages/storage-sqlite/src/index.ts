@@ -1155,38 +1155,52 @@ export class Store {
             "UPDATE a2a_tasks SET state=?,state_version=state_version+1,a2a_snapshot_json=?,updated_at_ms=? WHERE id=?",
           )
           .run(state, JSON.stringify(task), now, taskId);
-      this.db
-        .query(
-          "INSERT INTO a2a_messages(id,external_message_id,task_id,context_id,sender_principal_id,sender_agent_id,target_agent_id,role,parts_json,metadata_json,canonical_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .run(
-          messageRowId,
-          message.messageId,
-          taskId,
-          contextId,
-          principalId,
-          requester.agent_id,
-          agentId,
-          message.role === a2aAgentRole ? "agent" : "user",
-          JSON.stringify(message.parts),
-          JSON.stringify(message.metadata ?? {}),
-          requestHash,
-          now,
+      try {
+        this.db
+          .query(
+            "INSERT INTO a2a_messages(id,external_message_id,task_id,context_id,sender_principal_id,sender_agent_id,target_agent_id,role,parts_json,metadata_json,canonical_hash,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+          )
+          .run(
+            messageRowId,
+            message.messageId,
+            taskId,
+            contextId,
+            principalId,
+            requester.agent_id,
+            agentId,
+            message.role === a2aAgentRole ? "agent" : "user",
+            JSON.stringify(message.parts),
+            JSON.stringify(message.metadata ?? {}),
+            requestHash,
+            now,
+          );
+      } catch (error) {
+        throw new Error(
+          `ACCEPT_MESSAGE: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
+      }
       const sequence = continuation?.next_event_sequence ?? 1;
-      this.db
-        .query(
-          "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
-        )
-        .run(
-          id("evt"),
-          taskId,
-          sequence,
-          continuation ? "message-received" : "task-created",
-          principalId,
-          JSON.stringify({ messageId: message.messageId, snapshot: task }),
-          now,
+      try {
+        this.db
+          .query(
+            "INSERT INTO task_events(id,task_id,sequence,event_type,actor_principal_id,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
+          )
+          .run(
+            id("evt"),
+            taskId,
+            sequence,
+            continuation ? "message-received" : "task-created",
+            principalId,
+            JSON.stringify({ messageId: message.messageId, snapshot: task }),
+            now,
+          );
+      } catch (error) {
+        throw new Error(
+          `ACCEPT_TASK_EVENT: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
+      }
       this.db
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
