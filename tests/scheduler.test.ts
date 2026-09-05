@@ -31,10 +31,22 @@ describe("delivery scheduler", () => {
   });
   test("starts degraded and reconnects when the runtime appears", async () => {
     const store = fixture();
+    const agent = store.createAgent("reconnected-session");
+    store.bind(agent.id, "reconnected-thread");
     let starts = 0;
-    const adapter = new FakeRuntimeAdapter();
+    const inspected: string[] = [],
+      adapter = new FakeRuntimeAdapter();
     adapter.start = async () => {
       if (++starts === 1) throw new Error("offline");
+    };
+    adapter.inspectSession = async (session) => {
+      inspected.push(session.opaqueId);
+      return {
+        session,
+        availability: "idle",
+        observedAt: new Date().toISOString(),
+        attributes: {},
+      };
     };
     const scheduler = new DeliveryScheduler(store, adapter, "reconnect", {
       concurrency: 1,
@@ -49,6 +61,14 @@ describe("delivery scheduler", () => {
     expect(
       store.db.query<{ state: string }, []>("SELECT state FROM runtime_installations").get()?.state,
     ).toBe("online");
+    expect(inspected).toEqual(["reconnected-thread"]);
+    expect(
+      store.db
+        .query<{ availability: string | null }, []>(
+          "SELECT last_observed_availability availability FROM runtime_bindings WHERE status='active'",
+        )
+        .get()?.availability,
+    ).toBe("idle");
     await scheduler.stop();
     store.close();
   });

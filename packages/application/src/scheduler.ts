@@ -214,12 +214,28 @@ export class DeliveryScheduler {
         required(this.context, "adapter context").installationId,
         await this.adapter.probe(),
       );
+      await this.reconcileBoundSessions();
       this.connected = true;
       this.reconnectAttempts = 0;
       this.observeTask = this.observe();
     } catch {
       this.store.markRuntimeOffline(required(this.context, "adapter context").installationId);
       this.scheduleReconnect();
+    }
+  }
+  private async reconcileBoundSessions() {
+    const installationId = required(this.context, "adapter context").installationId,
+      sessions = this.store.db
+        .query<{ session_opaque_id: string }, [RuntimeInstallationId]>(
+          "SELECT session_opaque_id FROM runtime_bindings WHERE installation_id=? AND status='active'",
+        )
+        .all(installationId);
+    for (const row of sessions) {
+      const snapshot = await this.adapter.inspectSession({
+        installationId,
+        opaqueId: row.session_opaque_id,
+      });
+      this.store.observeSession(snapshot.session, snapshot.availability);
     }
   }
   private scheduleReconnect() {
