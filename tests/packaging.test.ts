@@ -1,16 +1,27 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const roots: string[] = [],
-  processes: Bun.Subprocess[] = [];
+  processes: Bun.Subprocess[] = [],
+  servers: ReturnType<typeof Bun.listen>[] = [];
 
 afterEach(async () => {
   for (const process of processes.splice(0)) {
     process.kill("SIGTERM");
     await process.exited;
   }
+  for (const server of servers.splice(0)) server.stop(true);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true });
 });
 
@@ -31,14 +42,23 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   const reservation = Bun.serve({ port: 0, fetch: () => new Response() }),
     port = required(reservation.port, "reserved port");
   reservation.stop(true);
+  const codexSocket = join(root, "codex.sock"),
+    codexServer = fakeCodex(codexSocket),
+    bin = join(root, "bin"),
+    codex = join(bin, "codex");
+  servers.push(codexServer);
+  mkdirSync(bin);
+  writeFileSync(codex, "#!/bin/sh\nprintf 'codex-cli 0.153.2\\n'\n");
+  chmodSync(codex, 0o700);
   const env = {
     ...process.env,
     ACS_HOME: root,
     ACS_A2A_PORT: String(port),
     ACS_CONTROL_SOCKET: join(root, "control.sock"),
     ACS_STORAGE_PATH: join(root, "acs.db"),
-    ACS_CODEX_SOCKET: join(root, "missing-codex.sock"),
-    PATH: "/usr/bin:/bin",
+    ACS_CODEX_SOCKET: codexSocket,
+    ACS_CODEX_BINARY: codex,
+    PATH: `${bin}:/usr/bin:/bin`,
   };
   expect(Bun.spawnSync([binary, "init"], { env }).exitCode).toBe(0);
 
@@ -110,7 +130,98 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   );
   const initialized = await readUntil(mcp.stdout, '"id":1');
   expect(initialized).toContain('"serverInfo"');
+
+  const doctor = Bun.spawn([binary, "codex", "doctor"], {
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    }),
+    diagnosis = record(JSON.parse(await new Response(doctor.stdout).text()));
+  expect(await doctor.exited).toBe(0);
+  expect(record(diagnosis.phaseZero).sharedAppServer).toBe("ready (0 thread sampled)");
+  expect(diagnosis.codex).toMatchObject({
+    installed: "codex-cli 0.153.2",
+    runningVersion: "0.153.2",
+    compatibility: "tested",
+  });
+
+  daemon.kill("SIGTERM");
+  expect(await daemon.exited).toBe(0);
+  processes.splice(processes.indexOf(daemon), 1);
 }, 30_000);
+
+function fakeCodex(path: string) {
+  const buffers = new WeakMap<object, Buffer>();
+  return Bun.listen({
+    unix: path,
+    socket: {
+      open() {},
+      data(socket, data) {
+        const bytes = Buffer.from(data),
+          text = bytes.toString();
+        if (text.startsWith("GET ")) {
+          const key = text.match(/Sec-WebSocket-Key: (.+)\r/i)?.at(1);
+          if (!key) throw new Error("missing WebSocket key");
+          const accept = createHash("sha1")
+            .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+            .digest("base64");
+          socket.write(
+            `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+          );
+          return;
+        }
+        let pending = Buffer.concat([buffers.get(socket) ?? Buffer.alloc(0), bytes]);
+        for (;;) {
+          const frame = clientFrame(pending);
+          if (!frame) break;
+          pending = pending.subarray(frame.consumed);
+          if (!frame.text) continue;
+          const request = record(JSON.parse(frame.text));
+          if (typeof request.id !== "number") continue;
+          socket.write(
+            serverFrame(
+              JSON.stringify({
+                id: request.id,
+                result:
+                  request.method === "initialize"
+                    ? { userAgent: "codex-cli 0.153.2" }
+                    : { data: [], nextCursor: null },
+              }),
+            ),
+          );
+        }
+        buffers.set(socket, pending);
+      },
+      close() {},
+      error() {},
+    },
+  });
+}
+
+function clientFrame(frame: Buffer) {
+  if (frame.length < 6) return undefined;
+  const lengthCode = byte(frame, 1) & 0x7f,
+    offset = lengthCode === 126 ? 4 : 2,
+    length = lengthCode === 126 ? frame.readUInt16BE(2) : lengthCode,
+    mask = frame.subarray(offset, offset + 4),
+    payload = frame.subarray(offset + 4, offset + 4 + length);
+  if (payload.length < length) return undefined;
+  return {
+    text: Buffer.from(payload.map((value, index) => value ^ byte(mask, index % 4))).toString(),
+    consumed: offset + 4 + length,
+  };
+}
+
+function serverFrame(text: string) {
+  const body = Buffer.from(text);
+  return Buffer.concat([Buffer.from([0x81, body.length]), body]);
+}
+
+function byte(buffer: Uint8Array, index: number) {
+  const value = buffer.at(index);
+  if (value === undefined) throw new Error("invalid WebSocket frame");
+  return value;
+}
 
 async function rpc(port: number, agent: string, token: string, method: string, params: unknown) {
   const response = await fetch(`http://127.0.0.1:${port}/agents/${agent}/a2a`, {
