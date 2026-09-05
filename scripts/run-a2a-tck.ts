@@ -44,7 +44,7 @@ try {
     token = tokenStore.createToken().token;
   tokenStore.close();
   emulator = startCodexEmulator(codexSocket);
-  daemon = Bun.spawn([binary, "daemon", "start"], { env, stdout: "ignore", stderr: "pipe" });
+  daemon = Bun.spawn([binary, "daemon", "run"], { env, stdout: "ignore", stderr: "pipe" });
   await waitFor(() => existsSync(env.ACS_CONTROL_SOCKET));
   run([binary, "agents", "create", "tck-agent"], undefined, env);
   await runAsync(
