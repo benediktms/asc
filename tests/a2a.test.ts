@@ -187,7 +187,8 @@ describe("A2A JSON-RPC", () => {
       const state = streamState(taskId, principalId, targetAgentId);
       if (state && !advancedDuringSubscription) {
         advancedDuringSubscription = true;
-        store.setTaskState(taskId, binding.principalId, TaskState.Canceled);
+        store.setTaskState(taskId, binding.principalId, TaskState.Working);
+        store.setTaskState(taskId, binding.principalId, TaskState.Completed);
       }
       return state;
     };
@@ -209,10 +210,15 @@ describe("A2A JSON-RPC", () => {
     if (initial.done || initial.value.payload?.$case !== "task")
       throw new Error("SDK stream did not return an initial task");
     const streamedTaskId = initial.value.payload.value.id;
-    const terminal = await streamed.next();
-    expect(terminal.value?.payload).toMatchObject({
+    const working = await streamed.next();
+    expect(working.value?.payload).toMatchObject({
       $case: "statusUpdate",
-      value: { taskId: streamedTaskId, status: { state: 5 } },
+      value: { taskId: streamedTaskId, status: { state: 2 } },
+    });
+    const completed = await streamed.next();
+    expect(completed.value?.payload).toMatchObject({
+      $case: "statusUpdate",
+      value: { taskId: streamedTaskId, status: { state: 3 } },
     });
     expect((await streamed.next()).done).toBe(true);
 

@@ -161,7 +161,7 @@ class Handler implements A2ARequestHandler {
       principal = principalName(context),
       state = this.streamState(accepted.id, principal);
     yield { payload: { $case: "task", value: state.task } };
-    yield* this.updates(state.task, principal, state.sequence);
+    yield* this.updates(state.task, state.sequence);
   }
   async getTask(params: GetTaskRequest, context: ServerCallContext) {
     const task = this.store.task(params.id, principalName(context), this.agent.id);
@@ -205,7 +205,7 @@ class Handler implements A2ARequestHandler {
     const principal = principalName(context),
       state = this.streamState(params.id, principal);
     yield { payload: { $case: "task", value: state.task } };
-    yield* this.updates(state.task, principal, state.sequence);
+    yield* this.updates(state.task, state.sequence);
   }
   async createTaskPushNotificationConfig(
     _params: TaskPushNotificationConfig,
@@ -229,19 +229,13 @@ class Handler implements A2ARequestHandler {
     if (!state) throw new JsonRpcTaskNotFoundError();
     return { task: asTask(state.task), sequence: state.sequence };
   }
-  private async *updates(
-    task: Task,
-    principalId: string,
-    sequence: number,
-  ): AsyncGenerator<StreamResponse> {
+  private async *updates(task: Task, sequence: number): AsyncGenerator<StreamResponse> {
     while (!terminal(task.status?.state)) {
       await new Promise((resolve) => setTimeout(resolve, 250));
       const events = this.store.eventsAfter(task.id, sequence);
       for (const event of events) {
         sequence = event.sequence;
-        const current = this.store.task(task.id, principalId);
-        if (!current) return;
-        task = asTask(current);
+        task = asTask(event.task);
         yield {
           payload: {
             $case: "statusUpdate",

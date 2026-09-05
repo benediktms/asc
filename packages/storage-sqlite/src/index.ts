@@ -806,7 +806,13 @@ export class Store {
       .query<{ sequence: number; event_type: string; payload_json: string }, [string, number]>(
         "SELECT sequence,event_type,payload_json FROM task_events WHERE task_id=? AND sequence>? ORDER BY sequence",
       )
-      .all(taskId, sequence);
+      .all(taskId, sequence)
+      .map((row) => {
+        const payload: unknown = JSON.parse(row.payload_json),
+          snapshot = isRecord(payload) ? storedTaskSchema.safeParse(payload.snapshot) : undefined;
+        if (!snapshot?.success) throw new Error("STORAGE_CORRUPT: invalid task event snapshot");
+        return { sequence: row.sequence, eventType: row.event_type, task: snapshot.data };
+      });
   }
   verifyTaskProjections(repair = false) {
     const rows = this.db
