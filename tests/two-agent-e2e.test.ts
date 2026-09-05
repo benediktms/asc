@@ -35,7 +35,7 @@ test("two Codex agents complete the canonical task workflow across every public 
       "thread-backend-rebound",
     ]);
   servers.push(emulator.server);
-  const env = environment(root, socket, port);
+  const env = { ...environment(root, socket, port), ACS_TEST_DIAGNOSTIC_ERRORS: "1" };
   writeFileSync(join(root, "config.toml"), config(port));
   runCommand(env, "init");
   let daemon = await startDaemon(env),

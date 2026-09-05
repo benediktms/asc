@@ -386,7 +386,10 @@ function applicationError(error: unknown) {
       : raw === "VALIDATION_FAILED"
         ? "ACS_VALIDATION_FAILED"
         : "ACS_STORAGE_UNAVAILABLE";
-  const publicMessage = code === "ACS_STORAGE_UNAVAILABLE" ? code : message;
+  const publicMessage =
+    code === "ACS_STORAGE_UNAVAILABLE" && process.env.ACS_TEST_DIAGNOSTIC_ERRORS !== "1"
+      ? code
+      : message;
   return new JsonRpcTransportError({
     jsonrpc: "2.0",
     id: null,
