@@ -46,6 +46,9 @@ describe("delivery scheduler", () => {
     await scheduler.start();
     await Bun.sleep(300);
     expect(starts).toBe(2);
+    expect(
+      store.db.query<{ state: string }, []>("SELECT state FROM runtime_installations").get()?.state,
+    ).toBe("online");
     await scheduler.stop();
     store.close();
   });

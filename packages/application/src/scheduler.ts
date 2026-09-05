@@ -210,10 +210,15 @@ export class DeliveryScheduler {
   private async connect() {
     try {
       await this.adapter.start(required(this.context, "adapter context"));
+      this.store.observeRuntime(
+        required(this.context, "adapter context").installationId,
+        await this.adapter.probe(),
+      );
       this.connected = true;
       this.reconnectAttempts = 0;
       this.observeTask = this.observe();
     } catch {
+      this.store.markRuntimeOffline(required(this.context, "adapter context").installationId);
       this.scheduleReconnect();
     }
   }
@@ -554,6 +559,7 @@ export class DeliveryScheduler {
     for await (const event of this.adapter.observe(this.abort.signal)) {
       if (event.type === "adapter.connection" && event.state === "offline") {
         this.connected = false;
+        this.store.markRuntimeOffline(required(this.context, "adapter context").installationId);
         this.scheduleReconnect();
         return;
       }

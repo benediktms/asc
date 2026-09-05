@@ -10,6 +10,7 @@ import type {
   JsonValue,
   RuntimeAvailability,
   RuntimeInstallationId,
+  RuntimeProbeResult,
   RuntimeSessionRef,
 } from "../../../contracts/runtime-adapter";
 import { loadConfig } from "../../config/src/index";
@@ -627,6 +628,27 @@ export class Store {
         "UPDATE runtime_bindings SET last_observed_availability=?,last_observed_at_ms=? WHERE installation_id=? AND session_opaque_id=? AND status='active'",
       )
       .run(availability, now, session.installationId, session.opaqueId);
+  }
+  observeRuntime(installationId: RuntimeInstallationId, probe: RuntimeProbeResult) {
+    const state = probe.state === "ready" ? "online" : probe.state;
+    this.db
+      .query(
+        "UPDATE runtime_installations SET state=?,capabilities_json=?,protocol_fingerprint=?,last_seen_at_ms=?,updated_at_ms=? WHERE id=?",
+      )
+      .run(
+        state,
+        JSON.stringify(probe.capabilities),
+        probe.protocolFingerprint ?? null,
+        Date.parse(probe.observedAt),
+        Date.now(),
+        installationId,
+      );
+  }
+  markRuntimeOffline(installationId: RuntimeInstallationId) {
+    const now = Date.now();
+    this.db
+      .query("UPDATE runtime_installations SET state='offline',updated_at_ms=? WHERE id=?")
+      .run(now, installationId);
   }
   revokeBinding(bindingId: string, reason = "revoked") {
     const binding = this.binding(bindingId);

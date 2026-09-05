@@ -75,6 +75,12 @@ describe("control protocol", () => {
     expect(await (await call("agents.get", { agent: "backend" })).json()).toMatchObject({
       result: { agent: { availability: "idle" } },
     });
+    expect(await (await call("runtimes.probe", {})).json()).toMatchObject({
+      result: { probe: { state: "ready" } },
+    });
+    expect(await (await call("runtimes.list", {})).json()).toMatchObject({
+      result: { runtimes: [{ state: "online" }] },
+    });
     expect(
       await (
         await call("bindings.bind", {

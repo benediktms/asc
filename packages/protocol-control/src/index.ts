@@ -379,13 +379,24 @@ export function controlHandler(
           return ok(rpc.id, {
             runtimes: store.db
               .query(
-                "SELECT id installationId,harness_id harnessId,adapter_id adapterId,label FROM runtime_installations",
+                "SELECT id installationId,harness_id harnessId,adapter_id adapterId,label,state,capabilities_json capabilitiesJson,protocol_fingerprint protocolFingerprint,last_seen_at_ms lastSeenAtMs FROM runtime_installations",
               )
               .all(),
           });
-        case "runtimes.probe":
+        case "runtimes.probe": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
-          return ok(rpc.id, { probe: await adapter.probe() });
+          const probe = await adapter.probe(),
+            installation = required(
+              store.db
+                .query<{ id: RuntimeInstallationId }, []>(
+                  "SELECT id FROM runtime_installations WHERE harness_id='codex' LIMIT 1",
+                )
+                .get(),
+              "runtime installation",
+            );
+          store.observeRuntime(installation.id, probe);
+          return ok(rpc.id, { probe });
+        }
         case "runtimes.sessions.list": {
           if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
           const page = await adapter.listSessions({ limit: 100 });
