@@ -312,6 +312,14 @@ export interface ControlStoragePort extends SqlPort {
 
 export interface DeliveryStoragePort extends SqlPort {
   write<Result>(operation: () => Result): Result;
+  audit(
+    actorPrincipalId: string | null,
+    action: string,
+    resourceType: string,
+    resourceId?: string,
+    details?: Record<string, unknown>,
+    correlationId?: string,
+  ): void;
   agent(value: string): AgentRow | null;
   observeRuntime(installationId: RuntimeInstallationId, probe: RuntimeProbeResult): void;
   markRuntimeOffline(installationId: RuntimeInstallationId): void;

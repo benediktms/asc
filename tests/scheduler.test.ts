@@ -267,6 +267,53 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
+  test("audits each explicitly enabled non-atomic wake attempt", async () => {
+    const store = fixture(),
+      agent = store.createAgent("non-atomic-wake"),
+      principal = authenticated(store);
+    store.bind(agent.id, "thread-non-atomic-wake", {
+      deliveryPolicy: { wakeStrategy: "non-atomic-idle-check" },
+    });
+    const accepted = store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "non-atomic-wake",
+          role: "ROLE_USER",
+          parts: [{ text: "work" }],
+        }),
+        { mode: "wake_when_idle" },
+      ),
+      adapter = new FakeRuntimeAdapter();
+    adapter.probe = async () => ({
+      state: "ready",
+      observedAt: new Date().toISOString(),
+      capabilities: { ...adapter.descriptor.capabilities, atomicDeferredWake: false },
+      diagnostics: [],
+    });
+    adapter.deliver = async () => ({
+      outcome: "accepted",
+      acceptedAt: new Date().toISOString(),
+      evidence: { scheme: "fake", value: "non-atomic-wake" },
+    });
+    const scheduler = new DeliveryScheduler(store, adapter, "non-atomic-wake");
+    await scheduler.start();
+    await Bun.sleep(350);
+    const audit = store.db
+      .query<{ details_json: string }, []>(
+        "SELECT details_json FROM audit_events WHERE action='delivery.non-atomic-wake-attempt'",
+      )
+      .get();
+    expect(audit && JSON.parse(audit.details_json)).toMatchObject({
+      bindingEpoch: 1,
+      wakeStrategy: "non-atomic-idle-check",
+      runtimeAtomicDeferredWake: false,
+      residualRisk: "inspect-start-race",
+    });
+    expect(deliveryState(store, accepted.deliveryId)?.state).toBe("accepted");
+    await scheduler.stop();
+    store.close();
+  });
   test("does not let one busy lane hide another target", async () => {
     const store = fixture(),
       principal = authenticated(store),

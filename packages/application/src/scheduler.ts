@@ -458,6 +458,18 @@ export class DeliveryScheduler {
       return true;
     });
     if (!startedAttempt) return;
+    if (
+      intent.mode === "wake_when_idle" &&
+      policy.wakeStrategy === "non-atomic-idle-check" &&
+      !this.capabilities.atomicDeferredWake
+    )
+      this.store.audit(null, "delivery.non-atomic-wake-attempt", "delivery", intent.id, {
+        bindingId: binding.id,
+        bindingEpoch: binding.epoch,
+        wakeStrategy: policy.wakeStrategy,
+        runtimeAtomicDeferredWake: this.capabilities.atomicDeferredWake,
+        residualRisk: "inspect-start-race",
+      });
     const payload: DeliveryPayload = JSON.parse(intent.payload_json),
       parties = required(
         this.store

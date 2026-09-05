@@ -33,7 +33,7 @@ type Fixture = {
   adapter: RuntimeAdapter;
   context: RuntimeAdapterContext;
   methods: string[];
-  failNext(method: string, failure: "overload" | "disconnect" | "hang"): void;
+  failNext(method: string, failure: "overload" | "busy" | "disconnect" | "hang"): void;
   disconnect(): void;
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
@@ -290,6 +290,22 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       fixture.close();
     });
 
+    test("defers when a foreign turn wins the idle inspection race", async () => {
+      const fixture = await create(),
+        { adapter, context, methods } = fixture;
+      await adapter.start(context);
+      fixture.setStatus("idle");
+      fixture.failNext("turn/start", "busy");
+      expect(await adapter.deliver(delivery("wake_when_idle"))).toEqual({
+        outcome: "deferred",
+        reason: "busy",
+        retryAfterMs: 1000,
+      });
+      expect(methods.slice(-3)).toEqual(["thread/read", "thread/resume", "turn/start"]);
+      await adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
     test("resumes a dormant thread only when policy permits", async () => {
       const fixture = await create(),
         { adapter, context, methods } = fixture;
@@ -466,7 +482,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
   const path = join(root, "codex.sock"),
     methods: string[] = [],
     buffers = new WeakMap<object, Buffer>(),
-    failures = new Map<string, "overload" | "disconnect" | "hang">();
+    failures = new Map<string, "overload" | "busy" | "disconnect" | "hang">();
   let fence = true,
     historyDelivery: string | undefined,
     loadedOnly = false,
@@ -516,12 +532,15 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
             socket.end();
             return;
           }
-          if (typeof request.id === "number" && failure === "overload")
+          if (typeof request.id === "number" && (failure === "overload" || failure === "busy"))
             socket.write(
               serverFrame(
                 JSON.stringify({
                   id: request.id,
-                  error: { code: -32000, message: "ingress overloaded" },
+                  error: {
+                    code: -32000,
+                    message: failure === "busy" ? "turn is already running" : "ingress overloaded",
+                  },
                 }),
               ),
             );

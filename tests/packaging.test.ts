@@ -314,6 +314,12 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     runningVersion: "0.153.2",
     compatibility: "tested",
   });
+  expect(diagnosis.wakePolicy).toEqual({
+    configuredDefaultForNewBindings: "atomic-only",
+    runtimeAtomicDeferredWake: false,
+    effectivePolicySource: "binding.deliveryPolicy.wakeStrategy",
+    nonAtomicAttemptAuditAction: "delivery.non-atomic-wake-attempt",
+  });
 
   const streamingTask = record(
       record(

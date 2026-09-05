@@ -127,6 +127,7 @@ export interface DeliveryDto {
   readonly kind: "a2a-message" | "task-event-notification";
   readonly taskId?: string;
   readonly targetAgentId: string;
+  readonly mode: "wake_when_idle" | "append_context" | "join_active";
   readonly state:
     | "pending"
     | "leased"
@@ -142,6 +143,12 @@ export interface DeliveryDto {
   readonly bindingId?: string;
   readonly bindingEpoch?: number;
   readonly runtimeExecutionId?: string;
+  readonly effectiveWakePolicy?: {
+    readonly wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
+    readonly bindingId: string;
+    readonly bindingEpoch: number;
+    readonly source: "pinned-binding" | "current-active-binding";
+  };
   readonly createdAt: string;
   readonly updatedAt: string;
 }

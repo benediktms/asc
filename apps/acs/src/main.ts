@@ -356,7 +356,9 @@ async function doctor() {
   const installedCodex = codex.success ? codex.stdout.toString().trim() : undefined,
     call = (method: string, params: unknown = {}) =>
       controlCall(config.runtime, config.token, method, params);
-  let sharedAppServer: string, runningCodexVersion: string | undefined;
+  let sharedAppServer: string,
+    runningCodexVersion: string | undefined,
+    runtimeAtomicDeferredWake = false;
   try {
     await call("system.initialize", {
       protocolVersion: "1.0",
@@ -369,6 +371,8 @@ async function doctor() {
       sessions = sessionsResult.sessions;
     runningCodexVersion =
       typeof probe.runtimeVersion === "string" ? probe.runtimeVersion : undefined;
+    const capabilities = recordValue(probe.capabilities);
+    runtimeAtomicDeferredWake = capabilities.atomicDeferredWake === true;
     sharedAppServer = `ready (${Array.isArray(sessions) ? sessions.length : 0} thread sampled)`;
   } catch (error) {
     sharedAppServer = `unavailable (${error instanceof Error ? error.message : String(error)})`;
@@ -393,6 +397,14 @@ async function doctor() {
       deliveryReconciliation: "durable wake marker proven; absence remains operator-owned",
       approvalOwnership:
         "verified: user approvals remain TUI-owned; ACS never answers local-input requests",
+    },
+    wakePolicy: {
+      configuredDefaultForNewBindings: settings.codex.allowNonAtomicWake
+        ? "non-atomic-idle-check"
+        : "atomic-only",
+      runtimeAtomicDeferredWake,
+      effectivePolicySource: "binding.deliveryPolicy.wakeStrategy",
+      nonAtomicAttemptAuditAction: "delivery.non-atomic-wake-attempt",
     },
     mutatingDeliveryEnabled: Boolean(
       runningCodexVersion &&

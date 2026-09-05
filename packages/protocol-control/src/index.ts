@@ -365,6 +365,7 @@ export function controlHandler(
           });
           store.observeSession(bindSnapshot.session, bindSnapshot.availability);
           audit("binding.bind", "binding", createdBinding.id);
+          auditNonAtomicWake(audit, createdBinding, store);
           if (createdBinding.rebound)
             audit("binding.rebind", "binding", createdBinding.id, {
               epoch: createdBinding.epoch,
@@ -394,6 +395,7 @@ export function controlHandler(
             audit("binding.claim.consume", "binding", binding.id, {
               idempotent: binding.idempotent,
             });
+            if (!binding.idempotent) auditNonAtomicWake(audit, binding, store);
             if (binding.rebound)
               audit("binding.rebind", "binding", binding.id, { epoch: binding.epoch });
             const agent = store.agent(binding.agentId);
@@ -728,7 +730,7 @@ export function controlHandler(
               "descending",
             );
           return ok(rpc.id, {
-            items: page.items.map(deliveryDto),
+            items: page.items.map((item) => deliveryDto(item, store)),
             nextCursor: page.nextCursor,
           });
         }
@@ -737,20 +739,20 @@ export function controlHandler(
             .query<DeliveryIntentRow, [string]>("SELECT * FROM delivery_intents WHERE id=?")
             .get(required(p.deliveryId, "deliveryId"));
           if (!item) throw new Error("DELIVERY_NOT_FOUND");
-          return ok(rpc.id, { delivery: deliveryDto(item) });
+          return ok(rpc.id, { delivery: deliveryDto(item, store) });
         }
         case "deliveries.retry":
           admin(principal.kind);
           const retryDeliveryId = required(p.deliveryId, "deliveryId"),
             retried = store.retryDelivery(retryDeliveryId);
           audit("delivery.retry", "delivery", retryDeliveryId);
-          return ok(rpc.id, { delivery: deliveryDto(required(retried, "delivery")) });
+          return ok(rpc.id, { delivery: deliveryDto(required(retried, "delivery"), store) });
         case "deliveries.cancel":
           admin(principal.kind);
           const cancelDeliveryId = required(p.deliveryId, "deliveryId"),
             canceled = store.cancelDelivery(cancelDeliveryId, p.reason);
           audit("delivery.cancel", "delivery", cancelDeliveryId);
-          return ok(rpc.id, { delivery: deliveryDto(required(canceled, "delivery")) });
+          return ok(rpc.id, { delivery: deliveryDto(required(canceled, "delivery"), store) });
         case "deliveries.resolveUnknown":
           admin(principal.kind);
           const resolveDeliveryId = required(p.deliveryId, "deliveryId"),
@@ -760,7 +762,7 @@ export function controlHandler(
             resolution,
             evidence: typeof p.evidence === "string" ? p.evidence : undefined,
           });
-          return ok(rpc.id, { delivery: deliveryDto(required(resolved, "delivery")) });
+          return ok(rpc.id, { delivery: deliveryDto(required(resolved, "delivery"), store) });
         default:
           throw new Error("METHOD_NOT_FOUND");
       }
@@ -1014,21 +1016,44 @@ function taskDto(store: ControlStoragePort, taskId: string): TaskDto {
     updatedAt: new Date(row.updated_at_ms).toISOString(),
   };
 }
-function deliveryDto(delivery: DeliveryIntentRow): DeliveryDto {
+function deliveryDto(delivery: DeliveryIntentRow, store: ControlStoragePort): DeliveryDto {
+  const binding = delivery.pinned_binding_id
+      ? store.binding(delivery.pinned_binding_id)
+      : store
+          .query<BindingRow, [`agt_${string}`]>(
+            "SELECT * FROM runtime_bindings WHERE agent_id=? AND status='active'",
+          )
+          .get(delivery.target_agent_id),
+    policy = binding ? jsonRecord(binding.delivery_policy_json) : undefined;
   return {
     id: delivery.id,
     kind: delivery.kind,
     taskId: delivery.task_id,
     targetAgentId: delivery.target_agent_id,
+    mode: delivery.mode,
     state: delivery.state,
     reason: delivery.state_reason ?? undefined,
     attemptCount: delivery.attempt_count,
     bindingId: delivery.pinned_binding_id ?? undefined,
     bindingEpoch: delivery.pinned_binding_epoch ?? undefined,
     runtimeExecutionId: delivery.runtime_execution_id ?? undefined,
+    effectiveWakePolicy:
+      delivery.mode === "wake_when_idle" && binding && policy
+        ? {
+            wakeStrategy: wakeStrategy(policy.wakeStrategy),
+            bindingId: binding.id,
+            bindingEpoch: binding.epoch,
+            source: delivery.pinned_binding_id ? "pinned-binding" : "current-active-binding",
+          }
+        : undefined,
     createdAt: new Date(delivery.created_at_ms).toISOString(),
     updatedAt: new Date(delivery.updated_at_ms).toISOString(),
   };
+}
+function wakeStrategy(value: unknown): "atomic-only" | "non-atomic-idle-check" | "disabled" {
+  if (value === "atomic-only" || value === "non-atomic-idle-check" || value === "disabled")
+    return value;
+  throw new Error("STORAGE_CORRUPT: invalid wake strategy");
 }
 function bindingDto(
   binding: BindingRow | { id: string; agentId: string; sessionId: string; epoch: number },
@@ -1049,6 +1074,24 @@ function bindingDto(
     activatedAt: row.activated_at_ms ? new Date(row.activated_at_ms).toISOString() : undefined,
     revokedAt: row.revoked_at_ms ? new Date(row.revoked_at_ms).toISOString() : undefined,
   };
+}
+function auditNonAtomicWake(
+  audit: (
+    action: string,
+    resourceType: string,
+    resourceId?: string,
+    details?: Record<string, unknown>,
+  ) => void,
+  binding: BindingRow | { id: string; agentId: string; sessionId: string; epoch: number },
+  store: ControlStoragePort,
+) {
+  const dto = bindingDto(binding, store);
+  if (dto.deliveryPolicy.wakeStrategy !== "non-atomic-idle-check") return;
+  audit("binding.non-atomic-wake-enabled", "binding", dto.id, {
+    bindingEpoch: dto.epoch,
+    wakeStrategy: dto.deliveryPolicy.wakeStrategy,
+    residualRisk: "inspect-start-race",
+  });
 }
 function runtimeHarnessId(store: ControlStoragePort, installationId: RuntimeInstallationId) {
   return required(

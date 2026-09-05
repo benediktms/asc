@@ -53,7 +53,10 @@ host-metadata attestation.
 
 Context-only delivery is enabled. Wake delivery is fail-closed by default because
 current Codex queue input cannot preserve named tool-output provenance; it needs
-an explicit per-binding `--allow-non-atomic-wake` policy. Generic
+an explicit per-binding `--allow-non-atomic-wake` policy. Enabling it and every
+resulting attempt are audited with the residual inspect/start race made explicit;
+`acs codex doctor` distinguishes the configured default from the runtime's
+atomic capability. Generic
 acceptance-unknown reconciliation is automatic, with operator resolution when
 the Codex adapter cannot prove authoritative history. Wake acceptance can be
 recovered from its durable named function-output marker; context-only ambiguity
