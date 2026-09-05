@@ -264,9 +264,7 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
           { ...delivery(), markRequestFlushed: () => flushes++ },
           writeAbort.signal,
         );
-      for (let index = 0; index < 100 && !methods.includes("thread/inject_items"); index++)
-        await Bun.sleep(1);
-      expect(methods).toContain("thread/inject_items");
+      await waitForMethod(methods, "thread/inject_items");
       writeAbort.abort();
       expect(await write).toMatchObject({
         outcome: "acceptance-unknown",
@@ -275,6 +273,47 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       expect(flushes).toBe(1);
       await adapter.stop({ reason: "shutdown" });
       fixture.close();
+    });
+
+    test("preserves ambiguity across shutdown and cancellation disconnects", async () => {
+      const shutdownFixture = await create(),
+        {
+          adapter: shutdownAdapter,
+          context: shutdownContext,
+          methods: shutdownMethods,
+        } = shutdownFixture;
+      await shutdownAdapter.start(shutdownContext);
+      shutdownFixture.failNext("thread/inject_items", "hang");
+      const deliveryResult = shutdownAdapter.deliver(delivery());
+      await waitForMethod(shutdownMethods, "thread/inject_items");
+      await shutdownAdapter.stop({ reason: "shutdown" });
+      expect(await deliveryResult).toMatchObject({
+        outcome: "acceptance-unknown",
+        ambiguity: "connection-reset",
+      });
+      shutdownFixture.close();
+
+      const cancelFixture = await create(),
+        { adapter: cancelAdapter, context: cancelContext, methods: cancelMethods } = cancelFixture;
+      await cancelAdapter.start(cancelContext);
+      const accepted = await cancelAdapter.deliver(delivery("wake_when_idle"));
+      if (accepted.outcome !== "accepted" || !accepted.execution)
+        throw new Error("expected owned execution");
+      cancelFixture.failNext("turn/interrupt", "hang");
+      const cancelResult = cancelAdapter.cancel({
+        execution: {
+          normalizedId: "exe_cancel",
+          opaqueId: accepted.execution.opaqueId,
+          session: delivery().target.session,
+          bindingId: delivery().target.bindingId,
+          bindingEpoch: delivery().target.bindingEpoch,
+        },
+      });
+      await waitForMethod(cancelMethods, "turn/interrupt");
+      cancelFixture.disconnect();
+      expect(await cancelResult).toMatchObject({ outcome: "unknown" });
+      await cancelAdapter.stop({ reason: "shutdown" });
+      cancelFixture.close();
     });
   });
 }
@@ -478,6 +517,11 @@ function mutations(methods: string[]) {
   return methods.filter((method) =>
     ["thread/inject_items", "turn/start", "turn/interrupt"].includes(method),
   );
+}
+
+async function waitForMethod(methods: string[], method: string) {
+  for (let index = 0; index < 100 && !methods.includes(method); index++) await Bun.sleep(1);
+  expect(methods).toContain(method);
 }
 
 function decodeClientFrame(frame: Buffer) {
