@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { telemetry } from "../../observability/src/index";
 import type { ThreadInjectItemsParams } from "../../codex-protocol-generated/src/v2/ThreadInjectItemsParams";
 import type { ThreadListParams } from "../../codex-protocol-generated/src/v2/ThreadListParams";
@@ -140,6 +141,8 @@ export class CodexAppServerClient {
 
   private connect() {
     if (this.connectPromise) return this.connectPromise;
+    if (!existsSync(this.socketPath))
+      return Promise.reject(new Error("app-server socket unavailable"));
     this.connectPromise = new Promise<void>((resolve, reject) => {
       const key = randomBytes(16).toString("base64");
       const expected = createHash("sha1")

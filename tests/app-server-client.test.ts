@@ -11,6 +11,13 @@ afterEach(() => {
 });
 
 describe("Codex app-server transport", () => {
+  test("rejects a missing app-server socket", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acs-codex-missing-"));
+    roots.push(root);
+    const client = new CodexAppServerClient(join(root, "missing.sock"));
+    await expect(client.start()).rejects.toThrow("app-server socket unavailable");
+  });
+
   test("upgrades over a Unix socket and omits jsonrpc", async () => {
     const root = mkdtempSync(join(tmpdir(), "acs-codex-"));
     roots.push(root);
