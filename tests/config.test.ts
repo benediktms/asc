@@ -16,10 +16,13 @@ describe("configuration", () => {
     const path = join(root, "config.toml");
     writeFileSync(
       path,
-      '[daemon]\na2a_listen = "127.0.0.1:9000"\n[delivery]\nworker_concurrency = 4\n[runtimes.codex]\nmax_in_flight_requests = 64\n',
+      '[daemon]\na2a_listen = "127.0.0.1:9000"\n[security]\nmax_parts = 8\nmax_text_part_bytes = 1024\n[delivery]\nworker_concurrency = 4\nmax_queued_delivery_intents = 12\n[runtimes.codex]\nmax_in_flight_requests = 64\n',
     );
     const config = loadConfig(path);
     expect(config.delivery.workerConcurrency).toBe(4);
+    expect(config.delivery.maxQueuedDeliveryIntents).toBe(12);
+    expect(config.security.maxParts).toBe(8);
+    expect(config.security.maxTextPartBytes).toBe(1024);
     expect(config.codex.maxInFlightRequests).toBe(64);
     writeFileSync(path, "[daemon]\nunknown = true\n");
     expect(() => loadConfig(path)).toThrow("unknown daemon.unknown");

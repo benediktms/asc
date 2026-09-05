@@ -8,6 +8,8 @@ export interface AcsConfig {
     requireA2aAuth: boolean;
     maxRequestBytes: number;
     maxInlineContentBytes: number;
+    maxParts: number;
+    maxTextPartBytes: number;
     claimTtlSeconds: number;
   };
   delivery: {
@@ -16,6 +18,7 @@ export interface AcsConfig {
     defaultMode: "wake_when_idle" | "append_context";
     retryBaseMs: number;
     retryCapMs: number;
+    maxQueuedDeliveryIntents: number;
   };
   codex: {
     enabled: boolean;
@@ -44,6 +47,8 @@ busy_timeout_ms = 5000
 require_a2a_auth = true
 max_request_bytes = 524288
 max_inline_content_bytes = 262144
+max_parts = 32
+max_text_part_bytes = 65536
 claim_ttl_seconds = 600
 
 [delivery]
@@ -52,6 +57,7 @@ lease_seconds = 30
 default_mode = "wake_when_idle"
 retry_base_ms = 250
 retry_cap_ms = 30000
+max_queued_delivery_intents = 1000
 
 [runtimes.codex]
 enabled = true
@@ -91,6 +97,8 @@ export function loadConfig(path = configPath()): AcsConfig {
       "require_a2a_auth",
       "max_request_bytes",
       "max_inline_content_bytes",
+      "max_parts",
+      "max_text_part_bytes",
       "claim_ttl_seconds",
     ]),
     delivery = section(root, "delivery", [
@@ -99,6 +107,7 @@ export function loadConfig(path = configPath()): AcsConfig {
       "default_mode",
       "retry_base_ms",
       "retry_cap_ms",
+      "max_queued_delivery_intents",
     ]),
     runtimes = section(root, "runtimes", ["codex"]),
     codex = section(runtimes, "codex", [
@@ -147,6 +156,11 @@ export function loadConfig(path = configPath()): AcsConfig {
         number(security.max_inline_content_bytes, 262144),
         "security.max_inline_content_bytes",
       ),
+      maxParts: positive(number(security.max_parts, 32), "security.max_parts"),
+      maxTextPartBytes: positive(
+        number(security.max_text_part_bytes, 65536),
+        "security.max_text_part_bytes",
+      ),
       claimTtlSeconds: positive(
         number(security.claim_ttl_seconds, 600),
         "security.claim_ttl_seconds",
@@ -161,6 +175,10 @@ export function loadConfig(path = configPath()): AcsConfig {
       defaultMode,
       retryBaseMs: positive(number(delivery.retry_base_ms, 250), "delivery.retry_base_ms"),
       retryCapMs: positive(number(delivery.retry_cap_ms, 30000), "delivery.retry_cap_ms"),
+      maxQueuedDeliveryIntents: positive(
+        number(delivery.max_queued_delivery_intents, 1000),
+        "delivery.max_queued_delivery_intents",
+      ),
     },
     codex: {
       enabled: boolean(codex.enabled, true),

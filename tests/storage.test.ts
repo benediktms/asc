@@ -141,6 +141,37 @@ describe("durable acceptance", () => {
     });
     store.close();
   });
+  test("enforces configured message part limits", () => {
+    const store = fixture({ maxParts: 1, maxTextPartBytes: 4 }),
+      agent = store.createAgent("bounded-message"),
+      principal = authenticated(store);
+    expect(() =>
+      store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "too-many-parts",
+          role: Role.ROLE_USER,
+          parts: [{ text: "one" }, { text: "two" }],
+        }),
+        {},
+      ),
+    ).toThrow("ACS_MESSAGE_TOO_LARGE");
+    expect(() =>
+      store.accept(
+        agent.id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "text-too-large",
+          role: Role.ROLE_USER,
+          parts: [{ text: "12345" }],
+        }),
+        {},
+      ),
+    ).toThrow("ACS_MESSAGE_TOO_LARGE");
+    expect(store.db.query("SELECT count(*) count FROM a2a_tasks").get()).toEqual({ count: 0 });
+    store.close();
+  });
   test("rolls back when any acceptance write fails", () => {
     const tables = [
       "conversation_contexts",

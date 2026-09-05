@@ -221,6 +221,8 @@ export class Store {
   readonly secret: Buffer;
   readonly limits: {
     maxInlineContentBytes: number;
+    maxParts: number;
+    maxTextPartBytes: number;
     claimTtlSeconds: number;
     defaultMode: "wake_when_idle" | "append_context";
     maxQueuedDeliveryIntents: number;
@@ -233,6 +235,8 @@ export class Store {
   ) {
     this.limits = {
       maxInlineContentBytes: 262144,
+      maxParts: 32,
+      maxTextPartBytes: 65536,
       claimTtlSeconds: 600,
       defaultMode: "wake_when_idle",
       maxQueuedDeliveryIntents: 1000,
@@ -906,11 +910,14 @@ export class Store {
   ): { task: StoredTask; deliveryId: string; duplicate: boolean } {
     if (!message.messageId || !message.parts.length)
       throw new Error("VALIDATION_FAILED: messageId and parts are required");
-    if (message.parts.length > 32) throw new Error("ACS_MESSAGE_TOO_LARGE");
+    if (message.parts.length > this.limits.maxParts) throw new Error("ACS_MESSAGE_TOO_LARGE");
     let bytes = 0;
     for (const part of message.parts) {
       if (!part.content || part.content.$case === "raw") throw new Error("ACS_UNSUPPORTED_CONTENT");
-      if (part.content.$case === "text" && Buffer.byteLength(part.content.value) > 65536)
+      if (
+        part.content.$case === "text" &&
+        Buffer.byteLength(part.content.value) > this.limits.maxTextPartBytes
+      )
         throw new Error("ACS_MESSAGE_TOO_LARGE");
       bytes += Buffer.byteLength(JSON.stringify(part));
     }

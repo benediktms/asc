@@ -142,10 +142,13 @@ async function main() {
 async function daemon() {
   const store = new Store(config, {
       maxInlineContentBytes: settings.security.maxInlineContentBytes,
+      maxParts: settings.security.maxParts,
+      maxTextPartBytes: settings.security.maxTextPartBytes,
       claimTtlSeconds: settings.security.claimTtlSeconds,
       defaultMode: settings.delivery.defaultMode,
       busyTimeoutMs: settings.storage.busyTimeoutMs,
       durability: settings.storage.durability,
+      maxQueuedDeliveryIntents: settings.delivery.maxQueuedDeliveryIntents,
     }),
     startedAt = new Date().toISOString();
   if (existsSync(config.runtime)) unlinkSync(config.runtime);
