@@ -290,6 +290,13 @@ test.skipIf(process.env.ACS_REAL_CODEX_MODEL !== "1")(
         outcome: "completed",
         finalParts: [{ kind: "text", text: "ACS_CONTEXT_VISIBLE_OK" }],
       });
+      await client.request("mcpServer/tool/call", {
+        server: "acs_meta_probe",
+        threadId,
+        tool: "capture_thread_meta",
+        arguments: {},
+      });
+      expect(readFileSync(metadataOutput, "utf8").trim().split("\n")).toEqual([threadId, threadId]);
       await adapter.stop({ reason: "shutdown" });
     } finally {
       if (threadId) await client.deleteThread(threadId).catch(() => {});
