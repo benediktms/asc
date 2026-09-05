@@ -109,10 +109,10 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     ),
     claimCode = string(claim.claimCode);
   const bindings = [
-    ["sender", "thread-sender"],
-    ["receiver", "thread-receiver"],
-  ].map(([agent, thread]) =>
-    Bun.spawn([binary, "bindings", "bind", agent, "--session", thread], {
+    ["codex", "bind", "sender", "--session", "thread-sender"],
+    ["bindings", "bind", "receiver", "--session", "thread-receiver"],
+  ].map((bindingArgs) =>
+    Bun.spawn([binary, ...bindingArgs], {
       env,
       stdout: "pipe",
       stderr: "pipe",
@@ -182,7 +182,13 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
       method: "tools/call",
       params: {
         name: "acs_claim",
-        arguments: { claimCode },
+        arguments: {
+          claimCode,
+          threadId: "forged-thread",
+          bindingId: "forged-binding",
+          bindingEpoch: 999,
+          sender: "forged-agent",
+        },
         _meta: { threadId: "thread-claimant" },
       },
     })}\n`,
@@ -191,6 +197,25 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   expect(record(record(record(claimCall.result).structuredContent).data)).toMatchObject({
     agent: { slug: "claimant" },
     binding: { status: "active", epoch: 1 },
+    idempotent: false,
+  });
+  mcp.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 100,
+      method: "tools/call",
+      params: {
+        name: "acs_claim",
+        arguments: { claimCode },
+        _meta: { threadId: "thread-claimant" },
+      },
+    })}\n`,
+  );
+  const retryCall = jsonRpcResponse(await readUntil(mcp.stdout, '"id":100'), 100);
+  expect(record(record(record(retryCall.result).structuredContent).data)).toMatchObject({
+    agent: { slug: "claimant" },
+    binding: { status: "active", epoch: 1 },
+    idempotent: true,
   });
   mcp.stdin.write(
     `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n${JSON.stringify({

@@ -75,6 +75,7 @@ const agentSchema = z.looseObject({
   claimResultSchema = z.looseObject({
     agent: agentSchema,
     binding: bindingSchema,
+    idempotent: z.boolean(),
   }),
   agentResultSchema = z.looseObject({ agent: agentSchema }),
   agentPageSchema = z.looseObject({
@@ -223,13 +224,26 @@ export async function runMcp(port = 7432) {
     "acs_claim",
     {
       description: "Bind this Codex thread using a one-time ACS claim code",
-      inputSchema: { claimCode: z.string().min(1).max(64) },
+      inputSchema: {
+        claimCode: z.string().min(1).max(64),
+        continuityPolicy: z.enum(["follow-pending", "strict"]).optional(),
+        allowNonAtomicWake: z.boolean().optional(),
+        revokeExisting: z.boolean().optional(),
+      },
     },
-    async ({ claimCode }, extra) =>
+    async ({ claimCode, continuityPolicy, allowNonAtomicWake, revokeExisting }, extra) =>
       execute(async () => {
         const claimed = await typedCall(
           "bindings.claim",
-          { claimCode, evidence: evidence(extra) },
+          {
+            claimCode,
+            continuityPolicy,
+            deliveryPolicy: {
+              wakeStrategy: allowNonAtomicWake ? "non-atomic-idle-check" : "atomic-only",
+            },
+            revokeExisting,
+            evidence: evidence(extra),
+          },
           claimResultSchema,
         );
         return {
@@ -239,6 +253,7 @@ export async function runMcp(port = 7432) {
             displayName: claimed.agent.displayName,
           },
           binding: claimed.binding,
+          idempotent: claimed.idempotent,
         };
       }),
   );

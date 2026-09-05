@@ -154,6 +154,23 @@ export interface BindingHandle {
   principalId: `prn_${string}`;
 }
 
+export interface BindingOptions {
+  continuityPolicy?: "follow-pending" | "strict";
+  deliveryPolicy?: Partial<{
+    wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
+    allowActiveTurnSteering: boolean;
+    autoResumeDormantThread: boolean;
+    interruptOnCancel: boolean;
+  }>;
+  installationId?: RuntimeInstallationId;
+  revokeExisting?: boolean;
+}
+
+export interface ClaimBindingResult extends BindingHandle {
+  idempotent: boolean;
+  rebound: boolean;
+}
+
 export interface DeliveryOptions {
   mode?: "wake_when_idle" | "append_context";
   priority?: "low" | "normal" | "high";
@@ -242,22 +259,8 @@ export interface ControlStoragePort extends SqlPort {
     principalId: string,
     ttlSeconds?: number,
   ): { claimId: string; claimCode: string; expiresAt: string };
-  bind(
-    agent: string,
-    sessionId: string,
-    options?: {
-      continuityPolicy?: "follow-pending" | "strict";
-      deliveryPolicy?: Partial<{
-        wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
-        allowActiveTurnSteering: boolean;
-        autoResumeDormantThread: boolean;
-        interruptOnCancel: boolean;
-      }>;
-      installationId?: RuntimeInstallationId;
-      revokeExisting?: boolean;
-    },
-  ): BindingHandle;
-  claim(code: string, sessionId: string, installationId?: RuntimeInstallationId): BindingHandle;
+  bind(agent: string, sessionId: string, options?: BindingOptions): BindingHandle;
+  claim(code: string, sessionId: string, options?: BindingOptions): ClaimBindingResult;
   binding(bindingId: string): BindingRow | null;
   revokeBinding(bindingId: string, reason?: string): BindingRow | null;
   observeSession(session: RuntimeSessionRef, availability: RuntimeAvailability): void;
