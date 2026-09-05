@@ -1204,28 +1204,35 @@ export class Store {
         replyExpected: options.replyExpected ?? true,
         traceContext: options.traceContext,
       };
-      this.db
-        .query(
-          "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .run(
-          deliveryId,
-          "a2a-message",
-          taskId,
-          messageRowId,
-          agentId,
-          acceptedBinding?.id ?? null,
-          acceptedBinding?.epoch ?? null,
-          mode,
-          priority,
-          DeliveryState.Pending,
-          now,
-          options.expiresAt ? Date.parse(options.expiresAt) : null,
-          JSON.stringify(payload),
-          this.payloadHash(payload),
-          now,
-          now,
+      try {
+        this.db
+          .query(
+            "INSERT INTO delivery_intents(id,kind,task_id,message_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,deadline_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          )
+          .run(
+            deliveryId,
+            "a2a-message",
+            taskId,
+            messageRowId,
+            agentId,
+            acceptedBinding?.id ?? null,
+            acceptedBinding?.epoch ?? null,
+            mode,
+            priority,
+            DeliveryState.Pending,
+            now,
+            options.expiresAt ? Date.parse(options.expiresAt) : null,
+            JSON.stringify(payload),
+            this.payloadHash(payload),
+            now,
+            now,
+          );
+      } catch (error) {
+        throw new Error(
+          `ACCEPT_DELIVERY_INTENT: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
+      }
       if (requester.binding_id && options.notifyOn?.length) {
         const subscription = this.db
           .query<{ id: string }, [string, string, BindingId]>(
