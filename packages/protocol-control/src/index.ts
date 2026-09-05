@@ -365,28 +365,50 @@ export function controlHandler(
           });
           store.observeSession(bindSnapshot.session, bindSnapshot.availability);
           audit("binding.bind", "binding", createdBinding.id);
+          if (createdBinding.rebound)
+            audit("binding.rebind", "binding", createdBinding.id, {
+              epoch: createdBinding.epoch,
+            });
           return ok(rpc.id, { binding: bindingDto(createdBinding, store) });
         case "bindings.claim": {
-          if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
-          const evidence = hostInvocationEvidence(p.evidence);
-          if (!evidence || !callerAttestor) throw new Error("UNATTESTED_CALLER");
-          const proof = await callerAttestor.attest(evidence);
-          if (proof.kind !== "attested") throw new Error("UNATTESTED_CALLER");
-          const claimSnapshot = await adapter.inspectSession(proof.session);
-          if (claimSnapshot.availability === "offline")
-            throw new Error("RUNTIME_UNAVAILABLE: session not found");
-          const binding = store.claim(
-            required(p.claimCode, "claimCode"),
-            proof.session.opaqueId,
-            proof.session.installationId,
-          );
-          store.observeSession(claimSnapshot.session, claimSnapshot.availability);
-          audit("binding.claim", "binding", binding.id);
-          const agent = store.agent(binding.agentId);
-          return ok(rpc.id, {
-            binding: bindingDto(binding, store),
-            agent: agent ? agentDto(store, agent) : undefined,
-          });
+          try {
+            if (!adapter) throw new Error("RUNTIME_UNAVAILABLE");
+            const evidence = hostInvocationEvidence(p.evidence);
+            if (!evidence || !callerAttestor) throw new Error("UNATTESTED_CALLER");
+            const proof = await callerAttestor.attest(evidence);
+            if (proof.kind !== "attested") throw new Error(`UNATTESTED_CALLER: ${proof.reason}`);
+            const claimSnapshot = await adapter.inspectSession(proof.session);
+            if (claimSnapshot.availability === "offline")
+              throw new Error("RUNTIME_UNAVAILABLE: session not found");
+            const binding = store.claim(
+              required(p.claimCode, "claimCode"),
+              proof.session.opaqueId,
+              {
+                installationId: proof.session.installationId,
+                continuityPolicy: p.continuityPolicy,
+                deliveryPolicy: p.deliveryPolicy,
+                revokeExisting: p.revokeExisting,
+              },
+            );
+            store.observeSession(claimSnapshot.session, claimSnapshot.availability);
+            audit("binding.claim.consume", "binding", binding.id, {
+              idempotent: binding.idempotent,
+            });
+            if (binding.rebound)
+              audit("binding.rebind", "binding", binding.id, { epoch: binding.epoch });
+            const agent = store.agent(binding.agentId);
+            return ok(rpc.id, {
+              binding: bindingDto(binding, store),
+              agent: agent ? agentDto(store, agent) : undefined,
+              idempotent: binding.idempotent,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            audit("binding.claim.reject", "claim", undefined, {
+              reason: controlErrorCode(message.split(":").at(0) ?? "INTERNAL"),
+            });
+            throw error;
+          }
         }
         case "bindings.get": {
           const binding = store.binding(required(p.bindingId, "bindingId"));
@@ -1103,6 +1125,10 @@ function controlErrorCode(raw: string): ControlErrorData["code"] {
     case "AGENT_DISABLED":
     case "BINDING_NOT_FOUND":
     case "BINDING_CONFLICT":
+    case "CLAIM_INVALID":
+    case "CLAIM_EXPIRED":
+    case "CLAIM_CONSUMED":
+    case "CLAIM_AMBIGUOUS":
     case "UNATTESTED_CALLER":
     case "STALE_BINDING":
     case "RUNTIME_UNAVAILABLE":

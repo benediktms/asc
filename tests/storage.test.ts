@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Message, Role, TaskState as A2ATaskState } from "@a2a-js/sdk";
 import { Store, type Paths, type StoredPart } from "../packages/storage-sqlite/src/index";
-import { TaskState } from "../packages/domain/src/index";
+import { BindingState, TaskState } from "../packages/domain/src/index";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -396,7 +396,7 @@ describe("durable acceptance", () => {
     ).toThrow("UNIQUE constraint failed");
     store.close();
   });
-  test("creates a Crockford claim and consumes it once", () => {
+  test("consumes a Crockford claim once and retries idempotently for its owning session", () => {
     const store = fixture(),
       agent = store.createAgent("claimed-agent"),
       requester = authenticated(store),
@@ -407,14 +407,85 @@ describe("durable acceptance", () => {
         "INSERT INTO runtime_installations(id,harness_id,adapter_id,label,endpoint_json,state,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,'offline',?,?)",
       )
       .run("ins_other", "other", "test.other", "other", "{}", now, now);
-    const binding = store.claim(claim.claimCode, "claimed-thread", "ins_other");
+    const binding = store.claim(claim.claimCode, "claimed-thread", {
+      installationId: "ins_other",
+    });
     expect(claim.claimCode).toMatch(/^[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{26}$/);
     expect(binding.agentId).toBe(agent.id);
-    expect(() => store.claim(claim.claimCode, "replayed-thread")).toThrow(
-      "invalid or expired claim",
+    expect(binding.idempotent).toBe(false);
+    expect(binding.rebound).toBe(false);
+    expect(store.claim(claim.claimCode, "claimed-thread", { installationId: "ins_other" })).toEqual(
+      { ...binding, idempotent: true },
     );
+    expect(() =>
+      store.claim(claim.claimCode, "replayed-thread", { installationId: "ins_other" }),
+    ).toThrow("CLAIM_CONSUMED");
     expect(store.binding(binding.id)?.session_opaque_id).toBe("claimed-thread");
     expect(store.binding(binding.id)?.installation_id).toBe("ins_other");
+    store.close();
+  });
+  test("allows only one competing claim consumer", async () => {
+    const store = fixture(),
+      agent = store.createAgent("claim-race"),
+      requester = authenticated(store),
+      claim = store.createClaim(agent.id, requester.id),
+      results = await Promise.allSettled(
+        ["race-one", "race-two"].map((sessionId) =>
+          Promise.resolve().then(() => store.claim(claim.claimCode, sessionId)),
+        ),
+      );
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected")?.reason).toMatchObject({
+      message: expect.stringContaining("CLAIM_CONSUMED"),
+    });
+    store.close();
+  });
+  test("classifies expired claims and rolls back consumption when binding fails", () => {
+    const store = fixture(),
+      requester = authenticated(store),
+      expiredAgent = store.createAgent("expired-claim"),
+      expired = store.createClaim(expiredAgent.id, requester.id);
+    store.db
+      .query("UPDATE binding_claims SET created_at_ms=?,expires_at_ms=? WHERE id=?")
+      .run(Date.now() - 2_000, Date.now() - 1_000, expired.claimId);
+    expect(() => store.claim(expired.claimCode, "expired-thread")).toThrow("CLAIM_EXPIRED");
+
+    const owner = store.createAgent("session-owner"),
+      target = store.createAgent("atomic-claim"),
+      claim = store.createClaim(target.id, requester.id);
+    store.bind(owner.id, "occupied-thread");
+    expect(() => store.claim(claim.claimCode, "occupied-thread")).toThrow(
+      "session already belongs to another agent",
+    );
+    expect(store.claim(claim.claimCode, "free-thread").agentId).toBe(target.id);
+    store.close();
+  });
+  test("requires explicit rebind and fences retries through the old claim", () => {
+    const store = fixture(),
+      agent = store.createAgent("rebound-claim"),
+      requester = authenticated(store),
+      oldClaim = store.createClaim(agent.id, requester.id),
+      oldBinding = store.claim(oldClaim.claimCode, "old-thread"),
+      newClaim = store.createClaim(agent.id, requester.id);
+    expect(() => store.claim(newClaim.claimCode, "new-thread")).toThrow("rebind required");
+    const rebound = store.claim(newClaim.claimCode, "new-thread", { revokeExisting: true });
+    expect(rebound).toMatchObject({ epoch: oldBinding.epoch + 1, rebound: true });
+    expect(store.binding(oldBinding.id)?.status).toBe(BindingState.Revoked);
+    expect(() => store.claim(oldClaim.claimCode, "old-thread")).toThrow("STALE_BINDING");
+    store.close();
+  });
+  test("distinguishes replacing an active binding from binding after revocation", () => {
+    const store = fixture(),
+      agent = store.createAgent("rebind-classification"),
+      first = store.bind(agent.id, "first-thread");
+    expect(first.rebound).toBe(false);
+    const replacement = store.bind(agent.id, "replacement-thread", { revokeExisting: true });
+    expect(replacement.rebound).toBe(true);
+    store.revokeBinding(replacement.id);
+    const afterRevocation = store.bind(agent.id, "after-revocation-thread");
+    expect(afterRevocation.epoch).toBe(3);
+    expect(afterRevocation.rebound).toBe(false);
     store.close();
   });
   test("reports observed active runtime sessions by state", () => {

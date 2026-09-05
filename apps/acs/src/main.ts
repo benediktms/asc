@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { chmodSync, existsSync, readFileSync, unlinkSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import { handleA2A } from "../../../packages/protocol-a2a/src/index";
 import { controlCall, controlHandler } from "../../../packages/protocol-control/src/index";
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
@@ -17,6 +18,7 @@ import {
   paths,
   writeDefaultConfig,
 } from "../../../packages/config/src/index";
+import { pickSession, type SessionChoice } from "./session-picker";
 
 const args = Bun.argv.slice(2),
   config = paths(),
@@ -58,6 +60,12 @@ async function main() {
     client: { name: "acs-cli", version: "0.1.0", instanceId: String(process.pid) },
     capabilities: {},
   });
+  if (args[0] === "codex" && args[1] === "bind") {
+    const agent = required(args[2], "agent"),
+      explicitSession = option("--session"),
+      session = explicitSession ?? (await chooseCodexSession(call));
+    return print(await call("bindings.bind", bindingParams(agent, session)));
+  }
   if (args[0] === "agents" && args[1] === "create") {
     const agent = required(args[2], "agent slug"),
       created = await call("agents.create", {
@@ -88,21 +96,10 @@ async function main() {
   if (args[0] === "agents" && args[1] === "list") return print(await call("agents.list"));
   if (args[0] === "bindings" && args[1] === "bind")
     return print(
-      await call("bindings.bind", {
-        agent: required(args[2], "agent"),
-        session: required(option("--session"), "--session"),
-        continuityPolicy: option("--continuity") ?? "follow-pending",
-        deliveryPolicy: {
-          wakeStrategy:
-            args.includes("--allow-non-atomic-wake") || settings.codex.allowNonAtomicWake
-              ? "non-atomic-idle-check"
-              : "atomic-only",
-          allowActiveTurnSteering: settings.codex.allowActiveTurnSteering,
-          autoResumeDormantThread: settings.codex.autoResumeDormantThreads,
-          interruptOnCancel: true,
-        },
-        revokeExisting: args.includes("--revoke-existing"),
-      }),
+      await call(
+        "bindings.bind",
+        bindingParams(required(args[2], "agent"), required(option("--session"), "--session")),
+      ),
     );
   if (args[0] === "bindings" && args[1] === "list") return print(await call("bindings.list"));
   if (args[0] === "bindings" && args[1] === "get")
@@ -297,6 +294,63 @@ function required<T>(value: T | null | undefined, name: string): T {
 function print(value: unknown) {
   console.log(JSON.stringify(value, null, 2));
 }
+function bindingParams(
+  agent: string,
+  session: string | { readonly installationId: string; readonly opaqueId: string },
+) {
+  return {
+    agent,
+    session,
+    continuityPolicy: option("--continuity") ?? "follow-pending",
+    deliveryPolicy: {
+      wakeStrategy:
+        args.includes("--allow-non-atomic-wake") || settings.codex.allowNonAtomicWake
+          ? "non-atomic-idle-check"
+          : "atomic-only",
+      allowActiveTurnSteering: settings.codex.allowActiveTurnSteering,
+      autoResumeDormantThread: settings.codex.autoResumeDormantThreads,
+      interruptOnCancel: true,
+    },
+    revokeExisting: args.includes("--revoke-existing"),
+  };
+}
+async function chooseCodexSession(call: (method: string, params?: unknown) => Promise<unknown>) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY)
+    throw new Error("Interactive Codex binding requires a terminal; use --session for automation");
+  const sessions = new Array<SessionChoice>();
+  let cursor: string | undefined;
+  do {
+    const page = recordValue(await call("runtimes.sessions.list", { cursor, limit: 100 }));
+    sessions.push(...sessionChoices(page.sessions));
+    cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+  } while (cursor);
+  const terminal = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await pickSession(sessions, (prompt) => terminal.question(prompt));
+  } finally {
+    terminal.close();
+  }
+}
+function sessionChoices(value: unknown): SessionChoice[] {
+  if (!Array.isArray(value)) throw new Error("Invalid runtime session list");
+  return value.map((item) => {
+    const snapshot = recordValue(item),
+      session = recordValue(snapshot.session),
+      attributes = recordValue(snapshot.attributes);
+    if (
+      typeof session.installationId !== "string" ||
+      typeof session.opaqueId !== "string" ||
+      typeof snapshot.availability !== "string"
+    )
+      throw new Error("Invalid runtime session");
+    return {
+      session: { installationId: session.installationId, opaqueId: session.opaqueId },
+      availability: snapshot.availability,
+      title: typeof attributes.displayTitle === "string" ? attributes.displayTitle : undefined,
+      cwd: typeof attributes.cwdHint === "string" ? attributes.cwdHint : undefined,
+    };
+  });
+}
 async function doctor() {
   const codex = Bun.spawnSync([settings.codex.binary, "--version"]);
   const installedCodex = codex.success ? codex.stdout.toString().trim() : undefined,
@@ -356,7 +410,7 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs codex bind <agent> [--session <codex-thread-id>] [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 

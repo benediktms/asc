@@ -25,7 +25,9 @@ import { paths } from "../../config/src/index";
 import { telemetry } from "../../observability/src/index";
 import type {
   AgentRow,
+  BindingOptions,
   BindingRow,
+  ClaimBindingResult,
   DeliveryOptions,
   DeliveryIntentRow,
   SqlBinding,
@@ -472,21 +474,7 @@ export class Store {
       .query<AgentRow, []>("SELECT * FROM agents WHERE deleted_at_ms IS NULL ORDER BY slug")
       .all();
   }
-  bind(
-    agentValue: string,
-    sessionId: string,
-    options: {
-      continuityPolicy?: "follow-pending" | "strict";
-      deliveryPolicy?: Partial<{
-        wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
-        allowActiveTurnSteering: boolean;
-        autoResumeDormantThread: boolean;
-        interruptOnCancel: boolean;
-      }>;
-      installationId?: RuntimeInstallationId;
-      revokeExisting?: boolean;
-    } = {},
-  ) {
+  bind(agentValue: string, sessionId: string, options: BindingOptions = {}) {
     const agent = this.agent(agentValue);
     if (!agent) throw new Error("AGENT_NOT_FOUND");
     const installation = must(
@@ -515,13 +503,15 @@ export class Store {
           "SELECT id FROM runtime_bindings WHERE agent_id=? AND status='active'",
         )
         .get(agent.id);
-      if (active && !options.revokeExisting) throw new Error("BINDING_CONFLICT");
+      if (active && !options.revokeExisting)
+        throw new Error("BINDING_CONFLICT: agent already has an active binding; rebind required");
       const sessionOwner = this.db
         .query<{ agent_id: `agt_${string}` }, [RuntimeInstallationId, string]>(
           "SELECT agent_id FROM runtime_bindings WHERE installation_id=? AND session_opaque_id=? AND status='active'",
         )
         .get(installation.id, sessionId);
-      if (sessionOwner && sessionOwner.agent_id !== agent.id) throw new Error("BINDING_CONFLICT");
+      if (sessionOwner && sessionOwner.agent_id !== agent.id)
+        throw new Error("BINDING_CONFLICT: session already belongs to another agent");
       const now = Date.now(),
         bindingId = id("bnd"),
         activeState = transitionBinding(BindingState.Pending, BindingState.Active),
@@ -578,7 +568,14 @@ export class Store {
           "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE target_agent_id=? AND state='deferred' AND state_reason IN ('offline','dormant','busy','policy','manual-wake-required')",
         )
         .run(now, now, agent.id);
-      return { id: bindingId, agentId: agent.id, sessionId, epoch, principalId };
+      return {
+        id: bindingId,
+        agentId: agent.id,
+        sessionId,
+        epoch,
+        principalId,
+        rebound: active !== null,
+      };
     });
   }
   binding(bindingId: string) {
@@ -648,29 +645,77 @@ export class Store {
       .run(claimId, agent.id, this.hashToken(claimCode), principalId, now, expires);
     return { claimId, claimCode, expiresAt: new Date(expires).toISOString() };
   }
-  claim(code: string, sessionId: string, installationId?: RuntimeInstallationId) {
+  claim(code: string, sessionId: string, options: BindingOptions = {}): ClaimBindingResult {
     return this.write(() => {
-      const candidates = this.db
+      const verifier = this.hashToken(code),
+        matches = this.db
           .query<
-            { id: `clm_${string}`; agent_id: `agt_${string}`; code_hash: Uint8Array },
-            [number]
+            {
+              id: `clm_${string}`;
+              agent_id: `agt_${string}`;
+              code_hash: Uint8Array;
+              expires_at_ms: number;
+              consumed_at_ms: number | null;
+              consumed_by_binding_id: BindingId | null;
+            },
+            [Uint8Array]
           >(
-            "SELECT id,agent_id,code_hash FROM binding_claims WHERE consumed_at_ms IS NULL AND expires_at_ms>?",
+            "SELECT id,agent_id,code_hash,expires_at_ms,consumed_at_ms,consumed_by_binding_id FROM binding_claims WHERE code_hash=? LIMIT 2",
           )
-          .all(Date.now()),
-        verifier = this.hashToken(code);
-      let row: (typeof candidates)[number] | undefined;
-      for (const candidate of candidates)
-        if (timingSafeEqual(verifier, Buffer.from(candidate.code_hash))) row = candidate;
-      if (!row) throw new Error("VALIDATION_FAILED: invalid or expired claim");
-      const binding = this.bind(row.agent_id, sessionId, { installationId }),
+          .all(verifier);
+      if (matches.length > 1) throw new Error("CLAIM_AMBIGUOUS");
+      const row = matches.at(0);
+      if (!row) throw new Error("CLAIM_INVALID");
+      if (row.consumed_at_ms !== null) {
+        const consumed = row.consumed_by_binding_id
+          ? this.db
+              .query<
+                {
+                  id: BindingId;
+                  agent_id: `agt_${string}`;
+                  installation_id: RuntimeInstallationId;
+                  session_opaque_id: string;
+                  epoch: number;
+                  status: BindingState;
+                  principal_id: `prn_${string}`;
+                },
+                [BindingId]
+              >(
+                "SELECT b.id,b.agent_id,b.installation_id,b.session_opaque_id,b.epoch,b.status,p.id principal_id FROM runtime_bindings b JOIN principals p ON p.binding_id=b.id WHERE b.id=?",
+              )
+              .get(row.consumed_by_binding_id)
+          : null;
+        if (!consumed) throw new Error("STORAGE_CORRUPT: consumed claim binding missing");
+        if (
+          (options.installationId !== undefined &&
+            consumed.installation_id !== options.installationId) ||
+          consumed.session_opaque_id !== sessionId
+        )
+          throw new Error("CLAIM_CONSUMED: claim belongs to another session");
+        if (consumed.status !== BindingState.Active)
+          throw new Error("STALE_BINDING: consumed claim binding is no longer active");
+        return {
+          id: consumed.id,
+          agentId: consumed.agent_id,
+          sessionId: consumed.session_opaque_id,
+          epoch: consumed.epoch,
+          principalId: consumed.principal_id,
+          idempotent: true,
+          rebound: false,
+        };
+      }
+      if (row.expires_at_ms <= Date.now()) throw new Error("CLAIM_EXPIRED");
+      const binding = this.bind(row.agent_id, sessionId, options),
         consumed = this.db
           .query(
             "UPDATE binding_claims SET consumed_at_ms=?,consumed_by_binding_id=? WHERE id=? AND consumed_at_ms IS NULL",
           )
           .run(Date.now(), binding.id, row.id);
-      if (consumed.changes !== 1) throw new Error("VALIDATION_FAILED: invalid or expired claim");
-      return binding;
+      if (consumed.changes !== 1) throw new Error("CLAIM_CONSUMED");
+      return {
+        ...binding,
+        idempotent: false,
+      };
     });
   }
   attestSession(

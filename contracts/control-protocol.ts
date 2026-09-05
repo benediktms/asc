@@ -36,6 +36,10 @@ export interface ControlErrorData {
     | "AGENT_DISABLED"
     | "BINDING_NOT_FOUND"
     | "BINDING_CONFLICT"
+    | "CLAIM_INVALID"
+    | "CLAIM_EXPIRED"
+    | "CLAIM_CONSUMED"
+    | "CLAIM_AMBIGUOUS"
     | "UNATTESTED_CALLER"
     | "STALE_BINDING"
     | "RUNTIME_UNAVAILABLE"
@@ -285,8 +289,8 @@ export interface ControlMethodMap {
   "bindings.bind": {
     readonly params: {
       readonly agent: string;
-      readonly installationId: string;
-      readonly session: RuntimeSessionRef;
+      readonly installationId?: string;
+      readonly session: RuntimeSessionRef | string;
       readonly continuityPolicy?: "follow-pending" | "strict";
       readonly deliveryPolicy?: Partial<RuntimeBindingDto["deliveryPolicy"]>;
       readonly revokeExisting?: boolean;
@@ -297,6 +301,9 @@ export interface ControlMethodMap {
   "bindings.claim": {
     readonly params: {
       readonly claimCode: string;
+      readonly continuityPolicy?: "follow-pending" | "strict";
+      readonly deliveryPolicy?: Partial<RuntimeBindingDto["deliveryPolicy"]>;
+      readonly revokeExisting?: boolean;
       readonly evidence: {
         readonly harnessId: "codex";
         readonly bridge: "mcp";
@@ -307,6 +314,7 @@ export interface ControlMethodMap {
     readonly result: {
       readonly agent: LogicalAgentDto;
       readonly binding: RuntimeBindingDto;
+      readonly idempotent: boolean;
     };
   };
 
