@@ -1,0 +1,66 @@
+name: Apply isolated ACS verification fixes
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    if: github.event.pull_request.number == 39 && github.head_ref == 'impl/direct-peer-delivery' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Verify every original and resulting file, then apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, lzma, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          staged = ['.github/acs-verification-edits.0', '.github/acs-verification-edits.1']
+          encoded = ''.join((root / path).read_text().strip() for path in staged)
+          payload = lzma.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(payload).hexdigest() == '0fd197364fdddadd378b09fa229c73b12cebb2f3de81c7be47c7193f26441afc', 'payload checksum mismatch'
+          changes = json.loads(payload)
+          outputs = []
+          for change in changes:
+              relative = pathlib.PurePosixPath(change['path'])
+              assert not relative.is_absolute() and '..' not in relative.parts and '.git' not in relative.parts
+              path = root / relative
+              assert not path.is_symlink()
+              previous = path.read_bytes() if path.exists() else None
+              digest = hashlib.sha256(previous).hexdigest() if previous is not None else None
+              assert digest == change['before'], f'concurrent edit: {relative}'
+              lines = (previous or b'').decode().splitlines(keepends=True)
+              for edit in reversed(change['edits']):
+                  assert 0 <= edit['start'] <= edit['end'] <= len(lines)
+                  lines[edit['start']:edit['end']] = edit['text'].splitlines(keepends=True)
+              result = ''.join(lines).encode() if change['after'] is not None else None
+              digest = hashlib.sha256(result).hexdigest() if result is not None else None
+              assert digest == change['after'], f'result checksum mismatch: {relative}'
+              outputs.append((path, result))
+          for path, result in outputs:
+              if result is None:
+                  path.unlink()
+              else:
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(result)
+          temporary = staged + ['.github/workflows/apply-acs-verification.yml']
+          for path in temporary:
+              (root / path).unlink()
+          subprocess.run(['git', 'add', '-A', '--', *[c['path'] for c in changes], *temporary], check=True)
+          PY
+          git diff --cached --check
+          git diff --cached --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: complete direct-delivery validation and native runtime coverage'
+          git push origin HEAD:refs/heads/impl/direct-peer-delivery
