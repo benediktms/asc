@@ -35,10 +35,16 @@ jobs:
           version: 2026.9.1
       - run: bun install --frozen-lockfile
       - run: git clone https://github.com/a2aproject/a2a-tck.git "$A2A_TCK_DIR"
-      - run: git checkout 263b9cfaf16a554bdfb166a7ba5b67716e946349
+      - run: git checkout "$(bun "$GITHUB_WORKSPACE/scripts/a2a-profile.ts" --revision)"
         working-directory: ${{ env.A2A_TCK_DIR }}
       - run: uv sync --frozen --python "$(command -v python)" --directory "$A2A_TCK_DIR"
       - run: bun run test:a2a-tck
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a2a-conformance-report
+          path: artifacts/a2a-tck
+          if-no-files-found: error
 
   release-matrix:
     runs-on: ubuntu-latest

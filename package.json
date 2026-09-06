@@ -10,7 +10,8 @@
   "scripts": {
     "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",
     "boundaries": "bun scripts/check-imports.ts",
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun run codex:check && bun test",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run boundaries && bun run enums:check && bun run codex:check && bun run a2a:check && bun test",
+    "a2a:check": "bun scripts/a2a-profile.ts",
     "codex:check": "bun scripts/generate-codex-protocol.ts --check",
     "enums:check": "bun scripts/check-enums.ts",
     "format": "oxfmt . '!packages/codex-protocol-generated/**'",

@@ -149,6 +149,7 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
       role: "ROLE_USER",
       parts: [{ text: "hello" }],
     },
+    configuration: { returnImmediately: true },
   });
   const task = record(record(sent.result).task ?? sent.result),
     taskId = string(task.id);
@@ -351,6 +352,7 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
               role: "ROLE_USER",
               parts: [{ text: "stay subscribed" }],
             },
+            configuration: { returnImmediately: true },
           })
         ).result,
       ).task,

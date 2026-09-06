@@ -94,6 +94,7 @@ describe("A2A JSON-RPC", () => {
               method: "SendMessage",
               params: {
                 message: { messageId, role: "ROLE_USER", parts: [{ text: "work" }] },
+                configuration: { returnImmediately: true },
               },
             }),
           }),
@@ -184,6 +185,7 @@ describe("A2A JSON-RPC", () => {
               role: "ROLE_USER",
               parts: [{ text: "work" }],
             },
+            configuration: { returnImmediately: true },
           },
         }),
       }),
@@ -240,6 +242,13 @@ describe("A2A JSON-RPC", () => {
       "http://[::1]:7432/agents/backend/a2a",
     );
     const call = async (method: string, params: unknown, tracing: Record<string, string> = {}) => {
+      if (
+        method === "SendMessage" &&
+        typeof params === "object" &&
+        params !== null &&
+        !("configuration" in params)
+      )
+        params = { ...params, configuration: { returnImmediately: true } };
       const response = await handleA2A(
         store,
         new Request("http://localhost/agents/backend/a2a", {
@@ -459,7 +468,11 @@ describe("A2A JSON-RPC", () => {
               { data: { content: { $case: "text", value: "nested data stays data" } } },
             ],
           }),
-          configuration: undefined,
+          configuration: {
+            acceptedOutputModes: [],
+            taskPushNotificationConfig: undefined,
+            returnImmediately: true,
+          },
           metadata: undefined,
         },
         options,
@@ -535,7 +548,11 @@ describe("A2A JSON-RPC", () => {
           role: Role.ROLE_USER,
           parts: [{ text: "resume work" }],
         }),
-        configuration: undefined,
+        configuration: {
+          acceptedOutputModes: [],
+          taskPushNotificationConfig: undefined,
+          returnImmediately: true,
+        },
         metadata: undefined,
       },
       options,
@@ -556,6 +573,94 @@ describe("A2A JSON-RPC", () => {
     });
     expect((await subscription.next()).done).toBe(true);
     expect(store.agent(agent.id)?.slug).toBe("sdk-client");
+    store.close();
+  });
+
+  test("honors blocking, interrupted, immediate, and response-history configuration", async () => {
+    for (const [suffix, state, expected] of [
+      ["completed", TaskState.Completed, "TASK_STATE_COMPLETED"],
+      ["input", TaskState.InputRequired, "TASK_STATE_INPUT_REQUIRED"],
+      ["auth", TaskState.AuthRequired, "TASK_STATE_AUTH_REQUIRED"],
+    ] as const) {
+      const store = fixture(),
+        agent = store.createAgent(`execution-${suffix}`),
+        requester = store.createToken(),
+        binding = store.bind(agent.id, `execution-${suffix}-thread`),
+        streamState = store.taskStreamState.bind(store);
+      let advanced = false;
+      store.taskStreamState = (taskId, principalId, targetAgentId) => {
+        const snapshot = streamState(taskId, principalId, targetAgentId);
+        if (snapshot && !advanced) {
+          advanced = true;
+          store.setTaskState(taskId, binding.principalId, TaskState.Working);
+          store.setTaskState(taskId, binding.principalId, state);
+        }
+        return snapshot;
+      };
+      const response = await handleA2A(
+          store,
+          new Request(`http://localhost/agents/execution-${suffix}/a2a`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${requester.token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: suffix,
+              method: "SendMessage",
+              params: {
+                message: {
+                  messageId: `execution-${suffix}`,
+                  role: "ROLE_USER",
+                  parts: [{ text: "work" }],
+                },
+              },
+            }),
+          }),
+          7432,
+        ),
+        result = record(await response.json());
+      expect(result.error).toBeUndefined();
+      const task = record(record(result.result).task ?? result.result);
+      expect(task.status).toMatchObject({ state: expected });
+      store.close();
+    }
+
+    const store = fixture(),
+      requester = store.createToken();
+    store.createAgent("execution-immediate");
+    store.taskStreamState = () => {
+      throw new Error("immediate mode must not subscribe");
+    };
+    const response = await handleA2A(
+        store,
+        new Request("http://localhost/agents/execution-immediate/a2a", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${requester.token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "immediate",
+            method: "SendMessage",
+            params: {
+              message: {
+                messageId: "execution-immediate",
+                role: "ROLE_USER",
+                parts: [{ text: "work" }],
+              },
+              configuration: { returnImmediately: true, historyLength: 0 },
+            },
+          }),
+        }),
+        7432,
+      ),
+      result = record(await response.json()),
+      task = record(record(result.result).task ?? result.result);
+    expect(task.status).toMatchObject({ state: "TASK_STATE_SUBMITTED" });
+    expect(task.history ?? []).toEqual([]);
     store.close();
   });
 
