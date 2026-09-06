@@ -3,7 +3,7 @@
 ## Purpose
 
 Define the harness-neutral delivery boundary and safe Codex integration.
-See ADRs 004, 005, 007, 009, and 010 and `contracts/runtime-adapter.ts`.
+See `contracts/runtime-adapter.ts` for the typed implementation boundary.
 
 ## Requirements
 
