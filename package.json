@@ -22,7 +22,8 @@
     "test": "bun test",
     "test:a2a-tck": "bun scripts/run-a2a-tck.ts",
     "test:codex-real": "ACS_REAL_CODEX=1 bun test tests/real-codex.test.ts",
-    "test:codex-model": "ACS_REAL_CODEX_MODEL=1 bun test tests/real-codex.test.ts"
+    "test:codex-model": "ACS_REAL_CODEX_MODEL=1 bun test tests/real-codex.test.ts",
+    "probe:codex-ownership": "bun scripts/probe-codex-ownership.ts"
   },
   "dependencies": {
     "@a2a-js/sdk": "1.1.0",

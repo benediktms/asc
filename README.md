@@ -103,11 +103,13 @@ acceptance-unknown reconciliation is automatic, with operator resolution when
 the Codex adapter cannot prove authoritative history. Wake acceptance can be
 recovered from its durable named function-output marker; context-only ambiguity
 remains operator-owned because injected items are absent from turn history.
-The phase-zero gates are complete. Codex `0.153.2` and `0.153.4` share the pinned
+The initial phase-zero release gates are complete. Codex `0.153.2` and `0.153.4` share the pinned
 client protocol, pass delivery probes, and preserve host-owned MCP thread
 metadata for normal and resumed threads. A real Codex `0.153.2` TUI and ACS
 client concurrently discovered the same thread and delivered lifecycle
 notifications through one Unix-socket app-server; reconnect behavior is covered
 by the adapter conformance suite. User-routed command approvals remain exclusive
 to the TUI. `requestUserInput` fans out to every subscribed client, but ACS never
-answers it, so a missing local owner fails closed.
+answers it, so a missing local owner fails closed. The broader shared-client
+ownership and routing matrix remains evidence-scoped; see
+[ADR-011](docs/adr/011-shared-app-server-ownership.md) and its opt-in recorder.
