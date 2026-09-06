@@ -34,12 +34,7 @@ import type {
 } from "../../../contracts/runtime-adapter";
 import { CodexAppServerClient } from "./app-server-client";
 import { telemetry } from "../../observability/src/index";
-import {
-  CODEX_PROTOCOL_FINGERPRINT,
-  jsonValue,
-  responseItem,
-  supportsCodexVersion,
-} from "./protocol-codec";
+import { CODEX_PROTOCOL_FINGERPRINT, supportsCodexVersion } from "./protocol-codec";
 
 export { SUPPORTED_CODEX_VERSIONS, TESTED_CODEX_VERSION } from "./protocol-codec";
 
@@ -75,10 +70,7 @@ const capabilities: RuntimeCapabilities = {
   listSessions: true,
   observeSessionState: true,
   observeExecutions: true,
-  appendContext: true,
-  wakeWhenIdle: true,
-  atomicDeferredWake: false,
-  steerActiveExecution: false,
+  directDelivery: true,
   cancelOwnedExecution: true,
   reconcileDelivery: true,
   callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
@@ -86,8 +78,7 @@ const capabilities: RuntimeCapabilities = {
 };
 const disabledCapabilities = (): RuntimeCapabilities => ({
   ...capabilities,
-  appendContext: false,
-  wakeWhenIdle: false,
+  directDelivery: false,
   cancelOwnedExecution: false,
   reconcileDelivery: false,
 });
@@ -105,13 +96,18 @@ type SessionCursor = {
   vendorCursor?: string;
   storedIds: string[];
 };
+type TrackedExecution = {
+  session: RuntimeSessionRef;
+  deliveries: Map<DeliveryId, string>;
+  finalParts: NeutralPart[];
+};
 
 export class CodexRuntimeAdapter implements RuntimeAdapter {
   readonly descriptor: RuntimeAdapterDescriptor = {
     adapterApiVersion: 1,
     adapterId: "codex.app-server",
     harnessId: "codex",
-    implementationVersion: "0.1.0",
+    implementationVersion: "0.2.0",
     capabilities,
   };
   private client?: CodexAppServerClient;
@@ -120,15 +116,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private runtimeVersion?: string;
   private events: RuntimeEvent[] = [];
   private waiters: Array<() => void> = [];
-  private executions = new Map<
-    string,
-    {
-      deliveryId: DeliveryId;
-      payloadHash: string;
-      session: RuntimeSessionRef;
-      finalParts: NeutralPart[];
-    }
-  >();
+  private executions = new Map<string, TrackedExecution>();
 
   constructor(
     readonly socketPath: string,
@@ -199,14 +187,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         runtimeVersion: this.runtimeVersion,
         protocolFingerprint: CODEX_PROTOCOL_FINGERPRINT,
         capabilities,
-        diagnostics: [
-          {
-            severity: "warning",
-            code: "NON_ATOMIC_WAKE_ONLY",
-            message:
-              "Codex queue input cannot preserve named tool-output provenance; wake requires explicit non-atomic policy.",
-          },
-        ],
+        diagnostics: [],
       };
     } catch (error) {
       if (signal?.aborted) throw error;
@@ -369,81 +350,43 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         retryable: false,
         details: { deadline: "expired" },
       };
-    if (request.mode === "join_active")
-      return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
-    if (request.mode === "wake_when_idle")
-      for (const execution of this.executions.values())
-        if (
-          execution.session.installationId === request.target.session.installationId &&
-          execution.session.opaqueId === request.target.session.opaqueId
-        )
-          return { outcome: "deferred", reason: "busy" };
-    const snapshot = await this.inspectSession(request.target.session, signal);
-    if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
-    if (request.mode === "append_context" && snapshot.availability === "dormant")
-      return { outcome: "deferred", reason: "dormant" };
     if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
-    if (request.mode === "wake_when_idle") {
-      if (snapshot.availability === "dormant") {
-        if (!request.autoResumeDormantThread) return { outcome: "deferred", reason: "dormant" };
-      } else if (snapshot.availability !== "idle")
-        return {
-          outcome: "deferred",
-          reason:
-            snapshot.availability === "busy" || snapshot.availability === "awaiting-local-input"
-              ? "busy"
-              : "policy",
-        };
-    }
+    const snapshot = await this.inspectSession(request.target.session, signal);
+    if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
+    if (snapshot.availability === "dormant") return { outcome: "deferred", reason: "dormant" };
+    if (snapshot.availability === "awaiting-local-input")
+      return { outcome: "deferred", reason: "local-input" };
+    if (snapshot.availability === "degraded" || snapshot.availability === "unknown")
+      return { outcome: "deferred", reason: "unsupported-active-state" };
     const fence = await this.requireContext().assertBindingFence(
       request.target.bindingId,
       request.target.bindingEpoch,
     );
     if (!fence.valid) return { outcome: "rejected", reason: "stale-binding", retryable: false };
     try {
-      if (request.mode === "append_context") {
-        await this.requireClient().injectItems(
-          {
-            threadId: request.target.session.opaqueId,
-            items: [jsonValue(JSON.stringify(responseItem(request.envelope)))],
-          },
-          request.markRequestFlushed,
-          signal,
-        );
-        return {
-          outcome: "accepted",
-          acceptedAt: new Date().toISOString(),
-          evidence: { scheme: "codex.thread-inject-items.v1", value: request.deliveryId },
-        };
-      }
       await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
-      const execution = {
-          deliveryId: request.deliveryId,
-          payloadHash: request.payloadHash,
-          session: request.target.session,
-          finalParts: new Array<NeutralPart>(),
-        },
-        response = await this.requireClient().startTurn(
-          {
-            threadId: request.target.session.opaqueId,
-            input: [],
-            turnTrigger: "agent-communications-service",
-            toolOutput: {
-              name: "receive_agent_message",
-              namespace: "acs",
-              output: JSON.stringify(request.envelope),
-            },
+      const response = await this.requireClient().startTurn(
+        {
+          threadId: request.target.session.opaqueId,
+          input: [],
+          turnTrigger: "agent-communications-service",
+          toolOutput: {
+            name: "receive_agent_message",
+            namespace: "acs",
+            output: JSON.stringify(request.envelope),
           },
-          request.markRequestFlushed,
-          signal,
-          (turnId) => this.executions.set(turnId, execution),
-        );
+        },
+        request.markRequestFlushed,
+        signal,
+        (turnId) => this.trackExecution(turnId, request),
+      );
+      this.trackExecution(response.turn.id, request);
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
-        execution: { opaqueId: response.turn.id, alreadyRunning: false },
-        evidence: { scheme: "codex.turn-start.v1", value: response.turn.id },
+        execution: { opaqueId: response.turn.id, relationship: "unknown" },
+        evidence: { scheme: "codex.turn-start.tool-output.v1", value: response.turn.id },
       };
     } catch (error: unknown) {
       const failure = appServerFailure(error);
@@ -460,8 +403,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       if (failure.kind === CodexAppServerFailureKind.SessionNotFound)
         return { outcome: "rejected", reason: "session-not-found", retryable: false };
       if (sessionUnavailable(failure.kind)) return { outcome: "deferred", reason: "offline" };
-      if (failure.kind === CodexAppServerFailureKind.UnsupportedMethod)
-        return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
+      if (failure.kind === CodexAppServerFailureKind.NotRunning)
+        return { outcome: "deferred", reason: "unsupported-active-state" };
       return {
         outcome: "rejected",
         reason: "runtime-protocol-error",
@@ -497,7 +440,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return marker
         ? {
             outcome: "accepted",
-            execution: { opaqueId: marker.turnId },
+            execution: { opaqueId: marker.turnId, relationship: "unknown" },
             evidence: {
               scheme: "codex.function-call-output.v1",
               value: request.deliveryId,
@@ -505,7 +448,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           }
         : {
             outcome: "inconclusive",
-            reason: "Codex history does not contain a durable wake marker",
+            reason: "Codex history does not contain the exact direct-delivery marker",
             operatorActionRequired: true,
           };
     } catch (error: unknown) {
@@ -523,7 +466,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     signal?.throwIfAborted();
     if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
-    if (!this.executions.has(request.execution.opaqueId))
+    const execution = this.executions.get(request.execution.opaqueId);
+    if (!execution || execution.deliveries.size !== 1)
       return { outcome: "rejected", reason: "not-owned", retryable: false };
     const fence = await this.requireContext().assertBindingFence(
       request.execution.bindingId,
@@ -544,6 +488,20 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         ? { outcome: "not-running" }
         : { outcome: "unknown", reason: `Codex cancellation failed (${failure.kind})` };
     }
+  }
+  private trackExecution(turnId: string, request: RuntimeDeliveryRequest) {
+    const existing = this.executions.get(turnId);
+    if (existing) {
+      existing.deliveries.set(request.deliveryId, request.payloadHash);
+      return existing;
+    }
+    const execution: TrackedExecution = {
+      session: request.target.session,
+      deliveries: new Map([[request.deliveryId, request.payloadHash]]),
+      finalParts: [],
+    };
+    this.executions.set(turnId, execution);
+    return execution;
   }
   private snapshot(thread: CodexThreadDto): RuntimeSessionSnapshot {
     return {
@@ -610,8 +568,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           session: execution.session,
           execution: { opaqueId: params.turn.id, session: execution.session },
           correlation: {
-            deliveryId: execution.deliveryId,
-            payloadHash: execution.payloadHash,
+            deliveryIds: [...execution.deliveries.keys()],
           },
         });
     }
