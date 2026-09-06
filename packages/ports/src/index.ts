@@ -99,7 +99,7 @@ export interface DeliveryIntentRow {
   kind: "a2a-message" | "task-event-notification";
   task_id: `tsk_${string}`;
   target_agent_id: `agt_${string}`;
-  mode: "wake_when_idle" | "append_context" | "join_active";
+  mode: "direct";
   state: DeliveryState;
   state_reason: string | null;
   attempt_count: number;
@@ -157,10 +157,8 @@ export interface BindingHandle {
 
 export interface BindingOptions {
   continuityPolicy?: "follow-pending" | "strict";
+  /** Internal compatibility shape while storage policy JSON is simplified. */
   deliveryPolicy?: Partial<{
-    wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
-    allowActiveTurnSteering: boolean;
-    autoResumeDormantThread: boolean;
     interruptOnCancel: boolean;
   }>;
   installationId?: RuntimeInstallationId;
@@ -172,7 +170,8 @@ export interface ClaimBindingResult extends BindingHandle {
 }
 
 export interface DeliveryOptions {
-  mode?: "wake_when_idle" | "append_context";
+  /** Internal storage selector. Public A2A/MCP callers cannot choose a mode. */
+  mode?: "direct";
   priority?: "low" | "normal" | "high";
   notifyOn?: string[];
   replyExpected?: boolean;

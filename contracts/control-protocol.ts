@@ -92,9 +92,6 @@ export interface RuntimeBindingDto {
   readonly status: "pending" | "active" | "stale" | "revoked";
   readonly continuityPolicy: "follow-pending" | "strict";
   readonly deliveryPolicy: {
-    readonly wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
-    readonly allowActiveTurnSteering: boolean;
-    readonly autoResumeDormantThread: boolean;
     readonly interruptOnCancel: boolean;
   };
   readonly createdAt: string;

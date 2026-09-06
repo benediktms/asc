@@ -20,7 +20,6 @@ export interface AcsConfig {
   delivery: {
     workerConcurrency: number;
     leaseSeconds: number;
-    defaultMode: "wake_when_idle" | "append_context";
     retryBaseMs: number;
     retryCapMs: number;
     maxQueuedDeliveryIntents: number;
@@ -31,9 +30,6 @@ export interface AcsConfig {
     connection: "daemon";
     statusPollIntervalMs: number;
     maxInFlightRequests: number;
-    allowNonAtomicWake: boolean;
-    allowActiveTurnSteering: boolean;
-    autoResumeDormantThreads: boolean;
   };
 }
 
@@ -67,7 +63,6 @@ claim_ttl_seconds = 600
 [delivery]
 worker_concurrency = 16
 lease_seconds = 30
-default_mode = "wake_when_idle"
 retry_base_ms = 250
 retry_cap_ms = 30000
 max_queued_delivery_intents = 1000
@@ -78,9 +73,6 @@ codex_binary = "codex"
 connection = "daemon"
 status_poll_interval_ms = 2000
 max_in_flight_requests = 128
-allow_non_atomic_wake = false
-allow_active_turn_steering = false
-auto_resume_dormant_threads = false
 `;
 
 export function defaultLocations(
@@ -140,7 +132,6 @@ export function loadConfig(path = configPath()): AcsConfig {
     delivery = section(root, "delivery", [
       "worker_concurrency",
       "lease_seconds",
-      "default_mode",
       "retry_base_ms",
       "retry_cap_ms",
       "max_queued_delivery_intents",
@@ -152,9 +143,6 @@ export function loadConfig(path = configPath()): AcsConfig {
       "connection",
       "status_poll_interval_ms",
       "max_in_flight_requests",
-      "allow_non_atomic_wake",
-      "allow_active_turn_steering",
-      "auto_resume_dormant_threads",
     ]);
   const configuredListen = string(daemon.a2a_listen, "127.0.0.1:7432"),
     listen = process.env.ACS_A2A_PORT
@@ -164,14 +152,11 @@ export function loadConfig(path = configPath()): AcsConfig {
       process.env.ACS_CONTROL_SOCKET ??
         auto(string(daemon.control_socket, "auto"), defaults.runtimeSocket),
     ),
-    defaultMode = string(delivery.default_mode, "wake_when_idle"),
     durability = string(storage.durability, "balanced"),
     connection = string(codex.connection, "daemon"),
     logLevel = process.env.ACS_LOG_LEVEL ?? string(daemon.log_level, "info"),
     logFormat = process.env.ACS_LOG_FORMAT ?? string(daemon.log_format, "pretty");
   parseListen(listen);
-  if (defaultMode !== "wake_when_idle" && defaultMode !== "append_context")
-    throw new Error("VALIDATION_FAILED: invalid delivery.default_mode");
   if (durability !== "balanced" && durability !== "strict")
     throw new Error("VALIDATION_FAILED: invalid storage.durability");
   if (connection !== "daemon")
@@ -219,7 +204,6 @@ export function loadConfig(path = configPath()): AcsConfig {
         "delivery.worker_concurrency",
       ),
       leaseSeconds: positive(number(delivery.lease_seconds, 30), "delivery.lease_seconds"),
-      defaultMode,
       retryBaseMs: positive(number(delivery.retry_base_ms, 250), "delivery.retry_base_ms"),
       retryCapMs: positive(number(delivery.retry_cap_ms, 30000), "delivery.retry_cap_ms"),
       maxQueuedDeliveryIntents: positive(
@@ -239,9 +223,6 @@ export function loadConfig(path = configPath()): AcsConfig {
         number(codex.max_in_flight_requests, 128),
         "runtimes.codex.max_in_flight_requests",
       ),
-      allowNonAtomicWake: boolean(codex.allow_non_atomic_wake, false),
-      allowActiveTurnSteering: boolean(codex.allow_active_turn_steering, false),
-      autoResumeDormantThreads: boolean(codex.auto_resume_dormant_threads, false),
     },
   };
 }

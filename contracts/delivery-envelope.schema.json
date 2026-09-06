@@ -46,6 +46,10 @@
           "const": false
         }
       }
+    },
+    "payloadHash": {
+      "type": "string",
+      "minLength": 1
     }
   },
   "allOf": [

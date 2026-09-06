@@ -226,6 +226,11 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     idempotent: true,
   });
   mcp.stdin.write(
+    `${JSON.stringify({ jsonrpc: "2.0", id: 101, method: "tools/call", params: { name: "acs_send", arguments: { to: "receiver", text: "must reject", delivery: "append_context" }, _meta: { threadId: "thread-sender" } } })}\n`,
+  );
+  const invalidMode = jsonRpcResponse(await readUntil(mcp.stdout, '"id":101'), 101);
+  expect(invalidMode.error ?? record(invalidMode.result).isError).toBeTruthy();
+  mcp.stdin.write(
     `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n${JSON.stringify({
       jsonrpc: "2.0",
       id: 2,
@@ -287,6 +292,12 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   );
   expect(record(assignedGetData.task).id).toBe(mcpTaskId);
   const receivedDeliveryId = string(assignedGetData.deliveryId, JSON.stringify(assignedGetData));
+  await waitFor(() => {
+    const inspection = Bun.spawnSync([binary, "deliveries", "get", receivedDeliveryId], { env });
+    if (inspection.exitCode !== 0) return false;
+    const delivery = record(record(JSON.parse(inspection.stdout.toString())).delivery);
+    return delivery.state === "deferred" && delivery.reason === "unsupported-capability";
+  });
   mcp.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",
@@ -324,7 +335,6 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   );
   expect(cancelData).toMatchObject({
     taskId: mcpTaskId,
-    state: "canceled",
     cancellationRequested: true,
   });
 
@@ -494,6 +504,13 @@ function codexResponse(method: string, params: Record<string, unknown>) {
   if (method === "thread/list" || method === "thread/loaded/list")
     return { data: [], nextCursor: null };
   if (method === "thread/read") return { thread: codexThread(string(params.threadId)) };
+  if (method === "turn/start") {
+    expect(params.input).toEqual([]);
+    expect(params.toolOutput).toMatchObject({ namespace: "acs", name: "receive_agent_message" });
+    return { turn: { id: `turn-${string(params.threadId)}` } };
+  }
+  if (method === "thread/inject_items" || method === "turn/interrupt")
+    throw new Error(`unexpected unsafe runtime mutation: ${method}`);
   return {};
 }
 

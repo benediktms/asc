@@ -30,7 +30,6 @@ CREATE UNIQUE INDEX agents_slug_active_uq
   ON agents(slug)
   WHERE deleted_at_ms IS NULL;
 
-
 CREATE TABLE runtime_installations (
   id TEXT PRIMARY KEY,
   harness_id TEXT NOT NULL,
@@ -102,9 +101,7 @@ CREATE TABLE principals (
 ) STRICT;
 
 CREATE INDEX principals_agent_idx ON principals(agent_id);
-
 CREATE INDEX principals_binding_idx ON principals(binding_id);
-
 
 CREATE TABLE auth_tokens (
   id TEXT PRIMARY KEY,
@@ -146,7 +143,6 @@ CREATE TABLE conversation_contexts (
 
 CREATE INDEX conversation_contexts_target_idx
   ON conversation_contexts(target_agent_id, updated_at_ms DESC);
-
 CREATE INDEX conversation_contexts_requester_idx
   ON conversation_contexts(requester_principal_id, updated_at_ms DESC);
 
@@ -177,10 +173,8 @@ CREATE TABLE a2a_tasks (
 
 CREATE INDEX a2a_tasks_target_state_idx
   ON a2a_tasks(target_agent_id, state, updated_at_ms DESC);
-
 CREATE INDEX a2a_tasks_requester_state_idx
   ON a2a_tasks(requester_principal_id, state, updated_at_ms DESC);
-
 CREATE INDEX a2a_tasks_context_idx
   ON a2a_tasks(context_id, created_at_ms);
 
@@ -279,9 +273,7 @@ CREATE TABLE delivery_intents (
   target_agent_id TEXT NOT NULL REFERENCES agents(id),
   pinned_binding_id TEXT REFERENCES runtime_bindings(id),
   pinned_binding_epoch INTEGER,
-  mode TEXT NOT NULL CHECK (
-    mode IN ('wake_when_idle', 'append_context', 'join_active')
-  ),
+  mode TEXT NOT NULL DEFAULT 'direct' CHECK (mode = 'direct'),
   priority INTEGER NOT NULL DEFAULT 10,
   state TEXT NOT NULL CHECK (
     state IN (
@@ -309,10 +301,8 @@ CREATE TABLE delivery_intents (
 
 CREATE INDEX delivery_intents_due_idx
   ON delivery_intents(state, not_before_ms, priority DESC, created_at_ms);
-
 CREATE INDEX delivery_intents_target_idx
   ON delivery_intents(target_agent_id, state, created_at_ms);
-
 CREATE INDEX delivery_intents_task_idx
   ON delivery_intents(task_id, created_at_ms);
 
@@ -361,6 +351,9 @@ CREATE TABLE runtime_executions (
   binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
   binding_epoch INTEGER NOT NULL CHECK (binding_epoch > 0),
   runtime_execution_opaque_id TEXT NOT NULL,
+  relationship TEXT NOT NULL DEFAULT 'unknown' CHECK (
+    relationship IN ('started', 'joined', 'unknown')
+  ),
   state TEXT NOT NULL CHECK (
     state IN (
       'accepted', 'started', 'awaiting-local-input',
@@ -379,6 +372,8 @@ CREATE TABLE runtime_executions (
 
 CREATE INDEX runtime_executions_binding_state_idx
   ON runtime_executions(binding_id, state, updated_at_ms);
+CREATE INDEX runtime_executions_runtime_turn_idx
+  ON runtime_executions(binding_id, runtime_execution_opaque_id, updated_at_ms);
 
 CREATE TABLE idempotency_records (
   scope TEXT NOT NULL,
@@ -409,6 +404,5 @@ CREATE TABLE audit_events (
 
 CREATE INDEX audit_events_created_idx
   ON audit_events(created_at_ms DESC);
-
 CREATE INDEX audit_events_resource_idx
   ON audit_events(resource_type, resource_id, created_at_ms DESC);

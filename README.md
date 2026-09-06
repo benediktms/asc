@@ -25,16 +25,25 @@ to replace a live control socket.
 ### Receiving messages in independently launched sessions
 
 MCP registration and runtime delivery are separate connections. A successful
-`acs_identity` proves the session's identity, not that ACS's shared app-server
-hosts it. For automatic context delivery, launch/resume the recipient through
-the shared endpoint (`codex --remote unix:// resume <session-id>`).
+`acs_identity` proves identity, not that ACS's app-server hosts the live session.
+Launch/resume the recipient through the shared endpoint
+(`codex --remote unix:// resume <session-id>`) before expecting automatic delivery.
+ACS never resumes an unreachable thread on a second app-server.
 
-If the recipient runs elsewhere, use `acs_inbox_list`, then `acs_task_get` to
-read a message and its delivery ID. Pass both task and delivery IDs to
-`acs_task_acknowledge`; this accepts everything observed by that read without
-swallowing a concurrent follow-up. Context delivery stays deferred while that
-thread is not loaded on the connected app-server; ACS does not resume a second
-copy of an active session. Complete accepted tasks with `acs_task_complete`.
+Peer messages use direct native input: Codex receives empty local-user input
+plus named `acs.receive_agent_message` tool output. Idle sessions start a turn;
+supported active sessions accept peer input into the ongoing turn. Runtime
+acceptance is not an acknowledgement that the model has processed the message.
+Several peer requests may share one runtime turn, and each task must be completed
+explicitly with `acs_task_complete`, failed, or put into an input-required state.
+Turn completion never automatically completes an A2A task.
+
+Offline, dormant, locally blocked, and unsupported sessions retain pending
+messages with a diagnostic reason. `acs_inbox_list` and `acs_task_get` are useful
+for inspection, not a replacement for automatic delivery. There is no history
+append fallback or wake-policy flag. Canceling a task never confers ownership of
+a shared turn; the shared-endpoint Codex adapter does not advertise interruption.
+Urgency/preemption remains a separate OpenSpec change, not an implemented feature.
 
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.
@@ -89,25 +98,24 @@ before running the conformance command above.
 
 ## Current conformance boundary
 
-Implemented: standalone Bun binary, SQLite migration and restart, authenticated
-versioned Unix-socket control plane, agent/claim/binding administration, runtime
-diagnostics, A2A v1 Agent Cards and JSON-RPC send/get/list/cancel, durable
-idempotent acceptance, retries and recovery controls, context delivery, result
-capture, task notifications, and the Codex MCP stdio tool surface with
-host-metadata attestation.
+The service includes a standalone Bun binary, native SQLite persistence,
+authenticated Unix-socket control and loopback A2A endpoints, identity/claim/binding
+administration, explicit task callbacks, direct delivery, and recovery controls.
+The initial schema changes directly; development data from the former delivery
+model should use a fresh ACS data directory. There is no legacy-data migration.
 
-Context-only delivery is enabled. Wake delivery is fail-closed by default because
-current Codex queue input cannot preserve named tool-output provenance; it needs
-an explicit per-binding `--allow-non-atomic-wake` policy. Generic
-acceptance-unknown reconciliation is automatic, with operator resolution when
-the Codex adapter cannot prove authoritative history. Wake acceptance can be
-recovered from its durable named function-output marker; context-only ambiguity
-remains operator-owned because injected items are absent from turn history.
-The phase-zero gates are complete. Codex `0.153.2` and `0.153.4` share the pinned
-client protocol, pass delivery probes, and preserve host-owned MCP thread
-metadata for normal and resumed threads. A real Codex `0.153.2` TUI and ACS
-client concurrently discovered the same thread and delivered lifecycle
-notifications through one Unix-socket app-server; reconnect behavior is covered
-by the adapter conformance suite. User-routed command approvals remain exclusive
-to the TUI. `requestUserInput` fans out to every subscribed client, but ACS never
-answers it, so a missing local owner fails closed.
+`bun run test:codex-real` runs an isolated **real Codex binary** against a local
+mock Responses API. It verifies idle and active delivery, several distinct
+messages sharing one turn, tool rather than local-user provenance, delayed model
+input inclusion, exact persisted marker reconciliation, and rejection of
+empty-input context-only steering. No credentials or billable inference are used.
+The native CI matrix checks the supported `0.153.2` and `0.153.4` binaries.
+
+`bun run test:codex-model` is a separate explicit opt-in that uses configured
+Codex authentication and real inference. It has not been run as part of the
+credential-free verification. Neither a mock model nor this isolated smoke test
+proves the complete desktop/TUI ownership and human-approval experience.
+
+See [the verification record](docs/direct-delivery-verification.md) for exact
+scope, commands, and remaining interactive evidence. Do not infer a new delivery
+capability merely from an old compatibility or phase-zero result.

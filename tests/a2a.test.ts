@@ -75,6 +75,42 @@ describe("A2A JSON-RPC", () => {
     store.close();
   });
 
+  test("rejects removed delivery modes before durable acceptance", async () => {
+    const store = fixture(),
+      { token } = store.createToken();
+    store.createAgent("direct");
+    try {
+      for (const mode of ["append_context", "wake_when_idle", "join_active"]) {
+        const response = await handleA2A(
+          store,
+          new Request("http://localhost/agents/direct/a2a", {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: mode,
+              method: "SendMessage",
+              params: {
+                message: { messageId: mode, role: "ROLE_USER", parts: [{ text: "must reject" }] },
+                metadata: { "urn:agent-communications:delivery:v1": { mode } },
+              },
+            }),
+          }),
+          7432,
+        );
+        expect(await response.json()).toMatchObject({
+          error: { message: expect.stringContaining("unknown delivery option") },
+        });
+      }
+      expect(
+        store.db.query<{ count: number }, []>("SELECT count(*) count FROM delivery_intents").get()
+          ?.count,
+      ).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
   test("returns HTTP 429 when delivery admission is full", async () => {
     const store = fixture(1),
       agent = store.createAgent("bounded"),
@@ -585,7 +621,6 @@ describe("A2A JSON-RPC", () => {
         requestMetadata: {},
         messageMetadata: {},
         delivery: {
-          mode: "wake_when_idle",
           priority: "normal",
           notifyOn: ["terminal"],
           replyExpected: true,

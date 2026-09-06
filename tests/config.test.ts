@@ -42,6 +42,14 @@ describe("configuration", () => {
     expect(config.security.maxParts).toBe(8);
     expect(config.security.maxTextPartBytes).toBe(1024);
     expect(config.codex.maxInFlightRequests).toBe(64);
+    for (const removed of [
+      '[delivery]\ndefault_mode = "append_context"\n',
+      "[runtimes.codex]\nallow_non_atomic_wake = true\n",
+      "[runtimes.codex]\nallow_active_turn_steering = true\n",
+    ]) {
+      writeFileSync(path, removed);
+      expect(() => loadConfig(path)).toThrow("unknown");
+    }
     writeFileSync(path, "[daemon]\nunknown = true\n");
     expect(() => loadConfig(path)).toThrow("unknown daemon.unknown");
     writeFileSync(path, '[daemon]\na2a_listen = "0.0.0.0:9000"\n');

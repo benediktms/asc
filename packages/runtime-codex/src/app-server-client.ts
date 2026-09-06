@@ -85,11 +85,31 @@ export class CodexAppServerClient {
     const response = record(await this.request("thread/read", params, undefined, signal));
     return { thread: decodeThread(response.thread) };
   }
-  async findDeliveryMarker(threadId: string, deliveryId: string, signal?: AbortSignal) {
+  async findDeliveryMarker(
+    threadId: string,
+    deliveryId: string,
+    signal?: AbortSignal,
+    payloadHash?: string,
+  ) {
     const response = record(
       await this.request("thread/read", { threadId, includeTurns: true }, undefined, signal),
     );
-    return findDeliveryMarker(response.thread, deliveryId);
+    return findDeliveryMarker(response.thread, deliveryId, payloadHash);
+  }
+  async readExecution(threadId: string, turnId: string, signal?: AbortSignal) {
+    const response = record(
+        await this.request("thread/read", { threadId, includeTurns: true }, undefined, signal),
+      ),
+      thread = record(response.thread);
+    if (!Array.isArray(thread.turns)) throw new Error("invalid app-server turns");
+    const turn = thread.turns.map(record).find((candidate) => candidate.id === turnId);
+    if (!turn) return undefined;
+    if (!Array.isArray(turn.items)) throw new Error("invalid app-server turn items");
+    return {
+      id: stringField(turn, "id"),
+      status: stringField(turn, "status"),
+      items: turn.items.map(record),
+    };
   }
   async startThread(params: CodexThreadStartRequestDto) {
     return record(await this.request("thread/start", params));
@@ -285,7 +305,13 @@ export class CodexAppServerClient {
               pending.onResult?.(message.result);
               pending.resolve(message.result);
             } catch (error) {
-              pending.reject(error instanceof Error ? error : new Error(String(error)));
+              pending.reject(
+                appServerError(
+                  CodexAppServerFailureKind.RequestMarkerFailedAfterWrite,
+                  pending.requestFlushed,
+                  error,
+                ),
+              );
             }
           continue;
         }
@@ -333,7 +359,10 @@ function appServerError(
 function remoteFailureKind(message: string) {
   if (/overload|queue.*full|too many/i.test(message)) return CodexAppServerFailureKind.Backpressure;
   if (/not initialized/i.test(message)) return CodexAppServerFailureKind.NotInitialized;
-  if (/not running/i.test(message)) return CodexAppServerFailureKind.NotRunning;
+  if (
+    /not running|cannot steer|not steerable|non-steerable|does not support steering/i.test(message)
+  )
+    return CodexAppServerFailureKind.NotRunning;
   if (/not found|invalid thread/i.test(message)) return CodexAppServerFailureKind.SessionNotFound;
   if (/method not found|unsupported method/i.test(message))
     return CodexAppServerFailureKind.UnsupportedMethod;
@@ -389,13 +418,17 @@ function decodeThread(value: unknown): CodexThreadDto {
     cwd: stringField(thread, "cwd"),
     cliVersion: stringField(thread, "cliVersion"),
     source: thread.source,
-    status: { type: stringField(status, "type") },
+    status: {
+      type: stringField(status, "type"),
+      activeFlags: status.activeFlags === undefined ? undefined : stringArray(status.activeFlags),
+    },
   };
 }
 
-function findDeliveryMarker(value: unknown, deliveryId: string) {
+function findDeliveryMarker(value: unknown, deliveryId: string, payloadHash?: string) {
   const thread = record(value);
   if (!Array.isArray(thread.turns)) throw new Error("invalid app-server thread turns");
+  let found: { turnId: string } | undefined;
   for (const turnValue of thread.turns) {
     const turn = record(turnValue);
     if (!Array.isArray(turn.items)) throw new Error("invalid app-server turn items");
@@ -408,11 +441,20 @@ function findDeliveryMarker(value: unknown, deliveryId: string) {
         typeof item.output !== "string"
       )
         continue;
+      let envelope: unknown;
       try {
-        const envelope: unknown = JSON.parse(item.output);
-        if (isRecord(envelope) && envelope.deliveryId === deliveryId)
-          return { turnId: stringField(turn, "id") };
-      } catch {}
+        envelope = JSON.parse(item.output);
+      } catch {
+        continue;
+      }
+      if (!isRecord(envelope) || envelope.deliveryId !== deliveryId) continue;
+      if (payloadHash !== undefined && envelope.payloadHash !== payloadHash)
+        throw new Error("conflicting delivery payload hash");
+      const turnId = stringField(turn, "id");
+      if (found && found.turnId !== turnId)
+        throw new Error("delivery marker appears in multiple turns");
+      found = { turnId };
     }
   }
+  return found;
 }

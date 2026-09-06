@@ -34,12 +34,7 @@ import type {
 } from "../../../contracts/runtime-adapter";
 import { CodexAppServerClient } from "./app-server-client";
 import { telemetry } from "../../observability/src/index";
-import {
-  CODEX_PROTOCOL_FINGERPRINT,
-  jsonValue,
-  responseItem,
-  supportsCodexVersion,
-} from "./protocol-codec";
+import { CODEX_PROTOCOL_FINGERPRINT, supportsCodexVersion } from "./protocol-codec";
 
 export { SUPPORTED_CODEX_VERSIONS, TESTED_CODEX_VERSION } from "./protocol-codec";
 
@@ -75,19 +70,16 @@ const capabilities: RuntimeCapabilities = {
   listSessions: true,
   observeSessionState: true,
   observeExecutions: true,
-  appendContext: true,
-  wakeWhenIdle: true,
-  atomicDeferredWake: false,
-  steerActiveExecution: false,
-  cancelOwnedExecution: true,
+  directDelivery: false,
+  // A shared app-server attachment does not establish isolated execution ownership.
+  cancelOwnedExecution: false,
   reconcileDelivery: true,
   callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
   supportedPartKinds: ["text", "uri", "data"],
 };
 const disabledCapabilities = (): RuntimeCapabilities => ({
   ...capabilities,
-  appendContext: false,
-  wakeWhenIdle: false,
+  directDelivery: false,
   cancelOwnedExecution: false,
   reconcileDelivery: false,
 });
@@ -105,13 +97,18 @@ type SessionCursor = {
   vendorCursor?: string;
   storedIds: string[];
 };
+type TrackedExecution = {
+  session: RuntimeSessionRef;
+  deliveries: Map<DeliveryId, string>;
+  finalParts: NeutralPart[];
+};
 
 export class CodexRuntimeAdapter implements RuntimeAdapter {
   readonly descriptor: RuntimeAdapterDescriptor = {
     adapterApiVersion: 1,
     adapterId: "codex.app-server",
     harnessId: "codex",
-    implementationVersion: "0.1.0",
+    implementationVersion: "0.2.0",
     capabilities,
   };
   private client?: CodexAppServerClient;
@@ -120,15 +117,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private runtimeVersion?: string;
   private events: RuntimeEvent[] = [];
   private waiters: Array<() => void> = [];
-  private executions = new Map<
-    string,
-    {
-      deliveryId: DeliveryId;
-      payloadHash: string;
-      session: RuntimeSessionRef;
-      finalParts: NeutralPart[];
-    }
-  >();
+  private executions = new Map<string, TrackedExecution>();
 
   constructor(
     readonly socketPath: string,
@@ -199,14 +188,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         runtimeVersion: this.runtimeVersion,
         protocolFingerprint: CODEX_PROTOCOL_FINGERPRINT,
         capabilities,
-        diagnostics: [
-          {
-            severity: "warning",
-            code: "NON_ATOMIC_WAKE_ONLY",
-            message:
-              "Codex queue input cannot preserve named tool-output provenance; wake requires explicit non-atomic policy.",
-          },
-        ],
+        diagnostics: [],
       };
     } catch (error) {
       if (signal?.aborted) throw error;
@@ -369,81 +351,51 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         retryable: false,
         details: { deadline: "expired" },
       };
-    if (request.mode === "join_active")
-      return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
-    if (request.mode === "wake_when_idle")
-      for (const execution of this.executions.values())
-        if (
-          execution.session.installationId === request.target.session.installationId &&
-          execution.session.opaqueId === request.target.session.opaqueId
-        )
-          return { outcome: "deferred", reason: "busy" };
-    const snapshot = await this.inspectSession(request.target.session, signal);
-    if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
-    if (request.mode === "append_context" && snapshot.availability === "dormant")
-      return { outcome: "deferred", reason: "dormant" };
+    if (!this.client) return { outcome: "deferred", reason: "offline" };
+    if (request.target.session.installationId !== this.requireContext().installationId)
+      return { outcome: "deferred", reason: "route-unavailable" };
     if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
-    if (request.mode === "wake_when_idle") {
-      if (snapshot.availability === "dormant") {
-        if (!request.autoResumeDormantThread) return { outcome: "deferred", reason: "dormant" };
-      } else if (snapshot.availability !== "idle")
-        return {
-          outcome: "deferred",
-          reason:
-            snapshot.availability === "busy" || snapshot.availability === "awaiting-local-input"
-              ? "busy"
-              : "policy",
-        };
-    }
-    const fence = await this.requireContext().assertBindingFence(
-      request.target.bindingId,
-      request.target.bindingEpoch,
-    );
-    if (!fence.valid) return { outcome: "rejected", reason: "stale-binding", retryable: false };
+    const snapshot = await this.inspectSession(request.target.session, signal);
+    if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
+    if (snapshot.availability === "dormant") return { outcome: "deferred", reason: "dormant" };
+    if (snapshot.availability === "awaiting-local-input")
+      return { outcome: "deferred", reason: "local-input" };
+    if (snapshot.availability === "degraded" || snapshot.availability === "unknown")
+      return { outcome: "deferred", reason: "unsupported-active-state" };
     try {
-      if (request.mode === "append_context") {
-        await this.requireClient().injectItems(
-          {
-            threadId: request.target.session.opaqueId,
-            items: [jsonValue(JSON.stringify(responseItem(request.envelope)))],
+      // readThread already established a live owner on this endpoint. Resuming
+      // here is unnecessary and fails for fresh threads without a rollout.
+      const currentFence = await this.requireContext().assertBindingFence(
+        request.target.bindingId,
+        request.target.bindingEpoch,
+        signal,
+      );
+      if (!currentFence.valid)
+        return { outcome: "rejected", reason: "stale-binding", retryable: false };
+      const response = await this.requireClient().startTurn(
+        {
+          threadId: request.target.session.opaqueId,
+          input: [],
+          turnTrigger: "agent-communications-service",
+          toolOutput: {
+            name: "receive_agent_message",
+            namespace: "acs",
+            output: JSON.stringify({ ...request.envelope, payloadHash: request.payloadHash }),
           },
-          request.markRequestFlushed,
-          signal,
-        );
-        return {
-          outcome: "accepted",
-          acceptedAt: new Date().toISOString(),
-          evidence: { scheme: "codex.thread-inject-items.v1", value: request.deliveryId },
-        };
-      }
-      await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
-      const execution = {
-          deliveryId: request.deliveryId,
-          payloadHash: request.payloadHash,
-          session: request.target.session,
-          finalParts: new Array<NeutralPart>(),
         },
-        response = await this.requireClient().startTurn(
-          {
-            threadId: request.target.session.opaqueId,
-            input: [],
-            turnTrigger: "agent-communications-service",
-            toolOutput: {
-              name: "receive_agent_message",
-              namespace: "acs",
-              output: JSON.stringify(request.envelope),
-            },
-          },
-          request.markRequestFlushed,
-          signal,
-          (turnId) => this.executions.set(turnId, execution),
-        );
+        request.markRequestFlushed,
+        signal,
+        (turnId) => this.trackExecution(turnId, request),
+      );
+      // Subscription/observation is independent of the already-accepted input.
+      // A fresh thread acquires a rollout only after its first turn is admitted.
+      await this.observeAcceptedExecution(request, response.turn.id, signal);
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
-        execution: { opaqueId: response.turn.id, alreadyRunning: false },
-        evidence: { scheme: "codex.turn-start.v1", value: response.turn.id },
+        execution: { opaqueId: response.turn.id, relationship: "unknown" },
+        evidence: { scheme: "codex.turn-start.tool-output.v1", value: response.turn.id },
       };
     } catch (error: unknown) {
       const failure = appServerFailure(error);
@@ -460,8 +412,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       if (failure.kind === CodexAppServerFailureKind.SessionNotFound)
         return { outcome: "rejected", reason: "session-not-found", retryable: false };
       if (sessionUnavailable(failure.kind)) return { outcome: "deferred", reason: "offline" };
-      if (failure.kind === CodexAppServerFailureKind.UnsupportedMethod)
-        return { outcome: "rejected", reason: "unsupported-mode", retryable: false };
+      if (failure.kind === CodexAppServerFailureKind.NotRunning)
+        return { outcome: "deferred", reason: "unsupported-active-state" };
       return {
         outcome: "rejected",
         reason: "runtime-protocol-error",
@@ -493,11 +445,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         request.target.session.opaqueId,
         request.deliveryId,
         signal,
+        request.payloadHash,
       );
       return marker
         ? {
             outcome: "accepted",
-            execution: { opaqueId: marker.turnId },
+            execution: { opaqueId: marker.turnId, relationship: "unknown" },
             evidence: {
               scheme: "codex.function-call-output.v1",
               value: request.deliveryId,
@@ -505,7 +458,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           }
         : {
             outcome: "inconclusive",
-            reason: "Codex history does not contain a durable wake marker",
+            reason: "Codex history does not contain the exact direct-delivery marker",
             operatorActionRequired: true,
           };
     } catch (error: unknown) {
@@ -518,32 +471,66 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     }
   }
-  async cancel(request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
+  async cancel(_request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
     this.assertRunning();
     signal?.throwIfAborted();
-    if (!supportsCodexVersion(this.runtimeVersion))
-      return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
-    if (!this.executions.has(request.execution.opaqueId))
-      return { outcome: "rejected", reason: "not-owned", retryable: false };
-    const fence = await this.requireContext().assertBindingFence(
-      request.execution.bindingId,
-      request.execution.bindingEpoch,
-    );
-    if (!fence.valid) return { outcome: "rejected", reason: "stale-binding", retryable: false };
+    // A delivery receipt (even for a single task) is not a lease on the entire
+    // thread. This shared-endpoint adapter cannot prove exclusive ownership.
+    return { outcome: "rejected", reason: "not-owned", retryable: false };
+  }
+  private async observeAcceptedExecution(
+    request: RuntimeDeliveryRequest,
+    turnId: string,
+    signal?: AbortSignal,
+  ) {
     try {
-      await this.requireClient().interruptTurn(
-        request.execution.session.opaqueId,
-        request.execution.opaqueId,
+      const fence = await this.requireContext().assertBindingFence(
+        request.target.bindingId,
+        request.target.bindingEpoch,
         signal,
       );
-      return { outcome: "accepted", acceptedAt: new Date().toISOString() };
-    } catch (error: unknown) {
-      const failure = appServerFailure(error);
-      return failure.kind === CodexAppServerFailureKind.NotRunning ||
-        failure.kind === CodexAppServerFailureKind.SessionNotFound
-        ? { outcome: "not-running" }
-        : { outcome: "unknown", reason: `Codex cancellation failed (${failure.kind})` };
+      if (!fence.valid) return;
+      // Only the endpoint just proven to own this accepted live turn is used.
+      // Never retry input because listener attachment or projection fails.
+      await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
+      const turn = await this.requireClient().readExecution(
+        request.target.session.opaqueId,
+        turnId,
+        signal,
+      );
+      if (!turn) return;
+      const execution = this.executions.get(executionKey(request.target.session.opaqueId, turnId));
+      if (!execution) return;
+      for (const item of turn.items) {
+        if (item.type === "agentMessage" && typeof item.text === "string")
+          execution.finalParts = [{ kind: "text", text: item.text, mediaType: "text/markdown" }];
+      }
+      if (["completed", "interrupted", "failed"].includes(turn.status))
+        this.handleNotification("turn/completed", {
+          threadId: request.target.session.opaqueId,
+          turn,
+        });
+    } catch {
+      this.requireContext().logger.warn("runtime.observation-deferred", {
+        deliveryId: request.deliveryId,
+      });
+      if (!this.stopped)
+        setTimeout(() => void this.observeAcceptedExecution(request, turnId), 1_000).unref();
     }
+  }
+  private trackExecution(turnId: string, request: RuntimeDeliveryRequest) {
+    const existing = this.executions.get(executionKey(request.target.session.opaqueId, turnId));
+    if (existing) {
+      existing.deliveries.set(request.deliveryId, request.payloadHash);
+      return existing;
+    }
+    const execution: TrackedExecution = {
+      session: request.target.session,
+      deliveries: new Map([[request.deliveryId, request.payloadHash]]),
+      finalParts: [],
+    };
+    this.executions.set(executionKey(request.target.session.opaqueId, turnId), execution);
+    return execution;
   }
   private snapshot(thread: CodexThreadDto): RuntimeSessionSnapshot {
     return {
@@ -603,21 +590,20 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       });
     }
     if (method === "turn/started" && isTurnStarted(params)) {
-      const execution = this.executions.get(params.turn.id);
+      const execution = this.executions.get(executionKey(params.threadId, params.turn.id));
       if (execution)
         this.emit({
           type: "execution.started",
           session: execution.session,
           execution: { opaqueId: params.turn.id, session: execution.session },
           correlation: {
-            deliveryId: execution.deliveryId,
-            payloadHash: execution.payloadHash,
+            deliveryIds: [...execution.deliveries.keys()],
           },
         });
     }
     if (method === "item/completed" && isItemCompleted(params)) {
       const event = params,
-        execution = this.executions.get(event.turnId);
+        execution = this.executions.get(executionKey(event.threadId, event.turnId));
       if (
         execution &&
         event.item.type === "agentMessage" &&
@@ -636,7 +622,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     if (method === "turn/completed" && isTurnCompleted(params)) {
       const event = params,
-        execution = this.executions.get(event.turn.id);
+        execution = this.executions.get(executionKey(event.threadId, event.turn.id));
       if (execution) {
         const outcome =
           event.turn.status === "completed"
@@ -650,13 +636,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           outcome,
           finalParts: execution.finalParts,
         });
-        this.executions.delete(event.turn.id);
+        this.executions.delete(executionKey(event.threadId, event.turn.id));
       }
     }
   }
   private handleRequest(requestId: string, method: string, params: unknown) {
     if (!isRuntimeInputRequest(params)) return;
-    const execution = this.executions.get(params.turnId);
+    const execution = this.executions.get(executionKey(params.threadId, params.turnId));
     if (!execution) return;
     this.emit({
       type: "execution.awaiting-local-input",
@@ -727,12 +713,16 @@ function runtimeSourceKind(source: unknown) {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function isItemCompleted(
-  value: unknown,
-): value is { turnId: string; item: { type: "agentMessage"; text: string } | { type: string } } {
+function isItemCompleted(value: unknown): value is {
+  threadId: string;
+  turnId: string;
+  item: { type: "agentMessage"; text: string } | { type: string };
+} {
   return (
     typeof value === "object" &&
     value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
     "turnId" in value &&
     typeof value.turnId === "string" &&
     "item" in value &&
@@ -744,12 +734,15 @@ function isItemCompleted(
       ("text" in value.item && typeof value.item.text === "string"))
   );
 }
-function isTurnCompleted(
-  value: unknown,
-): value is { turn: { id: string; status: "completed" | "interrupted" | string } } {
+function isTurnCompleted(value: unknown): value is {
+  threadId: string;
+  turn: { id: string; status: "completed" | "interrupted" | string };
+} {
   return (
     typeof value === "object" &&
     value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
     "turn" in value &&
     typeof value.turn === "object" &&
     value.turn !== null &&
@@ -774,10 +767,14 @@ function isTurnStarted(value: unknown): value is { threadId: string; turn: { id:
   );
 }
 
-function isRuntimeInputRequest(value: unknown): value is { turnId: string; isBlocking?: boolean } {
+function isRuntimeInputRequest(
+  value: unknown,
+): value is { threadId: string; turnId: string; isBlocking?: boolean } {
   return (
     typeof value === "object" &&
     value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
     "turnId" in value &&
     typeof value.turnId === "string" &&
     (!("isBlocking" in value) || typeof value.isBlocking === "boolean")
@@ -807,7 +804,7 @@ function deliveryAmbiguous(kind: CodexAppServerFailureKind) {
 }
 function isThreadStatusChanged(
   value: unknown,
-): value is { threadId: string; status: { type: string } } {
+): value is { threadId: string; status: { type: string; activeFlags?: string[] } } {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -816,19 +813,29 @@ function isThreadStatusChanged(
     "status" in value &&
     typeof value.status === "object" &&
     value.status !== null &&
-    "type" in value.status
+    "type" in value.status &&
+    typeof value.status.type === "string" &&
+    (!("activeFlags" in value.status) ||
+      (Array.isArray(value.status.activeFlags) &&
+        value.status.activeFlags.every((flag) => typeof flag === "string")))
   );
 }
 
 function status(thread: CodexThreadDto): RuntimeAvailability {
   return statusType(thread.status);
 }
-function statusType(value: { type: string }): RuntimeAvailability {
+function statusType(value: { type: string; activeFlags?: readonly string[] }): RuntimeAvailability {
   switch (value.type) {
     case "idle":
       return "idle";
     case "active":
-      return "busy";
+      if (
+        value.activeFlags?.some(
+          (flag) => flag === "waitingOnApproval" || flag === "waitingOnUserInput",
+        )
+      )
+        return "awaiting-local-input";
+      return value.activeFlags?.length ? "degraded" : "busy";
     case "notLoaded":
       return "dormant";
     case "systemError":
@@ -836,4 +843,8 @@ function statusType(value: { type: string }): RuntimeAvailability {
     default:
       return "unknown";
   }
+}
+
+function executionKey(threadId: string, turnId: string) {
+  return JSON.stringify([threadId, turnId]);
 }

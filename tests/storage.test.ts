@@ -529,7 +529,7 @@ describe("durable acceptance", () => {
       parts: [{ text: "work" }],
     });
     const accepted = store.accept(target.id, senderBinding.principalId, message, {
-      mode: "wake_when_idle",
+      mode: "direct",
       priority: "normal",
       notifyOn: ["terminal"],
       replyExpected: true,
@@ -634,7 +634,7 @@ describe("durable acceptance", () => {
           role: Role.ROLE_USER,
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       );
     store.db
       .query("UPDATE delivery_intents SET pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?")

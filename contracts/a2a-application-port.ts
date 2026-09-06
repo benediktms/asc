@@ -23,7 +23,6 @@ export interface A2ATarget {
 }
 
 export interface DeliveryPreference {
-  readonly mode: "wake_when_idle" | "append_context";
   readonly priority: "low" | "normal" | "high";
   readonly notifyOn: readonly (
     | "working"

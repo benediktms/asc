@@ -64,7 +64,6 @@ export interface AcsMcpToolMap {
     readonly input: {
       readonly claimCode: string;
       readonly continuityPolicy?: "follow-pending" | "strict";
-      readonly allowNonAtomicWake?: boolean;
       readonly revokeExisting?: boolean;
     };
     readonly output: McpToolResult<{
@@ -127,7 +126,6 @@ export interface AcsMcpToolMap {
       readonly text: string;
       readonly taskId?: string;
       readonly contextId?: string;
-      readonly delivery?: "wake_when_idle" | "append_context";
       readonly priority?: "low" | "normal" | "high";
       readonly replyExpected?: boolean;
       readonly notifyOn?: readonly (
