@@ -62,7 +62,7 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     ACS_LOG_FORMAT: "json",
     PATH: `${bin}:/usr/bin:/bin`,
   };
-  expect(Bun.spawnSync([binary, "init"], { env }).exitCode).toBe(0);
+  expect(Bun.spawnSync([binary, "init", "--no-service"], { env }).exitCode).toBe(0);
   expect(existsSync(join(root, "acs.db"))).toBe(false);
   const tokenStore = new Store({
       data: join(root, "acs.db"),
@@ -88,6 +88,14 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   const socket = join(root, "control.sock");
   await waitFor(() => existsSync(socket));
   expect(statSync(socket).mode & 0o777).toBe(0o600);
+  const duplicateDaemon = Bun.spawn([binary, "daemon", "start"], {
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(await duplicateDaemon.exited).toBe(1);
+  expect(await new Response(duplicateDaemon.stderr).text()).toContain("already running");
+  expect(existsSync(socket)).toBe(true);
   for (const file of ["control.token", "bridge.token", "secret.key"])
     expect(statSync(join(root, file)).mode & 0o777).toBe(0o600);
   const resolution = Bun.spawnSync([binary, "deliveries", "resolve", "int_missing", "--accepted"], {

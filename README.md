@@ -8,8 +8,30 @@ bun run check
 bun run format
 bun run build
 ./dist/acs init
-./dist/acs daemon start
 ```
+
+On macOS, `init` installs and starts a `launchd` user service and registers the
+global Codex MCP bridge with the same socket path. The service starts at login
+and restarts if it exits; logs are in `~/Library/Logs/asc.log`. Re-running `init`
+updates the registration. Restart existing Codex sessions to load the MCP tools.
+Use `acs init --no-service` for file initialization only (for example in tests).
+On other platforms, start `acs daemon start` under your service manager.
+
+`init` migrates a running foreground daemon to the login service and restarts
+an existing service so rebuilt binaries take effect. `acs daemon start` refuses
+to replace a live control socket.
+
+### Receiving messages in independently launched sessions
+
+MCP registration and runtime delivery are separate connections. A successful
+`acs_identity` proves the session's identity, not that ASC's shared app-server
+hosts it. For automatic context delivery, launch/resume the recipient through
+the shared endpoint (`codex --remote unix:// resume <session-id>`).
+
+If the recipient runs elsewhere, use `acs_inbox_list` then `acs_task_get` to
+read its messages through MCP. Context delivery stays deferred while that
+thread is not loaded on the connected app-server; ASC does not resume a second
+copy of an active session. Complete consumed tasks with `acs_task_complete`.
 
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.

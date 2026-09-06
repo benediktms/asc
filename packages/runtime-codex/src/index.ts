@@ -380,6 +380,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           return { outcome: "deferred", reason: "busy" };
     const snapshot = await this.inspectSession(request.target.session, signal);
     if (snapshot.availability === "offline") return { outcome: "deferred", reason: "offline" };
+    if (request.mode === "append_context" && snapshot.availability === "dormant")
+      return { outcome: "deferred", reason: "dormant" };
     if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     if (request.mode === "wake_when_idle") {

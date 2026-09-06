@@ -37,7 +37,7 @@ export class A2AApplication implements A2AApplicationPort {
       requesterPrincipalId: command.principal.id,
       state: taskState(accepted.task),
       stateVersion: accepted.stateVersion ?? this.storage.taskVersion(accepted.task.id),
-      a2aSnapshot: jsonObject(accepted.task),
+      a2aSnapshot: taskSnapshot(accepted.task),
       deliveryId: accepted.deliveryId,
       duplicate: accepted.duplicate,
     };
@@ -46,7 +46,7 @@ export class A2AApplication implements A2AApplicationPort {
   async getTask(query: A2ATaskQuery): Promise<JsonObject> {
     const task = this.storage.task(query.taskId, query.principal.id, query.target.agentId);
     if (!task) throw new Error("ACS_TASK_NOT_VISIBLE");
-    return jsonObject(trim(task, query.historyLength));
+    return taskSnapshot(trim(task, query.historyLength));
   }
 
   async listTasks(query: A2ATaskListQuery) {
@@ -62,7 +62,7 @@ export class A2AApplication implements A2AApplicationPort {
     });
     return {
       tasks: page.tasks.map((task) =>
-        jsonObject({
+        taskSnapshot({
           ...trim(task, query.historyLength),
           artifacts: query.includeArtifacts ? task.artifacts : [],
         }),
@@ -75,7 +75,7 @@ export class A2AApplication implements A2AApplicationPort {
   async cancelTask(command: CancelA2ATaskCommand): Promise<JsonObject> {
     const task = this.storage.task(command.taskId, command.principal.id, command.target.agentId);
     if (!task) throw new Error("ACS_TASK_NOT_VISIBLE");
-    return jsonObject(
+    return taskSnapshot(
       this.storage.requestCancellation(command.taskId, command.principal.id, command.reason),
     );
   }
@@ -101,7 +101,7 @@ export class A2AApplication implements A2AApplicationPort {
       replay.at(-1)?.sequence ?? state.sequence,
     );
     return {
-      currentTask: jsonObject(state.task),
+      currentTask: taskSnapshot(state.task),
       replay,
       live: {
         async *[Symbol.asyncIterator]() {
@@ -217,9 +217,33 @@ function eventRecord(event: {
     taskId: event.task.id,
     sequence: event.sequence,
     eventType: event.eventType,
-    a2aEvent: jsonObject(event.task),
+    a2aEvent: taskSnapshot(event.task),
     createdAt: event.createdAt,
   };
+}
+
+function taskSnapshot(task: StoredTask): JsonObject {
+  return jsonObject({
+    ...task,
+    history: task.history.map(messageSnapshot),
+    status: task.status && {
+      ...task.status,
+      message: task.status.message && messageSnapshot(task.status.message),
+    },
+    artifacts: task.artifacts.map((artifact) => ({
+      ...artifact,
+      parts: artifact.parts.map(partSnapshot),
+    })),
+  });
+}
+
+function messageSnapshot(stored: StoredMessage) {
+  return { ...stored, parts: stored.parts.map(partSnapshot) };
+}
+
+function partSnapshot(part: StoredPart) {
+  const { content, ...attributes } = part;
+  return content ? { ...attributes, [content.$case]: content.value } : attributes;
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
