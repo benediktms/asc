@@ -1,11 +1,37 @@
 # Runtime-neutral agent spawning (WIP specification)
 
-Status: research result for #13; not a production API
+Status: supporting research result for #13; not a production API or a normative specification
 
 This specification describes a lifecycle control plane that can create runtime
 sessions and register them as ordinary ASC agents. It does not change A2A: once
 registered, a spawned agent has the same addressability and peer communication
 rules as an attached agent. Origin is metadata, not hierarchy.
+
+## Docker backend assessment (2026-09-06)
+
+The source-backed follow-up is the OpenSpec change
+[`evaluate-spawn-execution-backends`](../openspec/changes/evaluate-spawn-execution-backends/proposal.md),
+with its [research and design](../openspec/changes/evaluate-spawn-execution-backends/design.md),
+[proposed requirements](../openspec/changes/evaluate-spawn-execution-backends/specs/spawn-execution-backends/spec.md)
+and [evaluation tasks](../openspec/changes/evaluate-spawn-execution-backends/tasks.md).
+Current main's OpenSpec specifications take precedence over this older research
+draft and ADR-012. The new delta covers execution-backend selection; it does not
+approve or migrate every foundational spawning requirement below.
+
+Recommendation: retain direct Codex app-server spawning as the baseline; separate
+harness, execution environment and workspace selection in operator-owned profiles.
+Docker Agent can launch Codex harness agents, but the reviewed path uses
+noninteractive `codex exec` with approval and sandbox bypass rather than ACS's
+shared app-server boundary. It is not a transparent default replacement.
+Docker Sandboxes is a distinct, optional execution-environment candidate, subject
+to transport, attestation, permission, recovery, Git and resource-cost evidence.
+Neither Docker product becomes an ACS dependency in this update.
+
+The OpenSpec design records exact source revisions and the distinction between
+observed behavior and proposed integration. In particular, mounting a host Git
+worktree alone does not establish in-sandbox Git access; VM-local clones require
+verified export/retention before deletion. No live Docker integration or benchmark
+was executed. The original prototype results below are unchanged.
 
 ## Recommendation
 
