@@ -20,7 +20,7 @@ import {
   writeDefaultConfig,
 } from "../../../packages/config/src/index";
 import { pickSession, type SessionChoice } from "./session-picker";
-import { installService } from "./service";
+import { installService, persistentEnvironment } from "./service";
 
 const args = Bun.argv.slice(2),
   config = paths(),
@@ -163,7 +163,7 @@ function serviceEnvironment() {
   environment.ACS_CONTROL_SOCKET = config.runtime;
   environment.ACS_STORAGE_PATH = config.data;
   environment.ACS_CODEX_BINARY = Bun.which(settings.codex.binary) ?? settings.codex.binary;
-  return environment;
+  return persistentEnvironment(environment);
 }
 
 function installMcp() {

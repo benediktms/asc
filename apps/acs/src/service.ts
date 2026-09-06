@@ -1,5 +1,21 @@
 import { mkdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
+
+export function persistentEnvironment(environment: Record<string, string>, cwd = process.cwd()) {
+  const normalized = { ...environment };
+  for (const key of [
+    "CODEX_HOME",
+    "ACS_HOME",
+    "ACS_CONFIG_PATH",
+    "ACS_CONTROL_SOCKET",
+    "ACS_STORAGE_PATH",
+    "ACS_CODEX_SOCKET",
+  ])
+    if (normalized[key]) normalized[key] = resolve(cwd, normalized[key]);
+  if (normalized.ACS_CODEX_BINARY?.includes("/"))
+    normalized.ACS_CODEX_BINARY = resolve(cwd, normalized.ACS_CODEX_BINARY);
+  return normalized;
+}
 
 export function launchAgent(options: {
   command: string[];

@@ -2,7 +2,28 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installService, launchAgent } from "../apps/acs/src/service";
+import { installService, launchAgent, persistentEnvironment } from "../apps/acs/src/service";
+
+test("persistent runtime paths are absolute", () => {
+  expect(
+    persistentEnvironment(
+      {
+        ACS_HOME: ".acs",
+        ACS_CONFIG_PATH: "config.toml",
+        ACS_STORAGE_PATH: "data/acs.db",
+        ACS_CONTROL_SOCKET: "run/control.sock",
+        ACS_CODEX_BINARY: "codex",
+      },
+      "/work/repo",
+    ),
+  ).toMatchObject({
+    ACS_HOME: "/work/repo/.acs",
+    ACS_CONFIG_PATH: "/work/repo/config.toml",
+    ACS_STORAGE_PATH: "/work/repo/data/acs.db",
+    ACS_CONTROL_SOCKET: "/work/repo/run/control.sock",
+    ACS_CODEX_BINARY: "codex",
+  });
+});
 
 test("login service preserves executable arguments and the bridge socket environment", () => {
   const agent = launchAgent({
