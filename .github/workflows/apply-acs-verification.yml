@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Verify every original and resulting file, then apply
+      - name: Verify every original and resulting file, then apply source fixes
         shell: bash
         run: |
           set -euo pipefail
@@ -31,6 +31,7 @@ jobs:
           assert hashlib.sha256(payload).hexdigest() == '0fd197364fdddadd378b09fa229c73b12cebb2f3de81c7be47c7193f26441afc', 'payload checksum mismatch'
           changes = json.loads(payload)
           outputs = []
+          changed_paths = []
           for change in changes:
               relative = pathlib.PurePosixPath(change['path'])
               assert not relative.is_absolute() and '..' not in relative.parts and '.git' not in relative.parts
@@ -46,17 +47,20 @@ jobs:
               result = ''.join(lines).encode() if change['after'] is not None else None
               digest = hashlib.sha256(result).hexdigest() if result is not None else None
               assert digest == change['after'], f'result checksum mismatch: {relative}'
+              # Workflow edits require the connector's separate workflow permission.
+              if str(relative).startswith('.github/workflows/'):
+                  continue
               outputs.append((path, result))
+              changed_paths.append(str(relative))
           for path, result in outputs:
               if result is None:
                   path.unlink()
               else:
                   path.parent.mkdir(parents=True, exist_ok=True)
                   path.write_bytes(result)
-          temporary = staged + ['.github/workflows/apply-acs-verification.yml']
-          for path in temporary:
+          for path in staged:
               (root / path).unlink()
-          subprocess.run(['git', 'add', '-A', '--', *[c['path'] for c in changes], *temporary], check=True)
+          subprocess.run(['git', 'add', '-A', '--', *changed_paths, *staged], check=True)
           PY
           git diff --cached --check
           git diff --cached --stat
