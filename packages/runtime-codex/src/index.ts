@@ -711,9 +711,7 @@ function runtimeSourceKind(source: unknown) {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function isItemCompleted(
-  value: unknown,
-): value is {
+function isItemCompleted(value: unknown): value is {
   threadId: string;
   turnId: string;
   item: { type: "agentMessage"; text: string } | { type: string };
@@ -734,9 +732,7 @@ function isItemCompleted(
       ("text" in value.item && typeof value.item.text === "string"))
   );
 }
-function isTurnCompleted(
-  value: unknown,
-): value is {
+function isTurnCompleted(value: unknown): value is {
   threadId: string;
   turn: { id: string; status: "completed" | "interrupted" | string };
 } {

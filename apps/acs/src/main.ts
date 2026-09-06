@@ -467,7 +467,8 @@ async function doctor() {
       mcpAttestation: "verified on Codex 0.153.2 and 0.153.4",
       sharedAppServer,
       directDelivery: "named tool-output submission is the only automatic peer-message path",
-      deliveryReconciliation: "exact delivery markers are required; inconclusive writes remain operator-owned",
+      deliveryReconciliation:
+        "exact delivery markers are required; inconclusive writes remain operator-owned",
       approvalOwnership:
         "verified: user approvals remain TUI-owned; ACS never answers local-input requests",
     },
