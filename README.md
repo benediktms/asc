@@ -74,15 +74,15 @@ Activate mise in your shell, or prefix commands with `mise exec --`.
 TCK). JavaScript dependencies, including Codex `0.153.2`, are already pinned
 in `package.json` and `bun.lock`.
 
-Behavioral requirements now live in [OpenSpec specs](openspec/specs).
-Use the generated Codex skills: `$openspec-propose` to propose a change,
-`$openspec-apply-change` to implement it, and `$openspec-archive-change` to
-archive it after verification. Validate artifacts with `mise run specs:check`.
-The [OpenSpec workflow documentation](https://github.com/Fission-AI/OpenSpec)
-describes the workflow. Existing `docs/adr`, security documentation, and typed
-`contracts/` remain supporting references; keep them consistent with the specs.
-OpenSpec is the planning workflow for new changes; existing local Threadmark
-history is retained as historical context.
+Behavioral and architectural requirements live in [OpenSpec specs](openspec/specs),
+which are the sole normative specification source for ACS. Use the generated
+Codex skills: `$openspec-propose` to propose a change, `$openspec-apply-change`
+to implement it, and `$openspec-archive-change` to archive it after verification.
+Validate artifacts with `mise run specs:check`. The [OpenSpec workflow documentation](https://github.com/Fission-AI/OpenSpec)
+describes the workflow. README/operator docs, security documentation, typed
+contracts, tests, and implementation code are supporting artifacts and must
+conform to OpenSpec; do not introduce new architecture requirements outside it.
+Existing local Threadmark history is retained as historical context.
 
 For the external TCK checkout, use `uv sync --frozen --python "$(command -v python)" --directory "$A2A_TCK_DIR"`
 before running the conformance command above.
