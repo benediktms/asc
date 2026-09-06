@@ -946,7 +946,7 @@ export class Store {
           { id: string; state: DeliveryState; state_reason: string | null; attempt_count: number },
           [string]
         >(
-          "SELECT id,state,state_reason,attempt_count FROM delivery_intents WHERE task_id=? AND kind='a2a-message' ORDER BY created_at_ms DESC,id DESC LIMIT 1",
+          "SELECT id,state,state_reason,attempt_count FROM delivery_intents WHERE task_id=? AND kind='a2a-message' ORDER BY rowid DESC LIMIT 1",
         )
         .get(taskId);
     if (!delivery) return task;
@@ -1278,6 +1278,39 @@ export class Store {
       this.transitionTask(taskId, principalId, next, summary, details),
     );
   }
+  acknowledgeTask(taskId: string, principalId: string, deliveryId?: string) {
+    return this.write(() => {
+      const row = this.assignedTask(taskId, principalId);
+      if (deliveryId) {
+        const observed = this.db
+          .query<{ sequence: number }, [string, string]>(
+            "SELECT rowid sequence FROM delivery_intents WHERE id=? AND task_id=? AND kind='a2a-message'",
+          )
+          .get(deliveryId, taskId);
+        if (!observed) throw new Error("DELIVERY_NOT_FOUND");
+        const deliveries = this.db
+          .query<DeliveryIntentRow, [string, number]>(
+            "SELECT * FROM delivery_intents WHERE task_id=? AND kind='a2a-message' AND state IN ('pending','deferred','leased','attempting','acceptance-unknown') AND rowid<=?",
+          )
+          .all(taskId, observed.sequence);
+        if (
+          deliveries.some(
+            (delivery) => ![DeliveryState.Pending, DeliveryState.Deferred].includes(delivery.state),
+          )
+        )
+          throw new Error("DELIVERY_IN_PROGRESS");
+        const now = Date.now();
+        for (const delivery of deliveries)
+          this.db
+            .query(
+              "UPDATE delivery_intents SET state=?,state_reason='inbox-acknowledged',lease_owner=NULL,lease_expires_at_ms=NULL,updated_at_ms=? WHERE id=?",
+            )
+            .run(transitionDelivery(delivery.state, DeliveryState.Canceled), now, delivery.id);
+      }
+      if (row.state === TaskState.Working) return parseTask(row.a2a_snapshot_json);
+      return this.setTaskState(taskId, principalId, TaskState.Working);
+    });
+  }
   completeTask(taskId: string, principalId: string, summary: string, artifacts: StoredArtifact[]) {
     return this.write(() => {
       const row = this.assignedTask(taskId, principalId),
@@ -1288,6 +1321,14 @@ export class Store {
         throw new Error("TASK_STATE_CONFLICT");
       }
       if (terminalTaskState(row.state)) throw new Error("TASK_STATE_CONFLICT");
+      if (
+        this.db
+          .query(
+            "SELECT 1 FROM delivery_intents WHERE task_id=? AND kind='a2a-message' AND state IN ('pending','deferred','leased','attempting','acceptance-unknown') LIMIT 1",
+          )
+          .get(taskId)
+      )
+        throw new Error("UNACKNOWLEDGED_MESSAGES");
       if (artifacts.length) this.publishArtifacts(taskId, principalId, artifacts);
       return this.setTaskState(taskId, principalId, TaskState.Completed, summary);
     });

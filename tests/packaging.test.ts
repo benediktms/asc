@@ -286,6 +286,25 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     ).data,
   );
   expect(record(assignedGetData.task).id).toBe(mcpTaskId);
+  const receivedDeliveryId = string(assignedGetData.deliveryId, JSON.stringify(assignedGetData));
+  mcp.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: {
+        name: "acs_task_acknowledge",
+        arguments: { taskId: mcpTaskId, deliveryId: receivedDeliveryId },
+        _meta: { threadId: "thread-receiver" },
+      },
+    })}\n`,
+  );
+  const acknowledgeData = record(
+    record(
+      record(jsonRpcResponse(await readUntil(mcp.stdout, '"id":32'), 32).result).structuredContent,
+    ).data,
+  );
+  expect(acknowledgeData).toMatchObject({ taskId: mcpTaskId, state: "working" });
   mcp.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",

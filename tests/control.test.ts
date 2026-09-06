@@ -442,12 +442,19 @@ describe("control protocol", () => {
       await (
         await call(
           "executor.task.acknowledge",
-          { evidence: callerEvidence, taskId: assigned.task.id },
+          { evidence: callerEvidence, taskId: assigned.task.id, deliveryId: assigned.deliveryId },
           "1",
           bridgeToken,
         )
       ).json(),
     ).toMatchObject({ result: { task: { id: assigned.task.id, state: "working" } } });
+    expect(
+      store.db
+        .query<{ state: string; state_reason: string }, [string]>(
+          "SELECT state,state_reason FROM delivery_intents WHERE id=?",
+        )
+        .get(assigned.deliveryId),
+    ).toEqual({ state: "canceled", state_reason: "inbox-acknowledged" });
     expect(
       await (
         await call(
@@ -480,6 +487,47 @@ describe("control protocol", () => {
       updatedAt: expect.any(String),
     });
     expect(record(completed.task).status).toBeUndefined();
+    const firstMessage = store.accept(
+        required(store.agent("backend"), "backend").id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "observed-before-followup",
+          role: Role.ROLE_USER,
+          parts: [{ text: "first" }],
+        }),
+        {},
+      ),
+      followup = store.accept(
+        required(store.agent("backend"), "backend").id,
+        principal.id,
+        Message.fromJSON({
+          messageId: "unobserved-followup",
+          taskId: firstMessage.task.id,
+          contextId: firstMessage.task.contextId,
+          role: Role.ROLE_USER,
+          parts: [{ text: "second" }],
+        }),
+        {},
+      ),
+      backendPrincipal = required(store.authenticate(issuedToken), "backend principal").id;
+    store.acknowledgeTask(firstMessage.task.id, backendPrincipal, firstMessage.deliveryId);
+    expect(
+      store.db
+        .query<{ id: string; state: string }, [string]>(
+          "SELECT id,state FROM delivery_intents WHERE task_id=? ORDER BY rowid",
+        )
+        .all(firstMessage.task.id),
+    ).toEqual([
+      { id: firstMessage.deliveryId, state: "canceled" },
+      { id: followup.deliveryId, state: "pending" },
+    ]);
+    expect(() =>
+      store.completeTask(firstMessage.task.id, backendPrincipal, "premature", []),
+    ).toThrow("UNACKNOWLEDGED_MESSAGES");
+    store.acknowledgeTask(firstMessage.task.id, backendPrincipal, followup.deliveryId);
+    expect(
+      store.completeTask(firstMessage.task.id, backendPrincipal, "both handled", []).status?.state,
+    ).toBe(A2ATaskState.TASK_STATE_COMPLETED);
     const atomic = store.accept(
       required(store.agent("backend"), "backend").id,
       principal.id,
@@ -492,7 +540,7 @@ describe("control protocol", () => {
     );
     await call(
       "executor.task.acknowledge",
-      { evidence: callerEvidence, taskId: atomic.task.id },
+      { evidence: callerEvidence, taskId: atomic.task.id, deliveryId: atomic.deliveryId },
       "1",
       bridgeToken,
     );

@@ -28,10 +28,12 @@ MCP registration and runtime delivery are separate connections. A successful
 hosts it. For automatic context delivery, launch/resume the recipient through
 the shared endpoint (`codex --remote unix:// resume <session-id>`).
 
-If the recipient runs elsewhere, use `acs_inbox_list` then `acs_task_get` to
-read its messages through MCP. Context delivery stays deferred while that
+If the recipient runs elsewhere, use `acs_inbox_list`, then `acs_task_get` to
+read a message and its delivery ID. Pass both task and delivery IDs to
+`acs_task_acknowledge`; this accepts everything observed by that read without
+swallowing a concurrent follow-up. Context delivery stays deferred while that
 thread is not loaded on the connected app-server; ASC does not resume a second
-copy of an active session. Complete consumed tasks with `acs_task_complete`.
+copy of an active session. Complete accepted tasks with `acs_task_complete`.
 
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
 binding, diagnostics, and MCP bridge commands.

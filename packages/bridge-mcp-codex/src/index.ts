@@ -379,7 +379,7 @@ export async function runMcp(port = 7432) {
             historyLength: args.historyLength,
           }),
         );
-        return { task };
+        return { task, deliveryId: task.metadata?.[deliveryStatus]?.deliveryId };
       }),
   );
   server.registerTool(
@@ -448,6 +448,27 @@ export async function runMcp(port = 7432) {
           state,
           cancellationRequested:
             state === "canceled" || task.metadata?.[cancellationStatus]?.requested === true,
+        };
+      }),
+  );
+  server.registerTool(
+    "acs_task_acknowledge",
+    {
+      description: "Acknowledge an inbox task and start working on it",
+      inputSchema: { taskId: z.string(), deliveryId: z.string() },
+    },
+    async (args, extra) =>
+      execute(async () => {
+        await attest(extra);
+        const acknowledged = await typedCall(
+          "executor.task.acknowledge",
+          { ...args, evidence: evidence(extra) },
+          executorResultSchema,
+        );
+        return {
+          taskId: acknowledged.task.id,
+          state: "working",
+          eventSequence: acknowledged.eventSequence,
         };
       }),
   );
