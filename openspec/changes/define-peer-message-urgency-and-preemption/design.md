@@ -4,6 +4,8 @@ The merged direct-delivery design submits peer messages through a runtime-native
 
 Codex also exposes `turn/interrupt`, but interruption is materially stronger than ordinary message delivery. It can stop unrelated local work if ACS does not own the execution. This change defines urgency and preemption without conflating message priority, delivery acceptance, and execution ownership.
 
+The repository already states that `openspec/specs` is the source of truth for behavioral requirements, but existing documentation still asks contributors to keep ADRs and OpenSpec mutually consistent. That leaves two places where architecture can appear normative and has already allowed ADR-009 to become stale after the direct-delivery decision. This change makes OpenSpec the sole normative architecture/specification source.
+
 ## Decisions
 
 ### Define three urgency levels
@@ -117,16 +119,29 @@ turn/interrupt(threadId, activeTurnId)
 
 No preemption capability is advertised until real-Codex tests establish the exact state transitions and ambiguous-write behavior for the pinned runtime profile.
 
-## ADR alignment
+## Specification governance
 
-`docs/adr/009-safe-wake.md` describes the superseded context-append/non-atomic-wake model and is now stale relative to the accepted direct-delivery OpenSpec. This change should either:
+`openspec/specs` is the single normative source for ACS behavioral and architectural requirements. `openspec/changes` is the only place to propose changes to those requirements before they are archived into the canonical specs.
 
-- replace ADR-009 with a new accepted direct-delivery/urgency ADR while marking ADR-009 superseded; or
-- rewrite ADR-009 in place if the repository deliberately treats ADR files as mutable living decisions.
+Other files may explain, illustrate, or implement the specification, but they do not create independent requirements:
 
-Prefer explicit supersession if preserving decision history is valuable.
+- `contracts/` are typed implementation/wire contracts and must conform to OpenSpec;
+- `docs/threat-model.md` may explain security analysis but normative security behavior belongs in OpenSpec;
+- README and operator documentation describe usage and must conform to OpenSpec;
+- `docs/adr/` becomes historical/non-normative material only.
 
-ADRs 004 (runtime adapter), 005 (peer content), 006 (acceptance milestones), 007 (ambiguous acceptance), and 010 (local permissions) remain conceptually aligned and should be cross-checked rather than rewritten unnecessarily.
+### Retire ADRs without losing decisions
+
+The existing ADRs should not be mechanically deleted before their useful content is audited. For each ADR:
+
+1. identify still-valid behavioral or architectural requirements;
+2. verify those requirements already exist in the relevant `openspec/specs` capability;
+3. add missing requirements through this or a dedicated OpenSpec change;
+4. mark the ADR historical/non-normative, move it under a clearly historical location, or remove it once its decision context is no longer useful.
+
+No code review may rely on an ADR to override or supplement a canonical OpenSpec requirement. When an ADR and OpenSpec disagree, OpenSpec wins and the stale ADR should be corrected or retired.
+
+ADR-009 is the immediate example: its safe-wake decision has been superseded by direct delivery. Its still-valid concerns—peer provenance, runtime capability evidence, local permission ownership, and ambiguous acceptance—must live in the canonical runtime-delivery/security specs rather than in a replacement ADR.
 
 ## Risks / Trade-offs
 
@@ -135,3 +150,4 @@ ADRs 004 (runtime adapter), 005 (peer content), 006 (acceptance milestones), 007
 - **Preemption can destroy useful work** -> require explicit authority, proven target identity, audit events, and bounded policy.
 - **Interrupt succeeded but response was lost** -> reconcile runtime state before delivering a fresh turn; never blindly repeat interruption/delivery.
 - **Runtime cannot expose message-specific acknowledgement** -> omit the milestone rather than infer it.
+- **ADR retirement drops an undocumented invariant** -> audit every ADR before retirement and promote any unique normative content into OpenSpec first.
