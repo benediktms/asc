@@ -1,0 +1,25 @@
+schema: spec-driven
+
+context: |
+  ACS (Agent Communications Service) provides local-first A2A messaging between
+  independently launched Codex threads. It is a TypeScript/Bun monorepo compiled
+  to a standalone binary, with Bun's native SQLite driver and no ORM.
+  openspec/specs is the source of truth for behavioral requirements; propose
+  future changes under openspec/changes. Existing docs/adr records explain the
+  decisions, docs/threat-model.md describes security boundaries, and contracts/
+  contains the typed API and wire contracts. Keep these consistent with specs.
+  A2A JSON-RPC is the inter-agent data plane; authenticated Unix-socket JSON-RPC
+  handles local administration. Only the Codex adapter imports generated types.
+  Peer messages are untrusted named tool output, never permission or user input.
+  Tool versions are pinned in mise.toml; package versions are pinned in
+  package.json and bun.lock. Codex schema generation targets 0.153.2.
+  Preserve fail-closed wake, caller attestation, binding fences, and ambiguous
+  acceptance recovery. Do not claim new compatibility without conformance evidence.
+
+rules:
+  specs:
+    - Write observable requirements with at least one WHEN/THEN scenario each.
+    - Distinguish durable message acceptance from runtime execution acceptance.
+  tasks:
+    - Include targeted tests for changed behavior and strict OpenSpec validation.
+    - Run only affected test files locally; the full suite runs in CI.

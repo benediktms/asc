@@ -3,7 +3,8 @@
 Local-first A2A messaging for independently launched Codex threads.
 
 ```sh
-bun install
+mise install
+mise exec -- bun install --frozen-lockfile
 bun run check
 bun run format
 bun run build
@@ -12,8 +13,8 @@ bun run build
 
 On macOS, `init` installs and starts a `launchd` user service and registers the
 global Codex MCP bridge with the same socket path. The service starts at login
-and restarts if it exits; logs are in `~/Library/Logs/asc.log`. Re-running `init`
-updates the registration. Restart existing Codex sessions to load the MCP tools.
+and restarts if it exits; logs are in `~/Library/Logs/acs.log`. Re-running `init`
+updates the registration and retires the legacy `local.asc.daemon` service. Restart existing Codex sessions to load the MCP tools.
 Use `acs init --no-service` for file initialization only (for example in tests).
 On other platforms, start `acs daemon start` under your service manager.
 
@@ -24,7 +25,7 @@ to replace a live control socket.
 ### Receiving messages in independently launched sessions
 
 MCP registration and runtime delivery are separate connections. A successful
-`acs_identity` proves the session's identity, not that ASC's shared app-server
+`acs_identity` proves the session's identity, not that ACS's shared app-server
 hosts it. For automatic context delivery, launch/resume the recipient through
 the shared endpoint (`codex --remote unix:// resume <session-id>`).
 
@@ -32,7 +33,7 @@ If the recipient runs elsewhere, use `acs_inbox_list`, then `acs_task_get` to
 read a message and its delivery ID. Pass both task and delivery IDs to
 `acs_task_acknowledge`; this accepts everything observed by that read without
 swallowing a concurrent follow-up. Context delivery stays deferred while that
-thread is not loaded on the connected app-server; ASC does not resume a second
+thread is not loaded on the connected app-server; ACS does not resume a second
 copy of an active session. Complete accepted tasks with `acs_task_complete`.
 
 The daemon listens on `127.0.0.1:7432`. Run `acs --help` for administration,
@@ -65,6 +66,26 @@ A2A_TCK_DIR=/path/to/a2a-tck bun run test:a2a-tck
 The runner verifies the exact revision in
 `conformance/a2a-tck-revision.txt` and rejects any failure outside the reviewed
 requirement-level allowlist.
+
+## Development workflow
+
+Activate mise in your shell, or prefix commands with `mise exec --`.
+`mise.toml` pins Bun, Node (for OpenSpec), OpenSpec, Python, and uv (for the A2A
+TCK). JavaScript dependencies, including Codex `0.153.2`, are already pinned
+in `package.json` and `bun.lock`.
+
+Behavioral requirements now live in [OpenSpec specs](openspec/specs).
+Use the generated Codex skills: `$openspec-propose` to propose a change,
+`$openspec-apply-change` to implement it, and `$openspec-archive-change` to
+archive it after verification. Validate artifacts with `mise run specs:check`.
+The [OpenSpec workflow documentation](https://github.com/Fission-AI/OpenSpec)
+describes the workflow. Existing `docs/adr`, security documentation, and typed
+`contracts/` remain supporting references; keep them consistent with the specs.
+OpenSpec is the planning workflow for new changes; existing local Threadmark
+history is retained as historical context.
+
+For the external TCK checkout, use `uv sync --frozen --python "$(command -v python)" --directory "$A2A_TCK_DIR"`
+before running the conformance command above.
 
 ## Current conformance boundary
 

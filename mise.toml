@@ -1,0 +1,10 @@
+[tools]
+bun = "1.3.14"
+node = "26.7.0" # OpenSpec CLI runtime
+"npm:@fission-ai/openspec" = "1.12.0"
+python = "3.14.7" # A2A conformance runner
+uv = "0.12.9"
+
+[tasks."specs:check"]
+description = "Validate OpenSpec requirements and changes"
+run = "openspec validate --all --strict --no-interactive"
