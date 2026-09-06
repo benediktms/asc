@@ -231,7 +231,6 @@ async function daemon() {
       maxParts: settings.security.maxParts,
       maxTextPartBytes: settings.security.maxTextPartBytes,
       claimTtlSeconds: settings.security.claimTtlSeconds,
-      defaultMode: settings.delivery.defaultMode,
       busyTimeoutMs: settings.storage.busyTimeoutMs,
       durability: settings.storage.durability,
       maxQueuedDeliveryIntents: settings.delivery.maxQueuedDeliveryIntents,
@@ -388,15 +387,7 @@ function bindingParams(
     agent,
     session,
     continuityPolicy: option("--continuity") ?? "follow-pending",
-    deliveryPolicy: {
-      wakeStrategy:
-        args.includes("--allow-non-atomic-wake") || settings.codex.allowNonAtomicWake
-          ? "non-atomic-idle-check"
-          : "atomic-only",
-      allowActiveTurnSteering: settings.codex.allowActiveTurnSteering,
-      autoResumeDormantThread: settings.codex.autoResumeDormantThreads,
-      interruptOnCancel: true,
-    },
+    deliveryPolicy: { interruptOnCancel: true },
     revokeExisting: args.includes("--revoke-existing"),
   };
 }
@@ -475,8 +466,8 @@ async function doctor() {
       standaloneExecutable: "verified by clean-machine release matrix",
       mcpAttestation: "verified on Codex 0.153.2 and 0.153.4",
       sharedAppServer,
-      safeDelivery: "context injection proven; wake remains explicit non-atomic opt-in",
-      deliveryReconciliation: "durable wake marker proven; absence remains operator-owned",
+      directDelivery: "named tool-output submission is the only automatic peer-message path",
+      deliveryReconciliation: "exact delivery markers are required; inconclusive writes remain operator-owned",
       approvalOwnership:
         "verified: user approvals remain TUI-owned; ACS never answers local-input requests",
     },
@@ -496,7 +487,7 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
 }
 function usage() {
   console.log(
-    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs codex bind <agent> [--session <codex-thread-id>] [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--allow-non-atomic-wake] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
+    `ACS 0.1.0\n\n  acs init\n  acs daemon start\n  acs agents create <slug> [--claim] [--name name] [--description text]\n  acs agents get|delete <agent>\n  acs agents update <agent> [--slug slug] [--name name] [--description text] [--enable|--disable]\n  acs agents list\n  acs codex sessions list\n  acs codex bind <agent> [--session <codex-thread-id>] [--continuity follow-pending|strict] [--revoke-existing]\n  acs bindings bind <agent> --session <codex-thread-id> [--continuity follow-pending|strict] [--revoke-existing]\n  acs bindings get|revoke <binding-id>\n  acs bindings list\n  acs runtimes list\n  acs inbox [agent]\n  acs deliveries list|get|retry|cancel <delivery-id>\n  acs deliveries resolve <delivery-id> --accepted|--not-accepted-and-retry|--not-accepted-and-cancel\n  acs token show\n  acs codex doctor\n  acs codex install-mcp\n  acs mcp codex`,
   );
 }
 
