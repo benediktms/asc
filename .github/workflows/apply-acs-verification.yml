@@ -1,44 +1,14 @@
-name: Apply isolated ACS verification fixes
+name: Completed isolated ACS verification transfer
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  apply:
-    if: github.event.pull_request.number == 39 && github.head_ref == 'impl/direct-peer-delivery' && github.event.pull_request.head.repo.full_name == github.repository
+  completed:
+    if: false
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - uses: jdx/mise-action@v4
-        with:
-          version: 2026.9.1
-      - run: bun install --frozen-lockfile
-      - name: Format only reviewed source and specification paths
-        shell: bash
-        run: |
-          set -euo pipefail
-          files=(
-            apps/acs/src/main.ts
-            openspec/changes/define-peer-message-urgency-and-preemption/specs/local-service/spec.md
-            openspec/changes/define-peer-message-urgency-and-preemption/specs/runtime-delivery/spec.md
-            openspec/changes/define-peer-message-urgency-and-preemption/specs/specification-governance/spec.md
-            openspec/changes/inject-peer-messages-into-active-turns/specs/a2a-messaging/spec.md
-            packages/runtime-codex/src/index.ts
-          )
-          bun x --no-install oxfmt "${files[@]}"
-          git add -- "${files[@]}"
-          git diff --cached --check
-          if git diff --cached --quiet; then exit 0; fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'style: apply pinned formatter to direct-delivery changes'
-          git push origin HEAD:refs/heads/impl/direct-peer-delivery
+      - run: echo 'The one-time verification transfer has completed.'
