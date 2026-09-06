@@ -85,10 +85,7 @@ export interface RuntimeCapabilities {
   readonly listSessions: boolean;
   readonly observeSessionState: boolean;
   readonly observeExecutions: boolean;
-  readonly appendContext: boolean;
-  readonly wakeWhenIdle: boolean;
-  readonly atomicDeferredWake: boolean;
-  readonly steerActiveExecution: boolean;
+  readonly directDelivery: boolean;
   readonly cancelOwnedExecution: boolean;
   readonly reconcileDelivery: boolean;
   readonly callerAttestationSchemes: readonly string[];
@@ -158,7 +155,8 @@ export interface RuntimeAdapterClock {
   now(): string;
 }
 
-export type RuntimeDeliveryMode = "wake_when_idle" | "append_context" | "join_active";
+export type RuntimeDeliveryMode = "direct";
+export type RuntimeExecutionRelationship = "started" | "joined" | "unknown";
 
 export interface RuntimeDeliveryEnvelopeV1 {
   readonly schema: "urn:agent-communications:runtime-envelope:v1";
@@ -221,7 +219,6 @@ export interface RuntimeDeliveryRequest {
   readonly envelope: RuntimeDeliveryEnvelopeV1;
   readonly payloadHash: string;
   readonly deadline?: string;
-  readonly autoResumeDormantThread?: boolean;
   readonly markRequestFlushed?: () => void;
   readonly traceContext?: RuntimeTraceContext;
 }
@@ -230,9 +227,9 @@ export type RuntimeDeliveryResult =
   | {
       readonly outcome: "accepted";
       readonly acceptedAt: string;
-      readonly execution?: {
+      readonly execution: {
         readonly opaqueId: string;
-        readonly alreadyRunning: boolean;
+        readonly relationship: RuntimeExecutionRelationship;
       };
       readonly evidence: {
         readonly scheme: string;
@@ -244,8 +241,9 @@ export type RuntimeDeliveryResult =
       readonly reason:
         | "offline"
         | "dormant"
-        | "busy"
-        | "manual-wake-required"
+        | "local-input"
+        | "unsupported-active-state"
+        | "route-unavailable"
         | "backpressure"
         | "policy";
       readonly retryAfterMs?: number;
@@ -255,7 +253,6 @@ export type RuntimeDeliveryResult =
       readonly reason:
         | "stale-binding"
         | "session-not-found"
-        | "unsupported-mode"
         | "unsupported-content"
         | "permission-denied"
         | "runtime-protocol-error";
@@ -286,7 +283,10 @@ export interface RuntimeReconcileRequest {
 export type RuntimeReconcileResult =
   | {
       readonly outcome: "accepted";
-      readonly execution?: { readonly opaqueId: string };
+      readonly execution?: {
+        readonly opaqueId: string;
+        readonly relationship?: RuntimeExecutionRelationship;
+      };
       readonly evidence: JsonObject;
     }
   | {
@@ -340,6 +340,7 @@ export interface RuntimeExecutionRef {
 
 export interface RuntimeCorrelation {
   readonly deliveryId?: DeliveryId;
+  readonly deliveryIds?: readonly DeliveryId[];
   readonly payloadHash?: string;
 }
 
