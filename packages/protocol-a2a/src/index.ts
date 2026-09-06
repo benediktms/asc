@@ -57,14 +57,11 @@ function delivery(metadata: Record<string, unknown> | undefined): DeliveryPrefer
   const raw = metadata?.[extension],
     value = raw === undefined ? {} : raw;
   if (!isRecord(value)) throw new Error("VALIDATION_FAILED: delivery extension must be an object");
-  const allowed = new Set(["mode", "priority", "notifyOn", "replyExpected", "expiresAt"]);
+  const allowed = new Set(["priority", "notifyOn", "replyExpected", "expiresAt"]);
   if (Object.keys(value).some((key) => !allowed.has(key)))
     throw new Error("VALIDATION_FAILED: unknown delivery option");
-  const mode = value.mode ?? "wake_when_idle",
-    priority = value.priority ?? "normal",
+  const priority = value.priority ?? "normal",
     notifyOn = value.notifyOn ?? ["input-required", "terminal"];
-  if (mode !== "wake_when_idle" && mode !== "append_context")
-    throw new Error("ACS_UNSUPPORTED_DELIVERY_MODE");
   if (priority !== "low" && priority !== "normal" && priority !== "high")
     throw new Error("VALIDATION_FAILED: invalid priority");
   if (!Array.isArray(notifyOn) || !notifyOn.every(isNotifyState))
@@ -77,7 +74,6 @@ function delivery(metadata: Record<string, unknown> | undefined): DeliveryPrefer
   )
     throw new Error("VALIDATION_FAILED: invalid expiresAt");
   return {
-    mode,
     priority,
     notifyOn,
     replyExpected: value.replyExpected ?? true,
