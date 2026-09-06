@@ -295,7 +295,8 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   await waitFor(() => {
     const inspection = Bun.spawnSync([binary, "deliveries", "get", receivedDeliveryId], { env });
     if (inspection.exitCode !== 0) return false;
-    return record(record(JSON.parse(inspection.stdout.toString())).delivery).state === "accepted";
+    const delivery = record(record(JSON.parse(inspection.stdout.toString())).delivery);
+    return delivery.state === "deferred" && delivery.reason === "unsupported-capability";
   });
   mcp.stdin.write(
     `${JSON.stringify({
