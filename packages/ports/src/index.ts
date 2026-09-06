@@ -157,7 +157,11 @@ export interface BindingHandle {
 
 export interface BindingOptions {
   continuityPolicy?: "follow-pending" | "strict";
+  /** Internal compatibility shape while storage policy JSON is simplified. */
   deliveryPolicy?: Partial<{
+    wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
+    allowActiveTurnSteering: boolean;
+    autoResumeDormantThread: boolean;
     interruptOnCancel: boolean;
   }>;
   installationId?: RuntimeInstallationId;
@@ -169,6 +173,8 @@ export interface ClaimBindingResult extends BindingHandle {
 }
 
 export interface DeliveryOptions {
+  /** Internal storage selector. Public A2A/MCP callers cannot choose a mode. */
+  mode?: "direct";
   priority?: "low" | "normal" | "high";
   notifyOn?: string[];
   replyExpected?: boolean;
