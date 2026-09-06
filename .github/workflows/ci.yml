@@ -24,6 +24,36 @@ jobs:
       - run: mise run specs:check
       - run: bun run check
 
+  native-codex:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        codex: ["0.153.2", "0.153.4"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.9.1
+      - run: bun install --frozen-lockfile
+      - name: Install selected native Codex fixture
+        shell: bash
+        env:
+          CODEX_VERSION: ${{ matrix.codex }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/acs-native-fixture"
+          cd "$RUNNER_TEMP/acs-native-fixture"
+          printf '{"private":true}\n' > package.json
+          bun add --exact "@openai/codex@$CODEX_VERSION"
+          echo "ACS_CODEX_BINARY=$RUNNER_TEMP/acs-native-fixture/node_modules/.bin/codex" >> "$GITHUB_ENV"
+      - name: Real binary against local mock model (no account credentials)
+        env:
+          ACS_REAL_CODEX: "1"
+          ACS_EXPECTED_CODEX_VERSION: ${{ matrix.codex }}
+        run: bun test tests/real-codex.test.ts
+
   a2a-tck:
     runs-on: ubuntu-latest
     env:
