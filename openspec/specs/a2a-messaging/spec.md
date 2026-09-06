@@ -3,7 +3,7 @@
 ## Purpose
 
 Define durable inter-agent messaging independently of runtime execution.
-See ADRs 002, 006, and 008 and `contracts/a2a-application-port.ts`.
+See `contracts/a2a-application-port.ts` for the typed implementation boundary.
 
 ## Requirements
 
