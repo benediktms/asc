@@ -233,6 +233,17 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       fixture.close();
     });
 
+    test("retries post-acceptance observation without resubmitting input", async () => {
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
+      fixture.failNext("thread/resume", "overload");
+      expect(await fixture.adapter.deliver(delivery())).toMatchObject({ outcome: "accepted" });
+      await waitForMethodCount(fixture.methods, "thread/resume", 2);
+      expect(mutations(fixture.methods)).toEqual(["turn/start"]);
+      await fixture.adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
     test("reconciles exact markers and leaves missing or conflicting evidence inconclusive", async () => {
       const fixture = await create();
       await fixture.adapter.start(fixture.context);
@@ -393,12 +404,16 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
 
 runtimeAdapterConformance("Codex", () => codexFixture());
 
-test("Codex runtime adapter enables mutations for every supported runtime", async () => {
+test("Codex runtime adapter keeps direct delivery disabled until release gates pass", async () => {
   for (const version of SUPPORTED_CODEX_VERSIONS) {
     const fixture = await codexFixture(`codex-cli ${version}`),
       { adapter, context, methods } = fixture;
     await adapter.start(context);
-    expect(await adapter.probe()).toMatchObject({ state: "ready", runtimeVersion: version });
+    expect(await adapter.probe()).toMatchObject({
+      state: "ready",
+      runtimeVersion: version,
+      capabilities: { directDelivery: false },
+    });
     expect(await adapter.deliver(delivery())).toMatchObject({ outcome: "accepted" });
     expect(mutations(methods)).toEqual(["turn/start"]);
     await adapter.stop({ reason: "shutdown" });
@@ -665,6 +680,16 @@ function mutations(methods: string[]) {
 async function waitForMethod(methods: string[], method: string) {
   for (let index = 0; index < 100 && !methods.includes(method); index++) await Bun.sleep(1);
   expect(methods).toContain(method);
+}
+
+async function waitForMethodCount(methods: string[], method: string, count: number) {
+  for (
+    let index = 0;
+    index < 150 && methods.filter((candidate) => candidate === method).length < count;
+    index++
+  )
+    await Bun.sleep(10);
+  expect(methods.filter((candidate) => candidate === method)).toHaveLength(count);
 }
 
 function decodeClientFrame(frame: Buffer) {

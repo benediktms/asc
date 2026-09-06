@@ -70,7 +70,7 @@ const capabilities: RuntimeCapabilities = {
   listSessions: true,
   observeSessionState: true,
   observeExecutions: true,
-  directDelivery: true,
+  directDelivery: false,
   // A shared app-server attachment does not establish isolated execution ownership.
   cancelOwnedExecution: false,
   reconcileDelivery: true,
@@ -514,6 +514,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       this.requireContext().logger.warn("runtime.observation-deferred", {
         deliveryId: request.deliveryId,
       });
+      if (!this.stopped)
+        setTimeout(() => void this.observeAcceptedExecution(request, turnId), 1_000).unref();
     }
   }
   private trackExecution(turnId: string, request: RuntimeDeliveryRequest) {
