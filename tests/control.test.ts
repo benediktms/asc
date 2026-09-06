@@ -136,7 +136,7 @@ describe("control protocol", () => {
       result: {
         codex: {
           listSessions: false,
-          appendContext: false,
+          directDelivery: false,
           callerAttestationSchemes: [],
           supportedPartKinds: [],
         },
@@ -157,14 +157,14 @@ describe("control protocol", () => {
           installationId: installation.id,
           session: { installationId: installation.id, opaqueId: "thread-1" },
           continuityPolicy: "strict",
-          deliveryPolicy: { wakeStrategy: "disabled", interruptOnCancel: false },
+          deliveryPolicy: { interruptOnCancel: false },
         })
       ).json(),
     ).toMatchObject({
       result: {
         binding: {
           continuityPolicy: "strict",
-          deliveryPolicy: { wakeStrategy: "disabled", interruptOnCancel: false },
+          deliveryPolicy: { interruptOnCancel: false },
         },
       },
     });
@@ -189,7 +189,7 @@ describe("control protocol", () => {
           await call("bindings.claim", {
             claimCode: claim.claimCode,
             continuityPolicy: "strict",
-            deliveryPolicy: { wakeStrategy: "disabled" },
+            deliveryPolicy: { interruptOnCancel: false },
             evidence: evidence("claimed-thread"),
           })
         ).json(),
@@ -202,7 +202,7 @@ describe("control protocol", () => {
           installationId: installation.id,
           session: { opaqueId: "claimed-thread" },
           continuityPolicy: "strict",
-          deliveryPolicy: { wakeStrategy: "disabled" },
+          deliveryPolicy: { interruptOnCancel: false },
         },
       },
     });
@@ -647,16 +647,16 @@ describe("control protocol", () => {
     const listedRuntime = record(runtimeItems[0]);
     expect(listedRuntime).toMatchObject({
       installationId: installation.id,
-      probe: { state: "ready", capabilities: { appendContext: true }, diagnostics: [] },
+      probe: { state: "ready", capabilities: { directDelivery: true }, diagnostics: [] },
     });
     expect(listedRuntime.state).toBeUndefined();
     const originalProbe = adapter.probe.bind(adapter);
     adapter.probe = async () => ({
       ...(await originalProbe()),
-      capabilities: { ...adapter.descriptor.capabilities, appendContext: false },
+      capabilities: { ...adapter.descriptor.capabilities, directDelivery: false },
     });
     expect(await (await call("system.capabilities", {})).json()).toMatchObject({
-      result: { codex: { appendContext: false } },
+      result: { codex: { directDelivery: false } },
     });
     adapter.probe = originalProbe;
     const now = Date.now();

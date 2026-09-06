@@ -300,7 +300,7 @@ export async function runMcp(port = 7432) {
     "acs_send",
     {
       description: "Durably send an A2A task to another logical agent",
-      inputSchema: {
+      inputSchema: z.strictObject({
         to: z.string(),
         text: z.string().min(1).max(65536),
         taskId: z.string().optional(),
@@ -322,7 +322,7 @@ export async function runMcp(port = 7432) {
           .optional(),
         attachments: z.array(attachment).optional(),
         clientRequestId: z.string().optional(),
-      },
+      }),
     },
     async (args, extra) =>
       execute(async () => {

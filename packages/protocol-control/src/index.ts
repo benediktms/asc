@@ -75,10 +75,7 @@ const partSchema = z.discriminatedUnion("kind", [
     deliveryIds: z.array(z.string()).optional(),
     description: z.string().optional(),
     deliveryPolicy: z
-      .object({
-        wakeStrategy: z.enum(["atomic-only", "non-atomic-idle-check", "disabled"]).optional(),
-        allowActiveTurnSteering: z.boolean().optional(),
-        autoResumeDormantThread: z.boolean().optional(),
+      .strictObject({
         interruptOnCancel: z.boolean().optional(),
       })
       .optional(),
@@ -245,10 +242,7 @@ export function controlHandler(
               listSessions: false,
               observeSessionState: false,
               observeExecutions: false,
-              appendContext: false,
-              wakeWhenIdle: false,
-              atomicDeferredWake: false,
-              steerActiveExecution: false,
+              directDelivery: false,
               cancelOwnedExecution: false,
               reconcileDelivery: false,
               callerAttestationSchemes: [],

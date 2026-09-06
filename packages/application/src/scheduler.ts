@@ -19,6 +19,7 @@ import type {
   DeliveryId,
   RuntimeAdapter,
   RuntimeAdapterContext,
+  RuntimeCapabilities,
   RuntimeDeliveryEnvelopeV1,
   RuntimeDeliveryRequest,
   RuntimeEvent,
@@ -58,6 +59,7 @@ type ExecutionRow = {
 type ReconciliationRow = {
   id: DeliveryId;
   task_id: `tsk_${string}`;
+  kind: "a2a-message" | "task-event-notification";
   payload_hash: string;
   pinned_binding_id: BindingId;
   pinned_binding_epoch: number;
@@ -75,6 +77,7 @@ export class DeliveryScheduler {
   private inFlight = new Set<Promise<void>>();
   private context?: RuntimeAdapterContext;
   private connected = false;
+  private capabilities: RuntimeCapabilities;
   private nextConnectAt = 0;
   private reconnectAttempts = 0;
   private pendingExecutionEvents: RuntimeEvent[] = [];
@@ -89,7 +92,9 @@ export class DeliveryScheduler {
       retryCapMs: 30_000,
       reconnectMs: 2000,
     },
-  ) {}
+  ) {
+    this.capabilities = adapter.descriptor.capabilities;
+  }
 
   async start() {
     const installation = required(
@@ -173,7 +178,7 @@ export class DeliveryScheduler {
     const now = Date.now(),
       row = this.store
         .query<ReconciliationRow, [number]>(
-          "SELECT i.id,i.task_id,i.payload_hash,i.pinned_binding_id,i.pinned_binding_epoch,b.installation_id,b.session_opaque_id,a.reconciliation_token FROM delivery_intents i JOIN runtime_bindings b ON b.id=i.pinned_binding_id JOIN delivery_attempts a ON a.intent_id=i.id AND a.attempt_number=i.attempt_count WHERE i.state='acceptance-unknown' AND i.not_before_ms<=? AND a.reconciliation_token IS NOT NULL LIMIT 1",
+          "SELECT i.id,i.task_id,i.kind,i.payload_hash,i.pinned_binding_id,i.pinned_binding_epoch,b.installation_id,b.session_opaque_id,a.reconciliation_token FROM delivery_intents i JOIN runtime_bindings b ON b.id=i.pinned_binding_id JOIN delivery_attempts a ON a.intent_id=i.id AND a.attempt_number=i.attempt_count WHERE i.state='acceptance-unknown' AND i.not_before_ms<=? AND a.reconciliation_token IS NOT NULL LIMIT 1",
         )
         .get(now);
     if (!row) return false;
@@ -221,7 +226,8 @@ export class DeliveryScheduler {
               now,
               now,
             );
-        if (result.execution) this.markTaskWorking(row.task_id, row.pinned_binding_id);
+        if (result.execution && row.kind === "a2a-message")
+          this.markTaskWorking(row.task_id, row.pinned_binding_id);
       });
       if (result.execution)
         this.replayExecutionEvents({
@@ -254,6 +260,7 @@ export class DeliveryScheduler {
     try {
       await this.adapter.start(required(this.context, "adapter context"));
       const probe = await this.adapter.probe();
+      this.capabilities = probe.capabilities;
       this.store.observeRuntime(required(this.context, "adapter context").installationId, probe);
       await this.reconcileBoundSessions();
       this.connected = true;
@@ -298,7 +305,7 @@ export class DeliveryScheduler {
         },
         []
       >(
-        "SELECT id task_id,requester_principal_id FROM a2a_tasks WHERE cancellation_requested=1 AND state NOT IN ('completed','failed','canceled','rejected') LIMIT 1",
+        "SELECT t.id task_id,t.requester_principal_id FROM a2a_tasks t WHERE t.cancellation_requested=1 AND t.state NOT IN ('completed','failed','canceled','rejected') AND NOT EXISTS(SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.state IN ('leased','attempting','acceptance-unknown')) LIMIT 1",
       )
       .get();
     if (!task) return false;
@@ -319,7 +326,11 @@ export class DeliveryScheduler {
         "SELECT e.id,e.runtime_execution_opaque_id,e.binding_id,e.binding_epoch,e.state,b.installation_id,b.session_opaque_id,b.delivery_policy_json FROM runtime_executions e JOIN delivery_intents i ON i.id=e.intent_id JOIN runtime_bindings b ON b.id=e.binding_id WHERE i.task_id=? AND e.relationship='started' AND e.state IN ('accepted','started','awaiting-local-input') AND NOT EXISTS(SELECT 1 FROM runtime_executions e2 WHERE e2.binding_id=e.binding_id AND e2.runtime_execution_opaque_id=e.runtime_execution_opaque_id AND e2.id<>e.id AND e2.state IN ('accepted','started','awaiting-local-input')) LIMIT 1",
       )
       .get(task.task_id);
-    if (row && interruptOnCancel(row.delivery_policy_json)) {
+    if (
+      row &&
+      this.capabilities.cancelOwnedExecution &&
+      interruptOnCancel(row.delivery_policy_json)
+    ) {
       const result = await this.adapter.cancel(
         {
           execution: {
@@ -338,7 +349,10 @@ export class DeliveryScheduler {
       );
       if (result.outcome === "accepted" || result.outcome === "not-running") {
         this.store.write(() => {
-          const interrupted = transitionRuntimeExecution(row.state, RuntimeExecutionState.Interrupted),
+          const interrupted = transitionRuntimeExecution(
+              row.state,
+              RuntimeExecutionState.Interrupted,
+            ),
             now = Date.now();
           this.store
             .query(
@@ -409,6 +423,8 @@ export class DeliveryScheduler {
   private async deliver(intent: DeliveryIntentRow) {
     const target = this.store.agent(intent.target_agent_id);
     if (!target?.enabled) return this.failTerminal(intent.id, "target-disabled");
+    if (!this.capabilities.directDelivery)
+      return this.defer(intent.id, "unsupported-capability", 30_000);
     const now = Date.now(),
       pinned = intent.pinned_binding_id
         ? this.store
@@ -539,7 +555,7 @@ export class DeliveryScheduler {
     });
     const completed = Date.now();
     if (result.outcome === "accepted") {
-      const execution = notification ? undefined : result.execution,
+      const execution = result.execution,
         executionId = execution ? id("exe") : null;
       this.store.write(() => {
         const accepted = transitionDelivery(DeliveryState.Attempting, DeliveryState.Accepted);
@@ -575,7 +591,7 @@ export class DeliveryScheduler {
               completed,
               completed,
             );
-        if (execution) this.markTaskWorking(intent.task_id, binding.id);
+        if (execution && !notification) this.markTaskWorking(intent.task_id, binding.id);
       });
       if (execution)
         this.replayExecutionEvents({
@@ -656,7 +672,7 @@ export class DeliveryScheduler {
         },
         [`tsk_${string}`]
       >(
-        "SELECT t.requester_principal_id,t.state,t.cancellation_requested,exists(SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.state='acceptance-unknown') ambiguous FROM a2a_tasks t WHERE t.id=?",
+        "SELECT t.requester_principal_id,t.state,t.cancellation_requested,exists(SELECT 1 FROM delivery_intents i WHERE i.task_id=t.id AND i.state IN ('leased','attempting','acceptance-unknown')) ambiguous FROM a2a_tasks t WHERE t.id=?",
       )
       .get(taskId);
     if (
@@ -888,7 +904,7 @@ export class DeliveryScheduler {
         executions = this.executions(event.execution);
       if (!executions.length) return this.queueExecutionEvent(event);
       for (const execution of executions) {
-        if (execution.state === RuntimeExecutionState.Started) continue;
+        if (execution.state !== RuntimeExecutionState.Accepted) continue;
         this.store
           .query("UPDATE runtime_executions SET state=?,started_at_ms=?,updated_at_ms=? WHERE id=?")
           .run(
@@ -905,7 +921,12 @@ export class DeliveryScheduler {
       if (!executions.length) return this.queueExecutionEvent(event);
       this.store.write(() => {
         for (const execution of executions) {
-          if (execution.state === RuntimeExecutionState.AwaitingLocalInput) continue;
+          if (
+            ![RuntimeExecutionState.Accepted, RuntimeExecutionState.Started].includes(
+              execution.state,
+            )
+          )
+            continue;
           if (execution.state === RuntimeExecutionState.Accepted) {
             execution.state = transitionRuntimeExecution(
               execution.state,
@@ -980,6 +1001,35 @@ export class DeliveryScheduler {
       (event) => !matching.includes(event),
     );
     for (const event of matching) this.project(event);
+    // A sibling delivery may already have projected completion while this
+    // acceptance was in flight. Runtime lifecycle is shared by all its rows.
+    const terminal = this.store
+      .query<
+        {
+          state: RuntimeExecutionState;
+          final_parts_json: string | null;
+          completed_at_ms: number;
+          updated_at_ms: number;
+        },
+        [string, RuntimeInstallationId, string]
+      >(
+        "SELECT e.state,e.final_parts_json,e.completed_at_ms,e.updated_at_ms FROM runtime_executions e JOIN runtime_bindings b ON b.id=e.binding_id WHERE e.runtime_execution_opaque_id=? AND b.installation_id=? AND b.session_opaque_id=? AND e.state IN ('completed','failed','interrupted') ORDER BY e.completed_at_ms DESC LIMIT 1",
+      )
+      .get(reference.opaqueId, reference.session.installationId, reference.session.opaqueId);
+    if (terminal)
+      this.store
+        .query(
+          "UPDATE runtime_executions SET state=?,final_parts_json=?,completed_at_ms=?,updated_at_ms=? WHERE runtime_execution_opaque_id=? AND binding_id IN (SELECT id FROM runtime_bindings WHERE installation_id=? AND session_opaque_id=?) AND state IN ('accepted','started','awaiting-local-input','unknown')",
+        )
+        .run(
+          terminal.state,
+          terminal.final_parts_json,
+          terminal.completed_at_ms,
+          terminal.updated_at_ms,
+          reference.opaqueId,
+          reference.session.installationId,
+          reference.session.opaqueId,
+        );
   }
   private observeSession(
     session: { installationId: RuntimeInstallationId; opaqueId: string },

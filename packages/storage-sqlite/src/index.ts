@@ -152,7 +152,6 @@ export class Store {
     maxParts: number;
     maxTextPartBytes: number;
     claimTtlSeconds: number;
-    defaultMode: "wake_when_idle" | "append_context";
     maxQueuedDeliveryIntents: number;
     busyTimeoutMs: number;
     durability: "balanced" | "strict";
@@ -166,7 +165,6 @@ export class Store {
       maxParts: 32,
       maxTextPartBytes: 65536,
       claimTtlSeconds: 600,
-      defaultMode: "wake_when_idle",
       maxQueuedDeliveryIntents: 1000,
       busyTimeoutMs: 5000,
       durability: "balanced",
@@ -492,10 +490,7 @@ export class Store {
         "STORAGE_CORRUPT: runtime installation missing",
       ),
       policy = {
-        wakeStrategy: options.deliveryPolicy?.wakeStrategy ?? "atomic-only",
-        allowActiveTurnSteering: options.deliveryPolicy?.allowActiveTurnSteering ?? false,
-        autoResumeDormantThread: options.deliveryPolicy?.autoResumeDormantThread ?? false,
-        interruptOnCancel: options.deliveryPolicy?.interruptOnCancel ?? true,
+        interruptOnCancel: options.deliveryPolicy?.interruptOnCancel ?? false,
       };
     return this.write(() => {
       const active = this.db
@@ -565,7 +560,7 @@ export class Store {
         );
       this.db
         .query(
-          "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE target_agent_id=? AND state='deferred' AND state_reason IN ('offline','dormant','busy','policy','manual-wake-required')",
+          "UPDATE delivery_intents SET not_before_ms=?,updated_at_ms=? WHERE target_agent_id=? AND state='deferred' AND state_reason IN ('offline','dormant','local-input','unsupported-active-state','route-unavailable','policy')",
         )
         .run(now, now, agent.id);
       return {
@@ -1190,7 +1185,7 @@ export class Store {
       this.db
         .query("UPDATE a2a_tasks SET next_event_sequence=? WHERE id=?")
         .run(sequence + 1, taskId);
-      const mode = options.mode ?? this.limits.defaultMode,
+      const mode = "direct",
         priority = { low: 0, normal: 10, high: 20 }[options.priority ?? "normal"];
       const payload = {
         taskId,
@@ -1440,7 +1435,7 @@ export class Store {
             deliveryId = id("int");
           this.db
             .query(
-              "INSERT INTO delivery_intents(id,kind,task_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,'append_context',10,?,?,?,?,?,?)",
+              "INSERT INTO delivery_intents(id,kind,task_id,target_agent_id,pinned_binding_id,pinned_binding_epoch,mode,priority,state,not_before_ms,payload_json,payload_hash,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,'direct',10,?,?,?,?,?,?)",
             )
             .run(
               deliveryId,

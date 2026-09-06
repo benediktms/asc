@@ -27,6 +27,137 @@ function fixture() {
 }
 
 describe("delivery scheduler", () => {
+  test("shared-turn completion and cancellation keep task results independent", async () => {
+    const store = fixture(),
+      agent = store.createAgent("shared"),
+      requester = authenticated(store),
+      binding = store.bind(agent.id, "shared-thread", {
+        deliveryPolicy: { interruptOnCancel: true },
+      }),
+      adapter = new FakeRuntimeAdapter(),
+      release = Promise.withResolvers<void>();
+    const tasks = ["a", "b"].map((messageId) =>
+      store.accept(
+        agent.id,
+        requester.id,
+        Message.fromJSON({ messageId, role: "ROLE_USER", parts: [{ text: messageId }] }),
+        {},
+      ),
+    );
+    let target: RuntimeDeliveryRequest["target"] | undefined,
+      interrupts = 0;
+    adapter.deliver = async (request) => {
+      target = request.target;
+      return {
+        outcome: "accepted",
+        acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "shared-turn", relationship: "unknown" },
+        evidence: { scheme: "fake", value: request.deliveryId },
+      };
+    };
+    adapter.cancel = async () => {
+      interrupts++;
+      return { outcome: "accepted", acceptedAt: new Date().toISOString() };
+    };
+    adapter.observe = async function* (signal) {
+      await release.promise;
+      if (!target) return;
+      yield {
+        type: "execution.completed",
+        execution: { session: target.session, opaqueId: "shared-turn" },
+        outcome: "completed",
+        finalParts: [{ kind: "text", text: "unattributed runtime output" }],
+      };
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    };
+    const scheduler = new DeliveryScheduler(store, adapter, "shared-test");
+    try {
+      await scheduler.start();
+      await until(
+        () =>
+          store.db
+            .query<{ count: number }, []>("SELECT count(*) count FROM runtime_executions")
+            .get()?.count === 2,
+      );
+      release.resolve();
+      await until(
+        () =>
+          store.db
+            .query<{ count: number }, []>(
+              "SELECT count(*) count FROM runtime_executions WHERE state='completed'",
+            )
+            .get()?.count === 2,
+      );
+      for (const task of tasks)
+        expect(store.task(task.task.id, requester.id)?.status?.state).toBe(
+          A2ATaskState.TASK_STATE_WORKING,
+        );
+      const first = tasks[0],
+        second = tasks[1];
+      if (!first || !second) throw new Error("missing task");
+      store.requestCancellation(first.task.id, requester.id);
+      scheduler.signal();
+      await until(
+        () =>
+          store.task(first.task.id, requester.id)?.status?.state ===
+          A2ATaskState.TASK_STATE_CANCELED,
+      );
+      expect(interrupts).toBe(0);
+      store.completeTask(second.task.id, binding.principalId, "explicit result for b", []);
+      expect(store.task(second.task.id, requester.id)?.status?.state).toBe(
+        A2ATaskState.TASK_STATE_COMPLETED,
+      );
+    } finally {
+      release.resolve();
+      await scheduler.stop();
+      store.close();
+    }
+  });
+
+  test("an ambiguous canceled task cannot starve unrelated delivery", async () => {
+    const store = fixture(),
+      agent = store.createAgent("ambiguous"),
+      other = store.createAgent("other"),
+      requester = authenticated(store),
+      adapter = new FakeRuntimeAdapter();
+    store.bind(agent.id, "ambiguous-thread");
+    store.bind(other.id, "other-thread");
+    const first = store.accept(
+      agent.id,
+      requester.id,
+      Message.fromJSON({ messageId: "ambiguous", role: "ROLE_USER", parts: [{ text: "first" }] }),
+      {},
+    );
+    store.db
+      .query("UPDATE delivery_intents SET state='acceptance-unknown' WHERE id=?")
+      .run(first.deliveryId);
+    store.requestCancellation(first.task.id, requester.id);
+    const second = store.accept(
+      other.id,
+      requester.id,
+      Message.fromJSON({ messageId: "unrelated", role: "ROLE_USER", parts: [{ text: "second" }] }),
+      {},
+    );
+    adapter.deliver = async () => ({
+      outcome: "accepted",
+      acceptedAt: new Date().toISOString(),
+      execution: { opaqueId: "other-turn", relationship: "unknown" },
+      evidence: { scheme: "fake", value: "other" },
+    });
+    const scheduler = new DeliveryScheduler(store, adapter, "fairness-test");
+    try {
+      await scheduler.start();
+      await until(() => deliveryState(store, second.deliveryId)?.state === "accepted");
+      expect(deliveryState(store, first.deliveryId)?.state).toBe("acceptance-unknown");
+    } finally {
+      await scheduler.stop();
+      store.close();
+    }
+  });
+
   test("bounds exponential retry delay with jitter", () => {
     expect(retryDelay(1, () => 0.5)).toBe(250);
     expect(retryDelay(99, () => 0.999)).toBeLessThan(30_000);
@@ -74,19 +205,19 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
-  test("leases and accepts context delivery through the runtime port", async () => {
+  test("leases and accepts direct delivery through the runtime port", async () => {
     const store = fixture(),
       agent = store.createAgent("backend"),
       principal = authenticated(store);
     store.bind(agent.id, "thread-1", {
-      deliveryPolicy: { autoResumeDormantThread: true },
+      deliveryPolicy: { interruptOnCancel: false },
     });
     const accepted = store.accept(
       agent.id,
       principal.id,
       Message.fromJSON({ messageId: "one", role: "ROLE_USER", parts: [{ text: "work" }] }),
       {
-        mode: "append_context",
+        mode: "direct",
         traceContext: {
           traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
           tracestate: "vendor=value",
@@ -100,6 +231,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "ok" },
       };
     };
@@ -123,7 +255,6 @@ describe("delivery scheduler", () => {
       },
     });
     expect(delivered).toMatchObject({
-      autoResumeDormantThread: true,
       traceContext: {
         traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         tracestate: "vendor=value",
@@ -145,7 +276,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "wake_when_idle" },
+        { mode: "direct" },
       ),
       delivering = Promise.withResolvers<{
         session: { installationId: `ins_${string}`; opaqueId: string };
@@ -158,7 +289,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
-        execution: { opaqueId: "early-turn", alreadyRunning: false },
+        execution: { opaqueId: "early-turn", relationship: "started" },
         evidence: { scheme: "fake", value: "early-turn" },
       };
     };
@@ -183,14 +314,13 @@ describe("delivery scheduler", () => {
     await Bun.sleep(400);
     expect(store.task(accepted.task.id, principal.id)).toMatchObject({
       status: {
-        state: A2ATaskState.TASK_STATE_COMPLETED,
-        message: { parts: [{ content: { value: "early final answer" } }] },
+        state: A2ATaskState.TASK_STATE_WORKING,
       },
     });
     await scheduler.stop();
     store.close();
   });
-  test("uses an adapter-provided atomic wake with the default policy", async () => {
+  test("uses direct delivery with no wake-policy opt-in", async () => {
     const store = fixture(),
       agent = store.createAgent("atomic-wake"),
       principal = authenticated(store);
@@ -203,7 +333,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "wake_when_idle" },
+        { mode: "direct" },
       ),
       delivered = Promise.withResolvers<void>(),
       adapter = new FakeRuntimeAdapter();
@@ -212,6 +342,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "atomic-wake" },
       };
     };
@@ -237,14 +368,14 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "wake_when_idle" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     let deliveries = 0;
     adapter.probe = async () => ({
       state: "ready",
       observedAt: new Date().toISOString(),
-      capabilities: { ...adapter.descriptor.capabilities, atomicDeferredWake: false },
+      capabilities: { ...adapter.descriptor.capabilities, directDelivery: false },
       diagnostics: [],
     });
     adapter.deliver = async () => {
@@ -252,6 +383,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "probed-wake" },
       };
     };
@@ -262,7 +394,7 @@ describe("delivery scheduler", () => {
     expect(deliveries).toBe(0);
     expect(deliveryState(store, accepted.deliveryId)).toEqual({
       state: "deferred",
-      state_reason: "manual-wake-required",
+      state_reason: "unsupported-capability",
     });
     await scheduler.stop();
     store.close();
@@ -283,7 +415,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       );
     store.accept(
       available.id,
@@ -293,7 +425,7 @@ describe("delivery scheduler", () => {
         role: "ROLE_USER",
         parts: [{ text: "work" }],
       }),
-      { mode: "append_context" },
+      { mode: "direct" },
     );
     const releaseCongested = Promise.withResolvers<void>(),
       availableDelivered = Promise.withResolvers<void>(),
@@ -304,6 +436,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: request.deliveryId },
       };
     };
@@ -338,7 +471,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     adapter.deliver = async () => ({
@@ -378,7 +511,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     adapter.deliver = async () => ({
@@ -416,7 +549,7 @@ describe("delivery scheduler", () => {
         role: "ROLE_USER",
         parts: [{ text: "work" }],
       }),
-      { mode: "append_context" },
+      { mode: "direct" },
     );
     store.db
       .query(
@@ -427,6 +560,7 @@ describe("delivery scheduler", () => {
     adapter.deliver = async () => ({
       outcome: "accepted",
       acceptedAt: new Date().toISOString(),
+      execution: { opaqueId: "fake-turn", relationship: "unknown" },
       evidence: { scheme: "fake", value: "recovered" },
     });
     const scheduler = new DeliveryScheduler(store, adapter, "replacement");
@@ -449,13 +583,13 @@ describe("delivery scheduler", () => {
         agent.id,
         principal.id,
         Message.fromJSON({ messageId: "unflushed", role: "ROLE_USER", parts: [{ text: "one" }] }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       flushed = store.accept(
         agent.id,
         principal.id,
         Message.fromJSON({ messageId: "flushed", role: "ROLE_USER", parts: [{ text: "two" }] }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       expired = Date.now() - 1;
     store.db
@@ -491,6 +625,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "recovered" },
       };
     };
@@ -549,7 +684,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     let release: (() => void) | undefined, markStarted: (() => void) | undefined;
@@ -565,6 +700,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "renewed" },
       };
     };
@@ -598,7 +734,7 @@ describe("delivery scheduler", () => {
       agent.id,
       requester.id,
       Message.fromJSON({ messageId: "shutdown", role: "ROLE_USER", parts: [{ text: "work" }] }),
-      { mode: "append_context" },
+      { mode: "direct" },
     );
     const adapter = new FakeRuntimeAdapter();
     let markStarted: (() => void) | undefined,
@@ -671,25 +807,25 @@ describe("delivery scheduler", () => {
         follow.id,
         requester.id,
         Message.fromJSON({ messageId: "follow", role: "ROLE_USER", parts: [{ text: "work" }] }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       strictDelivery = store.accept(
         strict.id,
         requester.id,
         Message.fromJSON({ messageId: "strict", role: "ROLE_USER", parts: [{ text: "work" }] }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       expiredDelivery = store.accept(
         expired.id,
         requester.id,
         Message.fromJSON({ messageId: "expired", role: "ROLE_USER", parts: [{ text: "work" }] }),
-        { mode: "append_context", expiresAt: new Date(Date.now() - 1000).toISOString() },
+        { mode: "direct", expiresAt: new Date(Date.now() - 1000).toISOString() },
       ),
       disabledDelivery = store.accept(
         disabled.id,
         requester.id,
         Message.fromJSON({ messageId: "disabled", role: "ROLE_USER", parts: [{ text: "work" }] }),
-        { mode: "append_context" },
+        { mode: "direct" },
       );
     const pin = store.db.query(
       "UPDATE delivery_intents SET state='deferred',state_reason='offline',not_before_ms=?,pinned_binding_id=?,pinned_binding_epoch=? WHERE id=?",
@@ -706,6 +842,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "accepted" },
       };
     };
@@ -736,19 +873,19 @@ describe("delivery scheduler", () => {
     const store = fixture(),
       agent = store.createAgent("cancel-target"),
       requester = authenticated(store);
-    store.bind(agent.id, "thread-cancel");
+    store.bind(agent.id, "thread-cancel", { deliveryPolicy: { interruptOnCancel: true } });
     const accepted = store.accept(
       agent.id,
       requester.id,
       Message.fromJSON({ messageId: "cancel-one", role: "ROLE_USER", parts: [{ text: "work" }] }),
-      { mode: "append_context" },
+      { mode: "direct" },
     );
     const canceled: string[] = [],
       adapter = new FakeRuntimeAdapter();
     adapter.deliver = async () => ({
       outcome: "accepted",
       acceptedAt: new Date().toISOString(),
-      execution: { opaqueId: "owned-turn", alreadyRunning: false },
+      execution: { opaqueId: "owned-turn", relationship: "started" },
       evidence: { scheme: "fake", value: "owned-turn" },
     });
     adapter.cancel = async (request) => {
@@ -790,7 +927,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     const started = Promise.withResolvers<void>(),
@@ -834,7 +971,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     let deliveryAccepted: (() => void) | undefined;
@@ -846,7 +983,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
-        execution: { opaqueId: "local-input-turn", alreadyRunning: false },
+        execution: { opaqueId: "local-input-turn", relationship: "started" },
         evidence: { scheme: "fake", value: "local-input-turn" },
       };
     };
@@ -927,7 +1064,7 @@ describe("delivery scheduler", () => {
     await scheduler.stop();
     store.close();
   });
-  test("does not correlate notification executions to the task", async () => {
+  test("records notification execution without transitioning the task", async () => {
     const store = fixture(),
       sender = store.createAgent("notification-sender"),
       target = store.createAgent("notification-target"),
@@ -963,7 +1100,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
-        execution: { opaqueId: "notification-turn", alreadyRunning: false },
+        execution: { opaqueId: "notification-turn", relationship: "started" },
         evidence: { scheme: "fake", value: "notification-turn" },
       };
     };
@@ -990,7 +1127,7 @@ describe("delivery scheduler", () => {
     ).toBe("input-required");
     expect(
       store.db.query<{ count: number }, []>("SELECT count(*) count FROM runtime_executions").get(),
-    ).toEqual({ count: 0 });
+    ).toEqual({ count: 1 });
     await scheduler.stop();
     store.close();
   });
@@ -1008,7 +1145,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       adapter = new FakeRuntimeAdapter();
     if (!bindingRow) throw new Error("missing binding");
@@ -1024,7 +1161,7 @@ describe("delivery scheduler", () => {
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
-        execution: { opaqueId: "explicit-result-turn", alreadyRunning: false },
+        execution: { opaqueId: "explicit-result-turn", relationship: "started" },
         evidence: { scheme: "fake", value: "explicit-result-turn" },
       };
     };
@@ -1084,7 +1221,7 @@ describe("delivery scheduler", () => {
         role: "ROLE_USER",
         parts: [{ text: "work" }],
       }),
-      { mode: "append_context" },
+      { mode: "direct" },
     );
     let deliveries = 0,
       reconciliations = 0;
@@ -1132,7 +1269,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       scheduler = new DeliveryScheduler(store, new FakeRuntimeAdapter(), "immutable-attempt");
     await scheduler.start();
@@ -1163,7 +1300,7 @@ describe("delivery scheduler", () => {
           role: "ROLE_USER",
           parts: [{ text: "work" }],
         }),
-        { mode: "append_context" },
+        { mode: "direct" },
       ),
       firstDelivery = Promise.withResolvers<void>(),
       secondDelivery = Promise.withResolvers<void>(),
@@ -1176,11 +1313,12 @@ describe("delivery scheduler", () => {
       }
       if (deliveries === 2) {
         secondDelivery.resolve();
-        return { outcome: "deferred", reason: "busy", retryAfterMs: 30_000 };
+        return { outcome: "deferred", reason: "local-input", retryAfterMs: 30_000 };
       }
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
+        execution: { opaqueId: "fake-turn", relationship: "unknown" },
         evidence: { scheme: "fake", value: "status-wake" },
       };
     };
@@ -1248,4 +1386,12 @@ function deliveryState(store: Store, deliveryId: string) {
       "SELECT state,state_reason FROM delivery_intents WHERE id=?",
     )
     .get(deliveryId);
+}
+
+async function until(condition: () => boolean) {
+  for (let i = 0; i < 200; i++) {
+    if (condition()) return;
+    await Bun.sleep(10);
+  }
+  throw new Error("scheduler condition timed out");
 }

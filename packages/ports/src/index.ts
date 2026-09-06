@@ -159,9 +159,6 @@ export interface BindingOptions {
   continuityPolicy?: "follow-pending" | "strict";
   /** Internal compatibility shape while storage policy JSON is simplified. */
   deliveryPolicy?: Partial<{
-    wakeStrategy: "atomic-only" | "non-atomic-idle-check" | "disabled";
-    allowActiveTurnSteering: boolean;
-    autoResumeDormantThread: boolean;
     interruptOnCancel: boolean;
   }>;
   installationId?: RuntimeInstallationId;

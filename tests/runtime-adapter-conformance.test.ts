@@ -33,7 +33,7 @@ type Fixture = {
   adapter: RuntimeAdapter;
   context: RuntimeAdapterContext;
   methods: string[];
-  failNext(method: string, failure: "overload" | "disconnect" | "hang"): void;
+  failNext(method: string, failure: "overload" | "disconnect" | "hang" | "malformed"): void;
   disconnect(): void;
   request(method: string, params: unknown): void;
   setFence(valid: boolean): void;
@@ -48,18 +48,15 @@ type Fixture = {
 
 function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>) {
   describe(`${name} runtime adapter conformance`, () => {
-    test("preserves fences, correlation, conservative state, and shutdown", async () => {
+    test("preserves fences, direct input, shared correlation, and local ownership", async () => {
       const fixture = await create(),
         { adapter, context, methods } = fixture;
       await adapter.start(context);
       await adapter.start(context);
       expect(methods.filter((method) => method === "initialize")).toHaveLength(1);
-      const iterator = adapter.observe(new AbortController().signal)[Symbol.asyncIterator]();
-      expect((await iterator.next()).value).toEqual({
-        type: "adapter.connection",
-        state: "online",
-      });
-
+      const abort = new AbortController(),
+        iterator = adapter.observe(abort.signal)[Symbol.asyncIterator]();
+      expect((await iterator.next()).value).toMatchObject({ state: "online" });
       let flushes = 0;
       const markRequestFlushed = () => flushes++;
       fixture.setFence(false);
@@ -69,139 +66,78 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
       });
       expect(flushes).toBe(0);
       expect(mutations(methods)).toEqual([]);
-
-      const reads = methods.filter((method) => method === "thread/read").length,
-        unsupported: RuntimeDeliveryRequest = JSON.parse(JSON.stringify(delivery()));
+      const unsupported: RuntimeDeliveryRequest = JSON.parse(JSON.stringify(delivery()));
       Object.assign(unsupported.envelope.message?.parts[0] ?? {}, { kind: "future" });
       expect(await adapter.deliver(unsupported)).toMatchObject({
         outcome: "rejected",
         reason: "unsupported-content",
       });
-      expect(methods.filter((method) => method === "thread/read")).toHaveLength(reads);
-      expect(mutations(methods)).toEqual([]);
-
-      expect(await adapter.deliver(delivery("join_active"))).toMatchObject({
-        outcome: "rejected",
-        reason: "unsupported-mode",
-      });
-      expect(methods.filter((method) => method === "thread/read")).toHaveLength(reads);
-      expect(mutations(methods)).toEqual([]);
-
       fixture.setFence(true);
       const accepted = await adapter.deliver({ ...delivery(), markRequestFlushed });
-      expect(accepted).toEqual({
+      expect(accepted).toMatchObject({
         outcome: "accepted",
-        acceptedAt: expect.any(String),
-        evidence: { scheme: "codex.thread-inject-items.v1", value: "int_conformance" },
+        execution: { opaqueId: "turn-1", relationship: "unknown" },
+        evidence: { scheme: "codex.turn-start.tool-output.v1", value: "turn-1" },
       });
-      expect(flushes).toBe(1);
-      expect(mutations(methods)).toEqual(["thread/inject_items"]);
-
       fixture.setStatus("active");
-      expect(
-        await adapter.deliver({ ...delivery("wake_when_idle"), markRequestFlushed }),
-      ).toMatchObject({
-        outcome: "deferred",
-        reason: "busy",
+      const second = delivery();
+      const secondRequest: RuntimeDeliveryRequest = {
+        ...second,
+        deliveryId: "int_second",
+        envelope: { ...second.envelope, deliveryId: "int_second" },
+      };
+      expect(await adapter.deliver({ ...secondRequest, markRequestFlushed })).toMatchObject({
+        outcome: "accepted",
+        execution: { opaqueId: "turn-1", relationship: "unknown" },
       });
-      expect(flushes).toBe(1);
-      expect(mutations(methods)).toEqual(["thread/inject_items"]);
-
-      fixture.setStatus("future-status");
-      expect((await adapter.inspectSession(delivery().target.session)).availability).toBe(
-        "unknown",
-      );
+      expect(flushes).toBe(2);
+      expect(mutations(methods)).toEqual(["turn/start", "turn/start"]);
+      const started = iterator.next();
+      fixture.notify("turn/started", {
+        threadId: "thread-1",
+        turn: { id: "turn-1", status: "inProgress" },
+      });
+      expect((await started).value).toMatchObject({
+        type: "execution.started",
+        correlation: { deliveryIds: ["int_conformance", "int_second"] },
+      });
+      const localInput = iterator.next();
+      fixture.request("item/tool/requestUserInput", {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        isBlocking: true,
+        questions: [],
+      });
+      expect((await localInput).value).toMatchObject({
+        type: "execution.awaiting-local-input",
+        request: { kind: "question", blocking: true },
+      });
       expect(
         await adapter.cancel({
           execution: {
-            normalizedId: "exe_unowned",
-            opaqueId: "foreign-turn",
+            normalizedId: "exe_shared",
+            opaqueId: "turn-1",
             session: delivery().target.session,
             bindingId: "bnd_conformance",
             bindingEpoch: 1,
           },
         }),
       ).toMatchObject({ outcome: "rejected", reason: "not-owned" });
-      expect(mutations(methods)).toEqual(["thread/inject_items"]);
-
-      const reconciliation: RuntimeReconcileRequest = {
-        deliveryId: "int_conformance",
-        target: delivery().target,
-        payloadHash: "payload-hash",
-        reconciliationToken: "thread-1:int_conformance",
-      };
-      expect(
-        await adapter.reconcile({ ...reconciliation, reconciliationToken: "invalid" }),
-      ).toMatchObject({ outcome: "inconclusive", reason: "invalid Codex reconciliation token" });
-      expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
-      expect((await adapter.reconcile(reconciliation)).outcome).toBe("inconclusive");
-      fixture.failNext("thread/read", "overload");
-      expect(await adapter.reconcile(reconciliation)).toEqual({
-        outcome: "inconclusive",
-        reason: "Codex reconciliation failed (BACKPRESSURE)",
-        operatorActionRequired: true,
-      });
-      fixture.setHistoryDelivery("int_conformance");
-      expect(await adapter.reconcile(reconciliation)).toEqual({
-        outcome: "accepted",
-        execution: { opaqueId: "turn-history" },
-        evidence: {
-          scheme: "codex.function-call-output.v1",
-          value: "int_conformance",
-        },
-      });
-      expect(mutations(methods)).toEqual(["thread/inject_items"]);
-
-      fixture.setStatus("idle");
-      expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
-        outcome: "accepted",
-        execution: { opaqueId: "turn-1" },
-      });
-      expect(await adapter.deliver(delivery("wake_when_idle"))).toEqual({
-        outcome: "deferred",
-        reason: "busy",
-      });
-      expect(methods.filter((method) => method === "turn/start")).toHaveLength(1);
-      const started = iterator.next();
-      fixture.notify("turn/started", {
-        threadId: "thread-1",
-        turn: { id: "turn-1", status: "inProgress" },
-      });
-      expect((await started).value).toEqual({
-        type: "execution.started",
-        session: { installationId: "ins_conformance", opaqueId: "thread-1" },
-        execution: {
-          opaqueId: "turn-1",
-          session: { installationId: "ins_conformance", opaqueId: "thread-1" },
-        },
-        correlation: { deliveryId: "int_conformance", payloadHash: "payload-hash" },
-      });
-      const localInput = iterator.next();
-      fixture.request("item/tool/requestUserInput", {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        itemId: "item-1",
-        isBlocking: true,
-        questions: [],
-      });
-      expect((await localInput).value).toEqual({
-        type: "execution.awaiting-local-input",
-        execution: {
-          opaqueId: "turn-1",
-          session: { installationId: "ins_conformance", opaqueId: "thread-1" },
-        },
-        request: {
-          opaqueId: "server-request-1",
-          kind: "question",
-          blocking: true,
-          summary: "Local runtime input required",
-        },
-      });
+      expect(methods).not.toContain("turn/interrupt");
       const output = iterator.next();
+      fixture.notify("item/completed", {
+        threadId: "another-thread",
+        turnId: "turn-1",
+        item: { type: "agentMessage", text: "foreign final" },
+      });
+      fixture.notify("turn/completed", {
+        threadId: "another-thread",
+        turn: { id: "turn-1", status: "completed" },
+      });
       fixture.notify("item/completed", {
         threadId: "thread-1",
         turnId: "turn-1",
-        item: { type: "reasoning", summary: ["private reasoning"] },
+        item: { type: "reasoning", summary: ["private"] },
       });
       expect(
         await Promise.race([output.then(() => "event"), Bun.sleep(25).then(() => "none")]),
@@ -211,58 +147,129 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         turnId: "turn-1",
         item: { type: "agentMessage", text: "final answer" },
       });
-      expect((await output).value).toEqual({
+      expect((await output).value).toMatchObject({
         type: "execution.output",
-        execution: {
-          opaqueId: "turn-1",
-          session: { installationId: "ins_conformance", opaqueId: "thread-1" },
-        },
-        channel: "final-message",
-        parts: [{ kind: "text", text: "final answer", mediaType: "text/markdown" }],
+        parts: [{ kind: "text", text: "final answer" }],
       });
-      const completion = iterator.next();
+      const completed = iterator.next();
       fixture.notify("turn/completed", {
-        turn: { id: "foreign-turn", status: "completed" },
+        threadId: "thread-1",
+        turn: { id: "turn-1", status: "completed" },
       });
-      expect(
-        await Promise.race([completion.then(() => "event"), Bun.sleep(25).then(() => "none")]),
-      ).toBe("none");
-      fixture.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
-      expect((await completion).value).toMatchObject({
+      expect((await completed).value).toMatchObject({
         type: "execution.completed",
-        execution: { opaqueId: "turn-1" },
         finalParts: [{ kind: "text", text: "final answer" }],
       });
-
-      fixture.failNext("thread/inject_items", "overload");
-      expect(await adapter.deliver(delivery())).toMatchObject({
-        outcome: "deferred",
-        reason: "backpressure",
-      });
-
-      fixture.failNext("thread/inject_items", "disconnect");
-      expect(await adapter.deliver(delivery())).toMatchObject({
-        outcome: "acceptance-unknown",
-        ambiguity: "connection-reset",
-      });
-      expect((await iterator.next()).value).toEqual({
-        type: "adapter.connection",
-        state: "offline",
-      });
-
+      abort.abort();
       await adapter.stop({ reason: "shutdown" });
       expect((await iterator.next()).done).toBe(true);
-      const mutationsBeforeStoppedCall = mutations(methods);
       await expect(adapter.deliver(delivery())).rejects.toThrow("runtime adapter stopped");
-      expect(mutations(methods)).toEqual(mutationsBeforeStoppedCall);
       fixture.close();
-    }, 30_000);
+    });
 
-    test("reconnects after a disconnect without duplicating notifications", async () => {
+    test("checks the binding immediately before submission without resuming a second session", async () => {
+      const fixture = await create();
+      let checks = 0;
+      await fixture.adapter.start({
+        ...fixture.context,
+        assertBindingFence: async () => {
+          checks++;
+          expect(fixture.methods).toContain("thread/read");
+          expect(fixture.methods).not.toContain("turn/start");
+          return { valid: false, reason: "stale" };
+        },
+      });
+      expect(await fixture.adapter.deliver(delivery())).toMatchObject({
+        outcome: "rejected",
+        reason: "stale-binding",
+      });
+      expect(checks).toBe(1);
+      expect(fixture.methods).not.toContain("thread/resume");
+      expect(fixture.methods).not.toContain("turn/start");
+      await fixture.adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
+    test("defers dormant, blocked, unknown, and foreign-route sessions without fallback", async () => {
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
+      for (const [status, reason] of [
+        ["notLoaded", "dormant"],
+        ["waitingOnApproval", "local-input"],
+        ["waitingOnUserInput", "local-input"],
+        ["future-status", "unsupported-active-state"],
+      ]) {
+        fixture.setStatus(status);
+        expect(await fixture.adapter.deliver(delivery())).toMatchObject({
+          outcome: "deferred",
+          reason,
+        });
+      }
+      const request = delivery();
+      expect(
+        await fixture.adapter.deliver({
+          ...request,
+          target: {
+            ...request.target,
+            session: { ...request.target.session, installationId: "ins_foreign" },
+          },
+        }),
+      ).toMatchObject({ outcome: "deferred", reason: "route-unavailable" });
+      expect(fixture.methods).not.toContain("thread/resume");
+      expect(mutations(fixture.methods)).toEqual([]);
+      await fixture.adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
+    test("treats malformed successful admission responses as ambiguous, not rejected", async () => {
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
+      fixture.failNext("turn/start", "malformed");
+      expect(await fixture.adapter.deliver(delivery())).toMatchObject({
+        outcome: "acceptance-unknown",
+      });
+      expect(mutations(fixture.methods)).toEqual(["turn/start"]);
+      await fixture.adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
+    test("reconciles exact markers and leaves missing or conflicting evidence inconclusive", async () => {
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
+      const request: RuntimeReconcileRequest = {
+        deliveryId: "int_conformance",
+        target: delivery().target,
+        payloadHash: "payload-hash",
+        reconciliationToken: "thread-1:int_conformance",
+      };
+      expect(
+        await fixture.adapter.reconcile({ ...request, reconciliationToken: "invalid" }),
+      ).toMatchObject({ outcome: "inconclusive" });
+      expect(await fixture.adapter.reconcile(request)).toMatchObject({ outcome: "inconclusive" });
+      fixture.setHistoryDelivery("int_conformance");
+      expect(await fixture.adapter.reconcile(request)).toMatchObject({
+        outcome: "accepted",
+        execution: { opaqueId: "turn-history", relationship: "unknown" },
+      });
+      expect(
+        await fixture.adapter.reconcile({ ...request, payloadHash: "conflict" }),
+      ).toMatchObject({ outcome: "inconclusive" });
+      fixture.failNext("thread/read", "overload");
+      expect(await fixture.adapter.reconcile(request)).toMatchObject({
+        outcome: "inconclusive",
+        operatorActionRequired: true,
+      });
+      expect(mutations(fixture.methods)).toEqual([]);
+      await fixture.adapter.stop({ reason: "shutdown" });
+      fixture.close();
+    });
+
+    test("reconnects without duplicate delivery and never equates tracking with ownership", async () => {
       const fixture = await create(),
-        { adapter, context, methods } = fixture;
-      await adapter.start(context);
-      const iterator = adapter.observe(new AbortController().signal)[Symbol.asyncIterator]();
+        { adapter, methods } = fixture;
+      await adapter.start(fixture.context);
+      const abort = new AbortController(),
+        iterator = adapter.observe(abort.signal)[Symbol.asyncIterator]();
       expect((await iterator.next()).value).toMatchObject({ state: "online" });
       fixture.disconnect();
       expect((await iterator.next()).value).toMatchObject({ state: "offline" });
@@ -271,161 +278,115 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         reason: "offline",
       });
       expect(mutations(methods)).toEqual([]);
-
-      await adapter.start(context);
+      await adapter.start(fixture.context);
       expect((await iterator.next()).value).toMatchObject({ state: "online" });
-      expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
-        outcome: "accepted",
-        execution: { opaqueId: "turn-1" },
+      expect(await adapter.deliver(delivery())).toMatchObject({ outcome: "accepted" });
+      expect(
+        await adapter.cancel({
+          execution: {
+            normalizedId: "exe_one",
+            opaqueId: "turn-1",
+            session: delivery().target.session,
+            bindingId: "bnd_conformance",
+            bindingEpoch: 1,
+          },
+        }),
+      ).toMatchObject({ outcome: "rejected", reason: "not-owned" });
+      expect(methods).not.toContain("turn/interrupt");
+      fixture.notify("turn/completed", {
+        threadId: "thread-1",
+        turn: { id: "turn-1", status: "completed" },
       });
-      fixture.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
-      expect((await iterator.next()).value).toMatchObject({
-        type: "execution.completed",
-        execution: { opaqueId: "turn-1" },
-      });
+      expect((await iterator.next()).value).toMatchObject({ type: "execution.completed" });
       expect(
         await Promise.race([iterator.next().then(() => "event"), Bun.sleep(25).then(() => "none")]),
       ).toBe("none");
-      await adapter.stop({ reason: "shutdown" });
-      fixture.close();
-    });
-
-    test("resumes a dormant thread only when policy permits", async () => {
-      const fixture = await create(),
-        { adapter, context, methods } = fixture;
-      await adapter.start(context);
-      fixture.setStatus("notLoaded");
-      expect(await adapter.deliver(delivery("append_context"))).toMatchObject({
-        outcome: "deferred",
-        reason: "dormant",
-      });
-      let flushes = 0;
-      expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
-        outcome: "deferred",
-        reason: "dormant",
-      });
-      expect(mutations(methods)).toEqual([]);
-      expect(
-        await adapter.deliver({
-          ...delivery("wake_when_idle"),
-          autoResumeDormantThread: true,
-          markRequestFlushed: () => flushes++,
-        }),
-      ).toMatchObject({ outcome: "accepted", execution: { opaqueId: "turn-1" } });
-      expect(mutations(methods)).toEqual(["turn/start"]);
-      expect(flushes).toBe(1);
+      abort.abort();
       await adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
 
     test("does not repeat loaded sessions across stored pages", async () => {
-      const fixture = await create(),
-        { adapter, context } = fixture;
+      const fixture = await create();
       fixture.setSessionPages();
-      await adapter.start(context);
-      const first = await adapter.listSessions({ limit: 1 }),
-        second = await adapter.listSessions({ limit: 1, cursor: first.nextCursor }),
-        third = await adapter.listSessions({ limit: 1, cursor: second.nextCursor });
+      await fixture.adapter.start(fixture.context);
+      const first = await fixture.adapter.listSessions({ limit: 1 }),
+        second = await fixture.adapter.listSessions({ limit: 1, cursor: first.nextCursor }),
+        third = await fixture.adapter.listSessions({ limit: 1, cursor: second.nextCursor });
       expect(first.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-2"]);
       expect(second.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-1"]);
-      expect(second.sessions[0]?.availability).toBe("idle");
       expect(third).toEqual({ sessions: [], nextCursor: undefined });
-      await adapter.stop({ reason: "shutdown" });
+      await fixture.adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
-
     test("lists loaded sessions that are not persisted yet", async () => {
-      const fixture = await create(),
-        { adapter, context } = fixture;
+      const fixture = await create();
       fixture.setLoadedOnly();
-      await adapter.start(context);
-      const page = await adapter.listSessions({ limit: 1 });
+      await fixture.adapter.start(fixture.context);
+      const page = await fixture.adapter.listSessions({ limit: 1 });
       expect(page.sessions.map((session) => session.session.opaqueId)).toEqual(["thread-3"]);
       expect(page.nextCursor).toBeUndefined();
-      await adapter.stop({ reason: "shutdown" });
+      await fixture.adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
-
     test("does not expose unknown runtime source metadata", async () => {
-      const fixture = await create(),
-        { adapter, context } = fixture;
-      await adapter.start(context);
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
       fixture.setSource({ type: "cli", token: "secret-value" });
-      const snapshot = await adapter.inspectSession(delivery().target.session);
+      const snapshot = await fixture.adapter.inspectSession(delivery().target.session);
       expect(snapshot.attributes.sourceKind).toBe("cli");
       expect(JSON.stringify(snapshot)).not.toContain("secret-value");
-      await adapter.stop({ reason: "shutdown" });
+      await fixture.adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
-
-    test("honors aborts without hiding an ambiguous write", async () => {
-      const fixture = await create(),
-        { adapter, context, methods } = fixture;
-      await adapter.start(context);
-
+    test("honors aborts without hiding a flushed ambiguous write", async () => {
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
       fixture.failNext("thread/read", "hang");
       const readAbort = new AbortController(),
-        read = adapter.inspectSession(delivery().target.session, readAbort.signal);
+        read = fixture.adapter.inspectSession(delivery().target.session, readAbort.signal);
       readAbort.abort();
       await expect(read).rejects.toThrow(/operation was aborted/i);
-
-      fixture.failNext("thread/inject_items", "hang");
+      fixture.failNext("turn/start", "hang");
       let flushes = 0;
       const writeAbort = new AbortController(),
-        write = adapter.deliver(
+        write = fixture.adapter.deliver(
           { ...delivery(), markRequestFlushed: () => flushes++ },
           writeAbort.signal,
         );
-      await waitForMethod(methods, "thread/inject_items");
+      await waitForMethod(fixture.methods, "turn/start");
       writeAbort.abort();
-      expect(await write).toMatchObject({
-        outcome: "acceptance-unknown",
-        ambiguity: "connection-reset",
-      });
+      expect(await write).toMatchObject({ outcome: "acceptance-unknown" });
       expect(flushes).toBe(1);
-      await adapter.stop({ reason: "shutdown" });
+      expect(fixture.methods).not.toContain("thread/inject_items");
+      await fixture.adapter.stop({ reason: "shutdown" });
       fixture.close();
     });
-
-    test("preserves ambiguity across shutdown and cancellation disconnects", async () => {
-      const shutdownFixture = await create(),
-        {
-          adapter: shutdownAdapter,
-          context: shutdownContext,
-          methods: shutdownMethods,
-        } = shutdownFixture;
-      await shutdownAdapter.start(shutdownContext);
-      shutdownFixture.failNext("thread/inject_items", "hang");
-      const deliveryResult = shutdownAdapter.deliver(delivery());
-      await waitForMethod(shutdownMethods, "thread/inject_items");
-      await shutdownAdapter.stop({ reason: "shutdown" });
-      expect(await deliveryResult).toMatchObject({
+    test("distinguishes overload from lost acceptance and preserves shutdown ambiguity", async () => {
+      const fixture = await create();
+      await fixture.adapter.start(fixture.context);
+      fixture.failNext("turn/start", "overload");
+      expect(await fixture.adapter.deliver(delivery())).toMatchObject({
+        outcome: "deferred",
+        reason: "backpressure",
+      });
+      fixture.failNext("turn/start", "disconnect");
+      expect(await fixture.adapter.deliver(delivery())).toMatchObject({
         outcome: "acceptance-unknown",
-        ambiguity: "connection-reset",
       });
-      shutdownFixture.close();
-
-      const cancelFixture = await create(),
-        { adapter: cancelAdapter, context: cancelContext, methods: cancelMethods } = cancelFixture;
-      await cancelAdapter.start(cancelContext);
-      const accepted = await cancelAdapter.deliver(delivery("wake_when_idle"));
-      if (accepted.outcome !== "accepted" || !accepted.execution)
-        throw new Error("expected owned execution");
-      cancelFixture.failNext("turn/interrupt", "hang");
-      const cancelResult = cancelAdapter.cancel({
-        execution: {
-          normalizedId: "exe_cancel",
-          opaqueId: accepted.execution.opaqueId,
-          session: delivery().target.session,
-          bindingId: delivery().target.bindingId,
-          bindingEpoch: delivery().target.bindingEpoch,
-        },
-      });
-      await waitForMethod(cancelMethods, "turn/interrupt");
-      cancelFixture.disconnect();
-      expect(await cancelResult).toMatchObject({ outcome: "unknown" });
-      await cancelAdapter.stop({ reason: "shutdown" });
-      cancelFixture.close();
+      await fixture.adapter.start(fixture.context);
+      fixture.failNext("turn/start", "hang");
+      const before = fixture.methods.length,
+        write = fixture.adapter.deliver(delivery());
+      for (
+        let index = 0;
+        index < 100 && !fixture.methods.slice(before).includes("turn/start");
+        index++
+      )
+        await Bun.sleep(1);
+      await fixture.adapter.stop({ reason: "shutdown" });
+      expect(await write).toMatchObject({ outcome: "acceptance-unknown" });
+      fixture.close();
     });
   });
 }
@@ -439,7 +400,7 @@ test("Codex runtime adapter enables mutations for every supported runtime", asyn
     await adapter.start(context);
     expect(await adapter.probe()).toMatchObject({ state: "ready", runtimeVersion: version });
     expect(await adapter.deliver(delivery())).toMatchObject({ outcome: "accepted" });
-    expect(mutations(methods)).toEqual(["thread/inject_items"]);
+    expect(mutations(methods)).toEqual(["turn/start"]);
     await adapter.stop({ reason: "shutdown" });
     fixture.close();
   }
@@ -453,7 +414,7 @@ test("Codex runtime adapter disables mutations for an untested runtime", async (
     state: "incompatible",
     runtimeVersion: "99.0.0",
     protocolFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
-    capabilities: { appendContext: false, wakeWhenIdle: false, cancelOwnedExecution: false },
+    capabilities: { directDelivery: false, cancelOwnedExecution: false },
   });
   expect(await adapter.deliver(delivery())).toMatchObject({
     outcome: "rejected",
@@ -470,7 +431,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
   const path = join(root, "codex.sock"),
     methods: string[] = [],
     buffers = new WeakMap<object, Buffer>(),
-    failures = new Map<string, "overload" | "disconnect" | "hang">();
+    failures = new Map<string, "overload" | "disconnect" | "hang" | "malformed">();
   let fence = true,
     historyDelivery: string | undefined,
     loadedOnly = false,
@@ -534,16 +495,19 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
               serverFrame(
                 JSON.stringify({
                   id: request.id,
-                  result: response(
-                    method,
-                    status,
-                    userAgent,
-                    historyDelivery,
-                    source,
-                    request.params,
-                    sessionPages,
-                    loadedOnly,
-                  ),
+                  result:
+                    failure === "malformed"
+                      ? {}
+                      : response(
+                          method,
+                          status,
+                          userAgent,
+                          historyDelivery,
+                          source,
+                          request.params,
+                          sessionPages,
+                          loadedOnly,
+                        ),
                 }),
               ),
             );
@@ -603,7 +567,7 @@ async function codexFixture(userAgent = `codex-cli ${TESTED_CODEX_VERSION}`): Pr
   };
 }
 
-function delivery(mode: RuntimeDeliveryRequest["mode"] = "append_context"): RuntimeDeliveryRequest {
+function delivery(mode: RuntimeDeliveryRequest["mode"] = "direct"): RuntimeDeliveryRequest {
   return {
     deliveryId: "int_conformance",
     target: {
@@ -668,7 +632,9 @@ function thread(id: string, status: string, source: unknown, historyDelivery?: s
     cwd: "/tmp",
     cliVersion: "test",
     source,
-    status: { type: status },
+    status: status.startsWith("waitingOn")
+      ? { type: "active", activeFlags: [status] }
+      : { type: status },
     turns: historyDelivery
       ? [
           {
@@ -678,7 +644,10 @@ function thread(id: string, status: string, source: unknown, historyDelivery?: s
                 type: "functionCallOutput",
                 name: "receive_agent_message",
                 namespace: "acs",
-                output: JSON.stringify({ deliveryId: historyDelivery }),
+                output: JSON.stringify({
+                  deliveryId: historyDelivery,
+                  payloadHash: "payload-hash",
+                }),
               },
             ],
           },

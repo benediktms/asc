@@ -71,7 +71,8 @@ const capabilities: RuntimeCapabilities = {
   observeSessionState: true,
   observeExecutions: true,
   directDelivery: true,
-  cancelOwnedExecution: true,
+  // A shared app-server attachment does not establish isolated execution ownership.
+  cancelOwnedExecution: false,
   reconcileDelivery: true,
   callerAttestationSchemes: ["codex-mcp-thread-meta-v1"],
   supportedPartKinds: ["text", "uri", "data"],
@@ -350,6 +351,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         retryable: false,
         details: { deadline: "expired" },
       };
+    if (!this.client) return { outcome: "deferred", reason: "offline" };
+    if (request.target.session.installationId !== this.requireContext().installationId)
+      return { outcome: "deferred", reason: "route-unavailable" };
     if (!supportsCodexVersion(this.runtimeVersion))
       return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
     const snapshot = await this.inspectSession(request.target.session, signal);
@@ -359,13 +363,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return { outcome: "deferred", reason: "local-input" };
     if (snapshot.availability === "degraded" || snapshot.availability === "unknown")
       return { outcome: "deferred", reason: "unsupported-active-state" };
-    const fence = await this.requireContext().assertBindingFence(
-      request.target.bindingId,
-      request.target.bindingEpoch,
-    );
-    if (!fence.valid) return { outcome: "rejected", reason: "stale-binding", retryable: false };
     try {
-      await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
+      // readThread already established a live owner on this endpoint. Resuming
+      // here is unnecessary and fails for fresh threads without a rollout.
+      const currentFence = await this.requireContext().assertBindingFence(
+        request.target.bindingId,
+        request.target.bindingEpoch,
+        signal,
+      );
+      if (!currentFence.valid)
+        return { outcome: "rejected", reason: "stale-binding", retryable: false };
       const response = await this.requireClient().startTurn(
         {
           threadId: request.target.session.opaqueId,
@@ -374,14 +381,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           toolOutput: {
             name: "receive_agent_message",
             namespace: "acs",
-            output: JSON.stringify(request.envelope),
+            output: JSON.stringify({ ...request.envelope, payloadHash: request.payloadHash }),
           },
         },
         request.markRequestFlushed,
         signal,
         (turnId) => this.trackExecution(turnId, request),
       );
-      this.trackExecution(response.turn.id, request);
+      // Subscription/observation is independent of the already-accepted input.
+      // A fresh thread acquires a rollout only after its first turn is admitted.
+      await this.observeAcceptedExecution(request, response.turn.id, signal);
       return {
         outcome: "accepted",
         acceptedAt: new Date().toISOString(),
@@ -436,6 +445,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         request.target.session.opaqueId,
         request.deliveryId,
         signal,
+        request.payloadHash,
       );
       return marker
         ? {
@@ -461,36 +471,53 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       };
     }
   }
-  async cancel(request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
+  async cancel(_request: RuntimeCancelRequest, signal?: AbortSignal): Promise<RuntimeCancelResult> {
     this.assertRunning();
     signal?.throwIfAborted();
-    if (!supportsCodexVersion(this.runtimeVersion))
-      return { outcome: "rejected", reason: "runtime-protocol-error", retryable: false };
-    const execution = this.executions.get(request.execution.opaqueId);
-    if (!execution || execution.deliveries.size !== 1)
-      return { outcome: "rejected", reason: "not-owned", retryable: false };
-    const fence = await this.requireContext().assertBindingFence(
-      request.execution.bindingId,
-      request.execution.bindingEpoch,
-    );
-    if (!fence.valid) return { outcome: "rejected", reason: "stale-binding", retryable: false };
+    // A delivery receipt (even for a single task) is not a lease on the entire
+    // thread. This shared-endpoint adapter cannot prove exclusive ownership.
+    return { outcome: "rejected", reason: "not-owned", retryable: false };
+  }
+  private async observeAcceptedExecution(
+    request: RuntimeDeliveryRequest,
+    turnId: string,
+    signal?: AbortSignal,
+  ) {
     try {
-      await this.requireClient().interruptTurn(
-        request.execution.session.opaqueId,
-        request.execution.opaqueId,
+      const fence = await this.requireContext().assertBindingFence(
+        request.target.bindingId,
+        request.target.bindingEpoch,
         signal,
       );
-      return { outcome: "accepted", acceptedAt: new Date().toISOString() };
-    } catch (error: unknown) {
-      const failure = appServerFailure(error);
-      return failure.kind === CodexAppServerFailureKind.NotRunning ||
-        failure.kind === CodexAppServerFailureKind.SessionNotFound
-        ? { outcome: "not-running" }
-        : { outcome: "unknown", reason: `Codex cancellation failed (${failure.kind})` };
+      if (!fence.valid) return;
+      // Only the endpoint just proven to own this accepted live turn is used.
+      // Never retry input because listener attachment or projection fails.
+      await this.requireClient().resumeThread(request.target.session.opaqueId, signal);
+      const turn = await this.requireClient().readExecution(
+        request.target.session.opaqueId,
+        turnId,
+        signal,
+      );
+      if (!turn) return;
+      const execution = this.executions.get(executionKey(request.target.session.opaqueId, turnId));
+      if (!execution) return;
+      for (const item of turn.items) {
+        if (item.type === "agentMessage" && typeof item.text === "string")
+          execution.finalParts = [{ kind: "text", text: item.text, mediaType: "text/markdown" }];
+      }
+      if (["completed", "interrupted", "failed"].includes(turn.status))
+        this.handleNotification("turn/completed", {
+          threadId: request.target.session.opaqueId,
+          turn,
+        });
+    } catch {
+      this.requireContext().logger.warn("runtime.observation-deferred", {
+        deliveryId: request.deliveryId,
+      });
     }
   }
   private trackExecution(turnId: string, request: RuntimeDeliveryRequest) {
-    const existing = this.executions.get(turnId);
+    const existing = this.executions.get(executionKey(request.target.session.opaqueId, turnId));
     if (existing) {
       existing.deliveries.set(request.deliveryId, request.payloadHash);
       return existing;
@@ -500,7 +527,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       deliveries: new Map([[request.deliveryId, request.payloadHash]]),
       finalParts: [],
     };
-    this.executions.set(turnId, execution);
+    this.executions.set(executionKey(request.target.session.opaqueId, turnId), execution);
     return execution;
   }
   private snapshot(thread: CodexThreadDto): RuntimeSessionSnapshot {
@@ -561,7 +588,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       });
     }
     if (method === "turn/started" && isTurnStarted(params)) {
-      const execution = this.executions.get(params.turn.id);
+      const execution = this.executions.get(executionKey(params.threadId, params.turn.id));
       if (execution)
         this.emit({
           type: "execution.started",
@@ -574,7 +601,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     if (method === "item/completed" && isItemCompleted(params)) {
       const event = params,
-        execution = this.executions.get(event.turnId);
+        execution = this.executions.get(executionKey(event.threadId, event.turnId));
       if (
         execution &&
         event.item.type === "agentMessage" &&
@@ -593,7 +620,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     if (method === "turn/completed" && isTurnCompleted(params)) {
       const event = params,
-        execution = this.executions.get(event.turn.id);
+        execution = this.executions.get(executionKey(event.threadId, event.turn.id));
       if (execution) {
         const outcome =
           event.turn.status === "completed"
@@ -607,13 +634,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           outcome,
           finalParts: execution.finalParts,
         });
-        this.executions.delete(event.turn.id);
+        this.executions.delete(executionKey(event.threadId, event.turn.id));
       }
     }
   }
   private handleRequest(requestId: string, method: string, params: unknown) {
     if (!isRuntimeInputRequest(params)) return;
-    const execution = this.executions.get(params.turnId);
+    const execution = this.executions.get(executionKey(params.threadId, params.turnId));
     if (!execution) return;
     this.emit({
       type: "execution.awaiting-local-input",
@@ -686,10 +713,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 function isItemCompleted(
   value: unknown,
-): value is { turnId: string; item: { type: "agentMessage"; text: string } | { type: string } } {
+): value is {
+  threadId: string;
+  turnId: string;
+  item: { type: "agentMessage"; text: string } | { type: string };
+} {
   return (
     typeof value === "object" &&
     value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
     "turnId" in value &&
     typeof value.turnId === "string" &&
     "item" in value &&
@@ -703,10 +736,15 @@ function isItemCompleted(
 }
 function isTurnCompleted(
   value: unknown,
-): value is { turn: { id: string; status: "completed" | "interrupted" | string } } {
+): value is {
+  threadId: string;
+  turn: { id: string; status: "completed" | "interrupted" | string };
+} {
   return (
     typeof value === "object" &&
     value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
     "turn" in value &&
     typeof value.turn === "object" &&
     value.turn !== null &&
@@ -731,10 +769,14 @@ function isTurnStarted(value: unknown): value is { threadId: string; turn: { id:
   );
 }
 
-function isRuntimeInputRequest(value: unknown): value is { turnId: string; isBlocking?: boolean } {
+function isRuntimeInputRequest(
+  value: unknown,
+): value is { threadId: string; turnId: string; isBlocking?: boolean } {
   return (
     typeof value === "object" &&
     value !== null &&
+    "threadId" in value &&
+    typeof value.threadId === "string" &&
     "turnId" in value &&
     typeof value.turnId === "string" &&
     (!("isBlocking" in value) || typeof value.isBlocking === "boolean")
@@ -764,7 +806,7 @@ function deliveryAmbiguous(kind: CodexAppServerFailureKind) {
 }
 function isThreadStatusChanged(
   value: unknown,
-): value is { threadId: string; status: { type: string } } {
+): value is { threadId: string; status: { type: string; activeFlags?: string[] } } {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -773,19 +815,29 @@ function isThreadStatusChanged(
     "status" in value &&
     typeof value.status === "object" &&
     value.status !== null &&
-    "type" in value.status
+    "type" in value.status &&
+    typeof value.status.type === "string" &&
+    (!("activeFlags" in value.status) ||
+      (Array.isArray(value.status.activeFlags) &&
+        value.status.activeFlags.every((flag) => typeof flag === "string")))
   );
 }
 
 function status(thread: CodexThreadDto): RuntimeAvailability {
   return statusType(thread.status);
 }
-function statusType(value: { type: string }): RuntimeAvailability {
+function statusType(value: { type: string; activeFlags?: readonly string[] }): RuntimeAvailability {
   switch (value.type) {
     case "idle":
       return "idle";
     case "active":
-      return "busy";
+      if (
+        value.activeFlags?.some(
+          (flag) => flag === "waitingOnApproval" || flag === "waitingOnUserInput",
+        )
+      )
+        return "awaiting-local-input";
+      return value.activeFlags?.length ? "degraded" : "busy";
     case "notLoaded":
       return "dormant";
     case "systemError":
@@ -793,4 +845,8 @@ function statusType(value: { type: string }): RuntimeAvailability {
     default:
       return "unknown";
   }
+}
+
+function executionKey(threadId: string, turnId: string) {
+  return JSON.stringify([threadId, turnId]);
 }

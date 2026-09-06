@@ -161,6 +161,8 @@ export type RuntimeExecutionRelationship = "started" | "joined" | "unknown";
 export interface RuntimeDeliveryEnvelopeV1 {
   readonly schema: "urn:agent-communications:runtime-envelope:v1";
   readonly deliveryId: DeliveryId;
+  /** Included by the adapter in the submitted marker; never permission evidence. */
+  readonly payloadHash?: string;
   readonly kind: "a2a-message" | "a2a-task-event";
 
   readonly from: {
