@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installService, launchAgent, persistentEnvironment } from "../apps/acs/src/service";
@@ -27,11 +27,11 @@ test("persistent runtime paths are absolute", () => {
 
 test("login service preserves executable arguments and the bridge socket environment", () => {
   const agent = launchAgent({
-    command: ["/Applications/ASC & Tools/acs"],
+    command: ["/Applications/ACS & Tools/acs"],
     environment: { ACS_CONTROL_SOCKET: "/private/tmp/acs/control.sock" },
-    log: "/Users/example/Library/Logs/asc.log",
+    log: "/Users/example/Library/Logs/acs.log",
   });
-  expect(agent.ProgramArguments).toEqual(["/Applications/ASC & Tools/acs", "daemon", "start"]);
+  expect(agent.ProgramArguments).toEqual(["/Applications/ACS & Tools/acs", "daemon", "start"]);
   expect(agent.EnvironmentVariables.ACS_CONTROL_SOCKET).toBe("/private/tmp/acs/control.sock");
   expect(agent.KeepAlive).toBe(true);
   expect(agent.RunAtLoad).toBe(true);
@@ -59,7 +59,8 @@ test.skipIf(process.platform !== "darwin")(
     const launchctl = (command: string[]) => {
       const operation = command.join(" ");
       actions.push(operation);
-      if (command[0] === "print") return loaded ? success : failure;
+      if (command[0] === "print")
+        return command[1] === "gui/999/local.acs.daemon" && loaded ? success : failure;
       if (command[0] === "bootstrap") loaded = true;
       return success;
     };
@@ -76,16 +77,100 @@ test.skipIf(process.platform !== "darwin")(
       };
       await installService(options);
       expect(actions).toEqual([
+        "print gui/999/local.acs.daemon",
         "print gui/999/local.asc.daemon",
         "stop unmanaged",
-        `bootstrap gui/999 ${home}/Library/LaunchAgents/local.asc.daemon.plist`,
+        `bootstrap gui/999 ${home}/Library/LaunchAgents/local.acs.daemon.plist`,
       ]);
       actions.length = 0;
       await installService(options);
       expect(actions).toEqual([
+        "print gui/999/local.acs.daemon",
         "print gui/999/local.asc.daemon",
-        "kickstart -k gui/999/local.asc.daemon",
+        "kickstart -k gui/999/local.acs.daemon",
       ]);
+    } finally {
+      rmSync(home, { recursive: true });
+    }
+  },
+);
+
+for (const legacyLoaded of [false, true]) {
+  test.skipIf(process.platform !== "darwin")(
+    `init retires the legacy service (loaded: ${legacyLoaded})`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "acs-service-")),
+        legacyPath = join(home, "Library/LaunchAgents/local.asc.daemon.plist"),
+        actions: string[] = [];
+      mkdirSync(join(home, "Library/LaunchAgents"), { recursive: true });
+      writeFileSync(legacyPath, "legacy plist");
+      try {
+        await installService({
+          home,
+          uid: 999,
+          command: ["/Applications/acs"],
+          environment: {},
+          stopUnmanagedDaemon: async () => {
+            actions.push("stop unmanaged");
+          },
+          launchctl: (args) => {
+            actions.push(args.join(" "));
+            return {
+              success:
+                args[0] !== "print" || (args[1] === "gui/999/local.asc.daemon" && legacyLoaded),
+              error: "not loaded",
+            };
+          },
+        });
+        expect(actions).toEqual([
+          "print gui/999/local.acs.daemon",
+          "print gui/999/local.asc.daemon",
+          ...(legacyLoaded ? ["bootout gui/999/local.asc.daemon"] : []),
+          "stop unmanaged",
+          `bootstrap gui/999 ${home}/Library/LaunchAgents/local.acs.daemon.plist`,
+        ]);
+        expect(existsSync(legacyPath)).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true });
+      }
+    },
+  );
+}
+
+test.skipIf(process.platform !== "darwin")(
+  "init aborts when the legacy service cannot stop",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "acs-service-")),
+      legacyPath = join(home, "Library/LaunchAgents/local.asc.daemon.plist"),
+      actions: string[] = [];
+    mkdirSync(join(home, "Library/LaunchAgents"), { recursive: true });
+    writeFileSync(legacyPath, "legacy plist");
+    try {
+      await expect(
+        installService({
+          home,
+          uid: 999,
+          command: ["/Applications/acs"],
+          environment: {},
+          stopUnmanagedDaemon: async () => {
+            actions.push("stop unmanaged");
+          },
+          launchctl: (args) => {
+            actions.push(args.join(" "));
+            return {
+              success: args[0] === "print" && args[1] === "gui/999/local.asc.daemon",
+              error: "bootout denied",
+            };
+          },
+        }),
+      ).rejects.toThrow("bootout denied");
+      expect(actions).toEqual([
+        "print gui/999/local.acs.daemon",
+        "print gui/999/local.asc.daemon",
+        "bootout gui/999/local.asc.daemon",
+      ]);
+      expect(existsSync(legacyPath)).toBe(true);
+      expect(existsSync(join(home, "Library/LaunchAgents/local.acs.daemon.plist"))).toBe(false);
     } finally {
       rmSync(home, { recursive: true });
     }

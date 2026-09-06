@@ -219,7 +219,7 @@ export async function runMcp(port = 7432) {
           bindingEpoch: identity.attestation.bindingEpoch,
           remediation:
             identity.agent?.availability === "dormant"
-              ? "This thread is not loaded on ASC's connected app-server. Read messages with acs_inbox_list and acs_task_get, or resume through codex --remote unix:// for automatic delivery."
+              ? "This thread is not loaded on ACS's connected app-server. Read messages with acs_inbox_list and acs_task_get, or resume through codex --remote unix:// for automatic delivery."
               : undefined,
         };
       }),

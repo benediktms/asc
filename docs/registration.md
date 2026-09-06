@@ -11,7 +11,7 @@ acs agents create backend --claim
 Inside the intended Codex session, call `acs_claim` with the returned `claimCode`.
 The MCP input may also set `continuityPolicy`, `allowNonAtomicWake`, and
 `revokeExisting`; it never accepts a thread, binding, principal, or sender ID.
-ASC derives the runtime session exclusively from Codex-owned MCP metadata.
+ACS derives the runtime session exclusively from Codex-owned MCP metadata.
 After a successful claim, `acs_identity` immediately reports the logical agent
 and active binding epoch.
 

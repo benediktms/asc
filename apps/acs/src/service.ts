@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 export function persistentEnvironment(environment: Record<string, string>, cwd = process.cwd()) {
@@ -23,7 +23,7 @@ export function launchAgent(options: {
   log: string;
 }) {
   return {
-    Label: "local.asc.daemon",
+    Label: "local.acs.daemon",
     ProgramArguments: [...options.command, "daemon", "start"],
     RunAtLoad: true,
     KeepAlive: true,
@@ -43,10 +43,10 @@ export async function installService(options: {
   launchctl?: typeof launchctl;
 }) {
   const control = options.launchctl ?? launchctl,
-    path = `${options.home}/Library/LaunchAgents/local.asc.daemon.plist`,
-    log = `${options.home}/Library/Logs/asc.log`,
+    path = `${options.home}/Library/LaunchAgents/local.acs.daemon.plist`,
+    log = `${options.home}/Library/Logs/acs.log`,
     domain = `gui/${options.uid}`,
-    target = `${domain}/local.asc.daemon`,
+    target = `${domain}/local.acs.daemon`,
     plist = Bun.spawnSync(["/usr/bin/plutil", "-convert", "xml1", "-o", "-", "-"], {
       stdin: Buffer.from(JSON.stringify(launchAgent({ ...options, log }))),
     });
@@ -56,8 +56,11 @@ export async function installService(options: {
     loaded = control(["print", target]).success;
   mkdirSync(dirname(path), { recursive: true });
   mkdirSync(dirname(log), { recursive: true });
-  if (changed) writeFileSync(path, content, { mode: 0o600 });
+  const legacyTarget = `${domain}/local.asc.daemon`;
+  if (control(["print", legacyTarget]).success) requireSuccess(control(["bootout", legacyTarget]));
+  rmSync(`${options.home}/Library/LaunchAgents/local.asc.daemon.plist`, { force: true });
   if (!loaded) await options.stopUnmanagedDaemon();
+  if (changed) writeFileSync(path, content, { mode: 0o600 });
   if (loaded && changed) requireSuccess(control(["bootout", target]));
   if (!loaded || changed) {
     for (let attempt = 0; ; attempt++) {

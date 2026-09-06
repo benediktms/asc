@@ -43,7 +43,7 @@ async function main() {
       });
       installMcp();
       await waitForDaemon();
-      console.log("ASC login service and global Codex MCP are ready");
+      console.log("ACS login service and global Codex MCP are ready");
     }
     console.log(`Initialized ACS at ${config.data}`);
     return;
@@ -197,7 +197,7 @@ async function waitForDaemon() {
       await Bun.sleep(100);
     }
   }
-  throw new Error("ASC service did not become ready; check ~/Library/Logs/asc.log");
+  throw new Error("ACS service did not become ready; check ~/Library/Logs/acs.log");
 }
 
 async function stopUnmanagedDaemon() {
@@ -207,7 +207,7 @@ async function stopUnmanagedDaemon() {
     if (!existsSync(config.runtime)) return;
     await Bun.sleep(100);
   }
-  throw new Error("Existing ASC daemon did not stop; service installation aborted");
+  throw new Error("Existing ACS daemon did not stop; service installation aborted");
 }
 
 function socketListening(path: string): Promise<boolean> {
@@ -238,7 +238,7 @@ async function daemon() {
     }),
     startedAt = new Date().toISOString();
   if (await socketListening(config.runtime))
-    throw new Error("ASC daemon is already running; use acs init to update its service");
+    throw new Error("ACS daemon is already running; use acs init to update its service");
   let scheduler: DeliveryScheduler | undefined;
   const a2a = Bun.serve({
     hostname: listen.hostname,
