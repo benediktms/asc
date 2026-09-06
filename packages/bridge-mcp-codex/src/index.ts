@@ -231,20 +231,16 @@ export async function runMcp(port = 7432) {
       inputSchema: {
         claimCode: z.string().min(1).max(64),
         continuityPolicy: z.enum(["follow-pending", "strict"]).optional(),
-        allowNonAtomicWake: z.boolean().optional(),
         revokeExisting: z.boolean().optional(),
       },
     },
-    async ({ claimCode, continuityPolicy, allowNonAtomicWake, revokeExisting }, extra) =>
+    async ({ claimCode, continuityPolicy, revokeExisting }, extra) =>
       execute(async () => {
         const claimed = await typedCall(
           "bindings.claim",
           {
             claimCode,
             continuityPolicy,
-            deliveryPolicy: {
-              wakeStrategy: allowNonAtomicWake ? "non-atomic-idle-check" : "atomic-only",
-            },
             revokeExisting,
             evidence: evidence(extra),
           },
@@ -309,7 +305,6 @@ export async function runMcp(port = 7432) {
         text: z.string().min(1).max(65536),
         taskId: z.string().optional(),
         contextId: z.string().optional(),
-        delivery: z.enum(["wake_when_idle", "append_context"]).optional(),
         priority: z.enum(["low", "normal", "high"]).optional(),
         replyExpected: z.boolean().optional(),
         notifyOn: z
@@ -347,7 +342,6 @@ export async function runMcp(port = 7432) {
             configuration: { returnImmediately: true },
             metadata: {
               "urn:agent-communications:delivery:v1": {
-                mode: args.delivery,
                 priority: args.priority,
                 replyExpected: args.replyExpected,
                 notifyOn: args.notifyOn,
