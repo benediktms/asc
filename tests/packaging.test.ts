@@ -62,7 +62,7 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     ACS_LOG_FORMAT: "json",
     PATH: `${bin}:/usr/bin:/bin`,
   };
-  expect(Bun.spawnSync([binary, "init"], { env }).exitCode).toBe(0);
+  expect(Bun.spawnSync([binary, "init", "--no-service"], { env }).exitCode).toBe(0);
   expect(existsSync(join(root, "acs.db"))).toBe(false);
   const tokenStore = new Store({
       data: join(root, "acs.db"),
@@ -88,6 +88,14 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
   const socket = join(root, "control.sock");
   await waitFor(() => existsSync(socket));
   expect(statSync(socket).mode & 0o777).toBe(0o600);
+  const duplicateDaemon = Bun.spawn([binary, "daemon", "start"], {
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(await duplicateDaemon.exited).toBe(1);
+  expect(await new Response(duplicateDaemon.stderr).text()).toContain("already running");
+  expect(existsSync(socket)).toBe(true);
   for (const file of ["control.token", "bridge.token", "secret.key"])
     expect(statSync(join(root, file)).mode & 0o777).toBe(0o600);
   const resolution = Bun.spawnSync([binary, "deliveries", "resolve", "int_missing", "--accepted"], {
@@ -278,6 +286,25 @@ test("compiled binary runs a clean-machine two-agent service workflow", async ()
     ).data,
   );
   expect(record(assignedGetData.task).id).toBe(mcpTaskId);
+  const receivedDeliveryId = string(assignedGetData.deliveryId, JSON.stringify(assignedGetData));
+  mcp.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: {
+        name: "acs_task_acknowledge",
+        arguments: { taskId: mcpTaskId, deliveryId: receivedDeliveryId },
+        _meta: { threadId: "thread-receiver" },
+      },
+    })}\n`,
+  );
+  const acknowledgeData = record(
+    record(
+      record(jsonRpcResponse(await readUntil(mcp.stdout, '"id":32'), 32).result).structuredContent,
+    ).data,
+  );
+  expect(acknowledgeData).toMatchObject({ taskId: mcpTaskId, state: "working" });
   mcp.stdin.write(
     `${JSON.stringify({
       jsonrpc: "2.0",

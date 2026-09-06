@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
+  "bin": {
+    "acs": "dist/acs"
+  },
   "type": "module",
   "scripts": {
     "build": "bun build apps/acs/src/main.ts --compile --outfile dist/acs",

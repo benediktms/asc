@@ -295,6 +295,10 @@ function runtimeAdapterConformance(name: string, create: () => Promise<Fixture>)
         { adapter, context, methods } = fixture;
       await adapter.start(context);
       fixture.setStatus("notLoaded");
+      expect(await adapter.deliver(delivery("append_context"))).toMatchObject({
+        outcome: "deferred",
+        reason: "dormant",
+      });
       let flushes = 0;
       expect(await adapter.deliver(delivery("wake_when_idle"))).toMatchObject({
         outcome: "deferred",

@@ -278,6 +278,7 @@ export interface ControlStoragePort extends SqlPort {
     task: StoredTask;
   }[];
   inboxTask(agentId: string, taskId: string): unknown;
+  acknowledgeTask(taskId: string, principalId: string, deliveryId?: string): StoredTask;
   publishMessage(
     taskId: string,
     principalId: string,

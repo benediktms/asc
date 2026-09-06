@@ -453,7 +453,11 @@ describe("A2A JSON-RPC", () => {
           message: Message.fromJSON({
             messageId: "sdk-client-message",
             role: Role.ROLE_USER,
-            parts: [{ text: "work" }],
+            parts: [
+              { text: "work" },
+              { url: "https://example.com/evidence", filename: "evidence" },
+              { data: { content: { $case: "text", value: "nested data stays data" } } },
+            ],
           }),
           configuration: undefined,
           metadata: undefined,
@@ -462,7 +466,20 @@ describe("A2A JSON-RPC", () => {
       );
     if (!("id" in sent)) throw new Error("SDK client did not return a task");
     expect(sent.id).toStartWith("tsk_");
-    expect((await client.getTask({ tenant: "", id: sent.id }, options)).id).toBe(sent.id);
+    const expectedParts = [
+      { content: { $case: "text", value: "work" } },
+      { content: { $case: "url", value: "https://example.com/evidence" } },
+      {
+        content: {
+          $case: "data",
+          value: { content: { $case: "text", value: "nested data stays data" } },
+        },
+      },
+    ];
+    expect(sent.history[0]?.parts).toMatchObject(expectedParts);
+    const fetched = await client.getTask({ tenant: "", id: sent.id }, options);
+    expect(fetched.id).toBe(sent.id);
+    expect(fetched.history[0]?.parts).toMatchObject(expectedParts);
     expect(
       (await client.cancelTask({ tenant: "", id: sent.id, metadata: undefined }, options)).status
         ?.state,
@@ -613,7 +630,10 @@ describe("A2A JSON-RPC", () => {
       });
     expect(compact.tasks).toMatchObject([{ history: [], artifacts: [] }]);
     expect(full.tasks).toMatchObject([
-      { artifacts: [{ artifactId: "application-port-artifact" }] },
+      {
+        artifacts: [{ artifactId: "application-port-artifact", parts: [{ text: "result" }] }],
+        history: [{ parts: [{ text: "work" }] }],
+      },
     ]);
     expect(future).toMatchObject({ tasks: [], totalSize: 0 });
     store.setTaskState(accepted.taskId, binding.principalId, TaskState.Completed);

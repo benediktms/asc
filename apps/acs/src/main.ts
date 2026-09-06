@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { chmodSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { createConnection } from "node:net";
 import { handleA2A } from "../../../packages/protocol-a2a/src/index";
 import { controlCall, controlHandler } from "../../../packages/protocol-control/src/index";
 import { runMcp } from "../../../packages/bridge-mcp-codex/src/index";
@@ -19,6 +20,7 @@ import {
   writeDefaultConfig,
 } from "../../../packages/config/src/index";
 import { pickSession, type SessionChoice } from "./session-picker";
+import { installService, persistentEnvironment } from "./service";
 
 const args = Bun.argv.slice(2),
   config = paths(),
@@ -31,6 +33,18 @@ async function main() {
   if (args[0] === "init") {
     writeDefaultConfig();
     initFiles(config);
+    if (process.platform === "darwin" && !args.includes("--no-service")) {
+      await installService({
+        command: selfCommand(),
+        environment: serviceEnvironment(),
+        home: required(process.env.HOME, "HOME"),
+        uid: required(process.getuid?.(), "user ID"),
+        stopUnmanagedDaemon,
+      });
+      installMcp();
+      await waitForDaemon();
+      console.log("ASC login service and global Codex MCP are ready");
+    }
     console.log(`Initialized ACS at ${config.data}`);
     return;
   }
@@ -38,19 +52,7 @@ async function main() {
   if (args[0] === "mcp" && args[1] === "codex") return runMcp(port);
   if (args[0] === "codex" && args[1] === "doctor") return doctor();
   if (args[0] === "codex" && args[1] === "install-mcp") {
-    const installed = Bun.spawnSync([
-      settings.codex.binary,
-      "mcp",
-      "add",
-      "acs",
-      "--",
-      process.execPath,
-      "mcp",
-      "codex",
-    ]);
-    if (!installed.success)
-      throw new Error(installed.stderr.toString().trim() || "Codex MCP installation failed");
-    process.stdout.write(installed.stdout);
+    installMcp();
     return;
   }
   const call = (method: string, params: unknown = {}) =>
@@ -141,6 +143,88 @@ async function main() {
   throw new Error(`Unknown command: ${args.join(" ")}`);
 }
 
+function selfCommand() {
+  return Bun.main.startsWith("/$bunfs/") ? [process.execPath] : [process.execPath, Bun.main];
+}
+
+function serviceEnvironment() {
+  const environment: Record<string, string> = {};
+  for (const key of [
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "CODEX_HOME",
+    "ACS_HOME",
+    "ACS_CONFIG_PATH",
+    "ACS_CODEX_SOCKET",
+    "ACS_A2A_PORT",
+  ])
+    if (process.env[key] !== undefined) environment[key] = process.env[key];
+  environment.ACS_CONTROL_SOCKET = config.runtime;
+  environment.ACS_STORAGE_PATH = config.data;
+  environment.ACS_CODEX_BINARY = Bun.which(settings.codex.binary) ?? settings.codex.binary;
+  return persistentEnvironment(environment);
+}
+
+function installMcp() {
+  const environment = serviceEnvironment(),
+    installed = Bun.spawnSync([
+      settings.codex.binary,
+      "mcp",
+      "add",
+      "acs",
+      ...Object.entries(environment).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
+      "--",
+      ...selfCommand(),
+      "mcp",
+      "codex",
+    ]);
+  if (!installed.success)
+    throw new Error(installed.stderr.toString().trim() || "Codex MCP installation failed");
+  process.stdout.write(installed.stdout);
+}
+
+async function waitForDaemon() {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      await controlCall(config.runtime, config.token, "system.initialize", {
+        protocolVersion: "1.0",
+        client: { name: "acs-init", version: "0.1.0", instanceId: String(process.pid) },
+        capabilities: {},
+      });
+      return;
+    } catch {
+      await Bun.sleep(100);
+    }
+  }
+  throw new Error("ASC service did not become ready; check ~/Library/Logs/asc.log");
+}
+
+async function stopUnmanagedDaemon() {
+  if (!(await socketListening(config.runtime))) return;
+  await controlCall(config.runtime, config.token, "system.shutdown", {});
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (!existsSync(config.runtime)) return;
+    await Bun.sleep(100);
+  }
+  throw new Error("Existing ASC daemon did not stop; service installation aborted");
+}
+
+function socketListening(path: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(path);
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", (error) => {
+      if ("code" in error && ["ENOENT", "ECONNREFUSED"].includes(String(error.code)))
+        resolve(false);
+      else reject(error);
+    });
+  });
+}
+
 async function daemon() {
   const store = new Store(config, {
       maxInlineContentBytes: settings.security.maxInlineContentBytes,
@@ -153,7 +237,8 @@ async function daemon() {
       maxQueuedDeliveryIntents: settings.delivery.maxQueuedDeliveryIntents,
     }),
     startedAt = new Date().toISOString();
-  if (existsSync(config.runtime)) unlinkSync(config.runtime);
+  if (await socketListening(config.runtime))
+    throw new Error("ASC daemon is already running; use acs init to update its service");
   let scheduler: DeliveryScheduler | undefined;
   const a2a = Bun.serve({
     hostname: listen.hostname,
@@ -169,6 +254,7 @@ async function daemon() {
       ),
     error: (error) => sanitizedError(error, String(process.pid)),
   });
+  if (existsSync(config.runtime)) unlinkSync(config.runtime);
   let control: ReturnType<typeof Bun.serve>;
   let finish: (() => void) | undefined;
   const stopped = new Promise<void>((resolve) => {
